@@ -16,6 +16,10 @@ Lacrosse, and Gaelic.
 3. Expand the team to discover every league it plays in
 4. Pick the leagues you care about and add them
 
+The page shows up to 60 teams. Use **Show more** to load the next batch.
+Search and sport filters still check the full team list, including teams
+not yet shown on the page.
+
 Sportarr adds each league with team scoping, so only your team's events are
 monitored, including cups and international competitions the team appears
 in.

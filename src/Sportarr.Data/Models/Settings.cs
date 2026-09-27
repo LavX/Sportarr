@@ -259,6 +259,7 @@ public class MediaManagementSettings
     // CreateEventFolders: Creates folders like /UFC/Season 2024/UFC 310/ (requires CreateSeasonFolders)
     public bool CreateLeagueFolders { get; set; } = true;
     public bool CreateSeasonFolders { get; set; } = true;
+    public bool CreateEventTypeFolders { get; set; } = false;
     public bool CreateEventFolders { get; set; } = false; // Default false - events go in season folder
     public string LeagueFolderFormat { get; set; } = "{Series}";
     public string SeasonFolderFormat { get; set; } = "Season {Season}";

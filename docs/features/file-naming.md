@@ -18,6 +18,12 @@ Customize the naming format in **Settings > Media Management**.
 
 ![Naming Settings](../images/naming-settings.png)
 
+## Grouping events within seasons
+
+Under **Settings > Media Management > Folders**, enable **Create League Folders** and **Create Season Folders** to use **Group Events by Type or Session**. Sportarr then places recognized event types between the season folder and the optional event folder. For example, WWE events can use `WWE/Season 2026/RAW/` or `WWE/Season 2026/PLE/`. Other supported leagues can group fighting event types or motorsport sessions. Unrecognized types go in `Other`, while leagues without grouping rules keep their existing folder layout.
+
+This setting is off by default and does not change episode numbers. It applies to new imports. To move existing files into the new layout, enable **Reorganize Folders on Rename** and click **Save Settings**. Then select the affected leagues on the Leagues page, choose **Rename Files**, review the path preview, and confirm.
+
 For the release title patterns Sportarr's parser understands per sport, see the [Release Naming reference](../RELEASE_NAMING.md).
 
 ## The Sportarr id token

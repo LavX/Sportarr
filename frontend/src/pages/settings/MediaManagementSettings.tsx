@@ -47,6 +47,7 @@ interface MediaManagementSettingsData {
   // Granular folder options - cascading hierarchy
   createLeagueFolders: boolean;
   createSeasonFolders: boolean;
+  createEventTypeFolders: boolean;
   createEventFolders: boolean;
   leagueFolderFormat: string;
   seasonFolderFormat: string;
@@ -93,6 +94,7 @@ const DEFAULT_MEDIA_MANAGEMENT_SETTINGS: MediaManagementSettingsData = {
     // Granular folder options - default: league/season enabled, event disabled
     createLeagueFolders: true,
     createSeasonFolders: true,
+    createEventTypeFolders: false,
     createEventFolders: false,
     leagueFolderFormat: '{Series}',
     seasonFolderFormat: 'Season {Season}',
@@ -998,6 +1000,7 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
                 // Cascade disable child options when parent is disabled
                 if (!e.target.checked) {
                   updateSetting('createSeasonFolders', false);
+                  updateSetting('createEventTypeFolders', false);
                   updateSetting('createEventFolders', false);
                 }
               }}
@@ -1021,6 +1024,7 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
                   updateSetting('createSeasonFolders', e.target.checked);
                   // Cascade disable child option when parent is disabled
                   if (!e.target.checked) {
+                    updateSetting('createEventTypeFolders', false);
                     updateSetting('createEventFolders', false);
                   }
                 }}
@@ -1035,9 +1039,29 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
             </label>
           )}
 
+          {settings.createLeagueFolders && settings.createSeasonFolders && (
+            <label className="flex items-start space-x-3 cursor-pointer ml-8 border-l-2 border-gray-700 pl-4 sm:ml-16">
+              <input
+                type="checkbox"
+                checked={settings.createEventTypeFolders}
+                onChange={(e) => updateSetting('createEventTypeFolders', e.target.checked)}
+                className="mt-1 w-5 h-5 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
+              />
+              <div className="min-w-0 flex-1">
+                <span className="text-white font-medium">Group Events by Type or Session</span>
+                <p className="text-sm text-gray-400 mt-1">
+                  Add a folder within each season for recognized event types and sessions. Leagues without type rules keep their current layout.
+                </p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Unknown types go in Other. This does not move existing files until you reorganize folders on rename.
+                </p>
+              </div>
+            </label>
+          )}
+
           {/* Create Event Folders - only visible if Season Folders enabled */}
           {settings.createLeagueFolders && settings.createSeasonFolders && (
-            <label className="flex items-start space-x-3 cursor-pointer ml-16 border-l-2 border-gray-700 pl-4">
+            <label className="flex items-start space-x-3 cursor-pointer ml-8 border-l-2 border-gray-700 pl-4 sm:ml-16">
               <input
                 type="checkbox"
                 checked={settings.createEventFolders}
@@ -1047,7 +1071,7 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
               <div className="flex-1">
                 <span className="text-white font-medium">Create Event Folders</span>
                 <p className="text-sm text-gray-400 mt-1">
-                  Create a folder for each event (e.g., <code className="text-purple-400 bg-gray-800 px-1 rounded">/UFC/Season 2024/UFC 310/</code>)
+                  Create a folder for each event (e.g., <code className="text-purple-400 bg-gray-800 px-1 rounded">/UFC/Season 2024/{settings.createEventTypeFolders && 'PPV/'}UFC 310/</code>)
                 </p>
                 <p className="text-xs text-gray-500 mt-1">
                   Multi-part events (Early Prelims, Prelims, Main Card) will be grouped in the same event folder.
@@ -1081,18 +1105,26 @@ export default function MediaManagementSettings({ showAdvanced: propShowAdvanced
           {/* Path Preview */}
           <div className="mt-4 p-4 bg-gradient-to-r from-blue-950/30 to-purple-950/30 border border-blue-900/50 rounded-lg">
             <p className="text-sm font-medium text-blue-300 mb-2">Folder Structure Preview:</p>
-            <p className="text-white font-mono text-sm">
+            <p className="text-white font-mono text-sm break-all">
               /root/
               {settings.createLeagueFolders && <span className="text-green-400">UFC/</span>}
               {settings.createLeagueFolders && settings.createSeasonFolders && <span className="text-yellow-400">Season 2024/</span>}
+              {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventTypeFolders && <span className="text-blue-400">PPV/</span>}
               {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventFolders && <span className="text-purple-400">UFC 310/</span>}
               <span className="text-gray-400">filename.mkv</span>
             </p>
+            {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventTypeFolders && (
+              <p className="text-xs text-gray-400 mt-2 break-all">
+                Examples: WWE/Season 2026/RAW/ and Formula 1/Season 2026/Race/.
+              </p>
+            )}
             <p className="text-xs text-gray-500 mt-2">
               {!settings.createLeagueFolders && "All files will be stored directly in the root folder."}
               {settings.createLeagueFolders && !settings.createSeasonFolders && "Files organized by league only."}
-              {settings.createLeagueFolders && settings.createSeasonFolders && !settings.createEventFolders && "Files organized by league and season (Plex TV show style)."}
-              {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventFolders && "Files organized by league, season, and event."}
+              {settings.createLeagueFolders && settings.createSeasonFolders && !settings.createEventTypeFolders && !settings.createEventFolders && "Files organized by league and season (Plex TV show style)."}
+              {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventTypeFolders && !settings.createEventFolders && "Recognized events are grouped by type within each season."}
+              {settings.createLeagueFolders && settings.createSeasonFolders && !settings.createEventTypeFolders && settings.createEventFolders && "Files organized by league, season, and event."}
+              {settings.createLeagueFolders && settings.createSeasonFolders && settings.createEventTypeFolders && settings.createEventFolders && "Recognized events are grouped by type, then by event."}
             </p>
           </div>
 

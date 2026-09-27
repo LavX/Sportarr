@@ -118,6 +118,9 @@ public static class DatabaseInitializer
         }
         } // end: if (!db.Database.IsNpgsql()) - legacy EnsureCreated() detection/seeding
 
+        if (!db.Database.IsNpgsql())
+            ReconcileExistingColumnMigrations(db);
+
         // Now apply any new migrations. Breadcrumbs before and after so a
         // report of "stuck at Applying database migrations" pinpoints the
         // phase - this whole initializer speaks through the console, not
@@ -2674,6 +2677,7 @@ public static class DatabaseInitializer
         EnsureColumn(db, "EventFiles", "ReleaseGroup", "TEXT");
         EnsureColumn(db, "MediaManagementSettings", "UserRejectedExtensions", "TEXT");
         EnsureColumn(db, "MediaManagementSettings", "FileFormatTokenUpgradeApplied", "INTEGER NOT NULL DEFAULT 0");
+        EnsureEventTypeFolderColumn(db);
         EnsureColumn(db, "Events", "Description", "TEXT");
         EnsureColumn(db, "IptvChannels", "HasArchive", "INTEGER NOT NULL DEFAULT 0");
         EnsureColumn(db, "IptvChannels", "ArchiveDays", "INTEGER NOT NULL DEFAULT 0");
@@ -2705,6 +2709,7 @@ public static class DatabaseInitializer
         EnsureColumn(db, "Events", "TsdbId", "TEXT NULL");
         EnsureColumn(db, "DownloadQueue", "OutputPath", "TEXT NULL");
         EnsureColumn(db, "DownloadQueue", "FailedAt", "TEXT NULL");
+        EnsureColumn(db, "DownloadQueue", "LastProgressAt", "TEXT NULL");
 
         RelaxLegacyRootFolderColumns(db);
     }
@@ -2724,6 +2729,40 @@ public static class DatabaseInitializer
         {
             Console.WriteLine($"[Sportarr] Warning: Could not ensure {table}.{column} column: {ex.Message}");
         }
+    }
+
+    internal static void EnsureEventTypeFolderColumn(SportarrDbContext db)
+    {
+        EnsureColumn(db, "MediaManagementSettings", "CreateEventTypeFolders", "INTEGER NOT NULL DEFAULT 0");
+    }
+
+    internal static void ReconcileExistingColumnMigrations(SportarrDbContext db)
+    {
+        if (!HasColumn(db, "__EFMigrationsHistory", "MigrationId"))
+            return;
+
+        ReconcileExistingColumnMigration(db, "20260908224021_PreservePendingPackIntent", "PendingReleases", "IsPack");
+        ReconcileExistingColumnMigration(db, "20260926044143_AddDownloadFailureTime", "DownloadQueue", "FailedAt");
+        ReconcileExistingColumnMigration(db, "20260927070006_AddEventTypeFolders", "MediaManagementSettings", "CreateEventTypeFolders");
+    }
+
+    private static void ReconcileExistingColumnMigration(
+        SportarrDbContext db, string migrationId, string table, string column)
+    {
+        if (!HasColumn(db, table, column) || db.Database.GetAppliedMigrations().Contains(migrationId))
+            return;
+
+        if (migrationId == "20260908224021_PreservePendingPackIntent")
+        {
+            db.Database.ExecuteSqlRaw("""
+                CREATE INDEX IF NOT EXISTS "IX_PendingReleases_EventId" ON "PendingReleases" ("EventId");
+                CREATE INDEX IF NOT EXISTS "IX_PendingReleases_Status_ReleasableAt" ON "PendingReleases" ("Status", "ReleasableAt");
+                """);
+        }
+
+        // Older SQLite releases added this column before its migration existed.
+        db.Database.ExecuteSqlInterpolated(
+            $"INSERT OR IGNORE INTO \"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ({migrationId}, '9.0.0')");
     }
 
     private static bool HasColumn(SportarrDbContext db, string table, string column)

@@ -241,6 +241,36 @@ public class ReleaseMatchingService
         return fresh;
     }
 
+    // Cache these pure results because RSS sync checks each title many times.
+    // Preserve case because NormalizeTitle does not fold it.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _normalizeTitleCache
+        = new(StringComparer.Ordinal);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string?> _nonEventContentCache
+        = new(StringComparer.Ordinal);
+    private const int TitleCacheMax = 16384;
+    private static int _normalizeTitleCacheClearing;
+    private static int _nonEventContentCacheClearing;
+
+    // Clear each cache at the cap to limit memory use.
+    private static void AddBounded<TValue>(
+        System.Collections.Concurrent.ConcurrentDictionary<string, TValue> cache, string key, TValue value,
+        ref int clearing)
+    {
+        if (cache.Count >= TitleCacheMax && System.Threading.Interlocked.CompareExchange(ref clearing, 1, 0) == 0)
+        {
+            try
+            {
+                if (cache.Count >= TitleCacheMax)
+                    cache.Clear();
+            }
+            finally
+            {
+                System.Threading.Volatile.Write(ref clearing, 0);
+            }
+        }
+        cache.TryAdd(key, value);
+    }
+
     // Team name variations are now in TeamNameVariationData.cs (shared with ReleaseMatchScorer)
 
     public ReleaseMatchingService(
@@ -2394,6 +2424,16 @@ public class ReleaseMatchingService
 
     public static string NormalizeTitle(string title)
     {
+        if (_normalizeTitleCache.TryGetValue(title, out var cached))
+            return cached;
+
+        var normalized = NormalizeTitleUncached(title);
+        AddBounded(_normalizeTitleCache, title, normalized, ref _normalizeTitleCacheClearing);
+        return normalized;
+    }
+
+    internal static string NormalizeTitleUncached(string title)
+    {
         // Pre-compiled regex hot path. The matcher runs NormalizeTitle inside
         // ContainsTeamName, which itself runs inside the per-event / per-release
         // loop of RssSyncService — at scale that's millions of normalize calls
@@ -2514,7 +2554,17 @@ public class ReleaseMatchingService
     /// Detect if a release is non-event content (press conference, interview, etc.)
     /// Returns the type of non-event content detected, or null if it appears to be actual event content.
     /// </summary>
-    private string? DetectNonEventContent(string releaseTitle)
+    private static string? DetectNonEventContent(string releaseTitle)
+    {
+        if (_nonEventContentCache.TryGetValue(releaseTitle, out var cached))
+            return cached;
+
+        var detected = DetectNonEventContentUncached(releaseTitle);
+        AddBounded(_nonEventContentCache, releaseTitle, detected, ref _nonEventContentCacheClearing);
+        return detected;
+    }
+
+    internal static string? DetectNonEventContentUncached(string releaseTitle)
     {
         var searchableTitle = releaseTitle.Replace('_', ' ');
         foreach (var pattern in NonEventContentPatterns)

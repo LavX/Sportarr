@@ -59,7 +59,7 @@ public class FileNamingService
 
     /// <summary>
     /// Build complete folder path using granular folder settings
-    /// Respects CreateLeagueFolders, CreateSeasonFolders, and CreateEventFolders settings
+    /// Respects the league, season, type, and event folder settings.
     /// </summary>
     /// <param name="settings">Media management settings with folder options</param>
     /// <param name="eventInfo">Event to build path for</param>
@@ -89,6 +89,13 @@ public class FileNamingService
             {
                 pathParts.Add(seasonFolder);
             }
+        }
+
+        if (settings.CreateLeagueFolders && settings.CreateSeasonFolders && settings.CreateEventTypeFolders)
+        {
+            var eventTypeFolder = EventFolderGroupResolver.Resolve(eventInfo);
+            if (!string.IsNullOrWhiteSpace(eventTypeFolder))
+                pathParts.Add(CleanFileName(eventTypeFolder, settings.ReplaceIllegalCharacters));
         }
 
         // Event folder (e.g., "UFC 310 (2024-12-14) E45") - only if season folders are enabled.

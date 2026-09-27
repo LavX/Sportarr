@@ -71,6 +71,7 @@ app.MapGet("/api/settings", async (ConfigService configService, SportarrDbContex
         // Granular folder creation settings
         CreateLeagueFolders = dbMediaSettings?.CreateLeagueFolders ?? true,
         CreateSeasonFolders = dbMediaSettings?.CreateSeasonFolders ?? true,
+        CreateEventTypeFolders = dbMediaSettings?.CreateEventTypeFolders ?? false,
         CreateEventFolders = dbMediaSettings?.CreateEventFolders ?? false,
         ReorganizeFolders = dbMediaSettings?.ReorganizeFolders ?? false,
         CopyFiles = dbMediaSettings?.CopyFiles ?? false,
@@ -646,6 +647,7 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
                 // Granular folder creation settings
                 CreateLeagueFolders = mediaManagementSettings.CreateLeagueFolders,
                 CreateSeasonFolders = mediaManagementSettings.CreateSeasonFolders,
+                CreateEventTypeFolders = mediaManagementSettings.CreateEventTypeFolders,
                 CreateEventFolders = mediaManagementSettings.CreateEventFolders,
                 ReorganizeFolders = mediaManagementSettings.ReorganizeFolders,
                 DeleteEmptyFolders = mediaManagementSettings.DeleteEmptyFolders,
@@ -687,6 +689,7 @@ app.MapPut("/api/settings", async (AppSettings updatedSettings, ConfigService co
             // Granular folder creation settings
             dbSettings.CreateLeagueFolders = mediaManagementSettings.CreateLeagueFolders;
             dbSettings.CreateSeasonFolders = mediaManagementSettings.CreateSeasonFolders;
+            dbSettings.CreateEventTypeFolders = mediaManagementSettings.CreateEventTypeFolders;
             dbSettings.CreateEventFolders = mediaManagementSettings.CreateEventFolders;
             dbSettings.ReorganizeFolders = mediaManagementSettings.ReorganizeFolders;
             dbSettings.DeleteEmptyFolders = mediaManagementSettings.DeleteEmptyFolders;

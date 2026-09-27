@@ -561,6 +561,78 @@ public class FileNamingServiceTests
         path.Should().EndWith("Monaco Grand Prix Race (2026-05-24) E41");
     }
 
+    [Fact]
+    public void BuildFolderPath_PlacesRecognizedTypeBetweenSeasonAndEvent()
+    {
+        var settings = FolderSettings();
+        settings.CreateEventTypeFolders = true;
+        var evt = new Event
+        {
+            Title = "WWE Royal Rumble",
+            Sport = "Wrestling",
+            EventDate = new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc),
+            Season = "2026",
+            EpisodeNumber = 23,
+            League = new League { Name = "WWE", Sport = "Wrestling" }
+        };
+
+        _service.BuildFolderPath(settings, evt).Should().Be(
+            Path.Combine("WWE", "Season 2026", "PLE", "WWE Royal Rumble (2026-01-31) E23"));
+    }
+
+    [Fact]
+    public void BuildFolderPath_GroupsWithoutEventFolderWhenItIsDisabled()
+    {
+        var settings = FolderSettings();
+        settings.CreateEventTypeFolders = true;
+        settings.CreateEventFolders = false;
+        var evt = new Event
+        {
+            Title = "UFC 310",
+            Sport = "Fighting",
+            EventDate = new DateTime(2026, 9, 27, 0, 0, 0, DateTimeKind.Utc),
+            Season = "2026",
+            League = new League { Name = "UFC", Sport = "Fighting" }
+        };
+
+        _service.BuildFolderPath(settings, evt).Should().Be(Path.Combine("UFC", "Season 2026", "PPV"));
+    }
+
+    [Fact]
+    public void BuildFolderPath_LeavesUnsupportedLeagueUngrouped()
+    {
+        var settings = FolderSettings();
+        settings.CreateEventTypeFolders = true;
+        settings.CreateEventFolders = false;
+        var evt = new Event
+        {
+            Title = "Arsenal vs Chelsea",
+            Sport = "Soccer",
+            EventDate = new DateTime(2026, 9, 27, 0, 0, 0, DateTimeKind.Utc),
+            Season = "2026",
+            League = new League { Name = "Premier League", Sport = "Soccer" }
+        };
+
+        _service.BuildFolderPath(settings, evt).Should().Be(Path.Combine("Premier League", "Season 2026"));
+    }
+
+    [Fact]
+    public void BuildFolderPath_KeepsExistingLayoutWhenTypeFoldersAreDisabled()
+    {
+        var settings = FolderSettings();
+        var evt = new Event
+        {
+            Title = "UFC 310",
+            Sport = "Fighting",
+            EventDate = new DateTime(2026, 9, 27, 0, 0, 0, DateTimeKind.Utc),
+            Season = "2026",
+            League = new League { Name = "UFC", Sport = "Fighting" }
+        };
+
+        _service.BuildFolderPath(settings, evt).Should().Be(
+            Path.Combine("UFC", "Season 2026", "UFC 310 (2026-09-27) E01"));
+    }
+
     [Theory]
     [InlineData("Mexico City Grand Prix Practice 3", "Mexico City Grand Prix")]
     [InlineData("MXGP of Portugal Race 2", "MXGP of Portugal")]

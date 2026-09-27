@@ -23,6 +23,7 @@ import SortableFilterableHeader from '../components/SortableFilterableHeader';
 import { useColumnVisibility } from '../hooks/useColumnVisibility';
 import { useCompactView } from '../hooks/useCompactView';
 import { applyTableSortFilter, useTableSortFilter } from '../hooks/useTableSortFilter';
+import { BUTTON_SECONDARY } from '../utils/designTokens';
 import { getSportIcon } from '../utils/sportIcons';
 import type { DiscoveredLeague, FollowedTeam, QualityProfile, Team } from '../types';
 
@@ -56,6 +57,7 @@ const TABLE_ROW_HOVER = 'text-sm transition-colors hover:bg-gray-800/50';
 const BADGE_RED = 'whitespace-nowrap rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400';
 const BADGE_GREEN = 'whitespace-nowrap rounded bg-green-900/30 px-1.5 py-0.5 text-xs text-green-400';
 const SCROLLABLE_LIST = 'max-h-60 overflow-y-auto';
+const TEAMS_PAGE_SIZE = 60;
 
 type TeamsColumnKey = 'badge' | 'name' | 'sport' | 'country' | 'status' | 'actions';
 
@@ -107,6 +109,7 @@ export default function TeamsPage() {
   const [activeTab, setActiveTab] = useState<'teams' | 'athletes'>('teams');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSport, setSelectedSport] = useState('all');
+  const [visibleCount, setVisibleCount] = useState(TEAMS_PAGE_SIZE);
   const [expandedTeamId, setExpandedTeamId] = useState<string | null>(null);
   const [discoveredLeagues, setDiscoveredLeagues] = useState<DiscoveredLeague[]>([]);
   const [isDiscovering, setIsDiscovering] = useState(false);
@@ -227,6 +230,23 @@ export default function TeamsPage() {
       })
       .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
   }, [allTeams, searchQuery, selectedSport]);
+
+  const tableData = useMemo(() => compactView ? applyTableSortFilter(
+    filteredTeams,
+    colFilters,
+    sortCol,
+    sortDir,
+    (col, team) => {
+      switch (col) {
+        case 'name': return String(team.name || '');
+        case 'sport': return String(team.sport || '');
+        case 'country': return String(team.country || '');
+        default: return '';
+      }
+    }
+  ) : [], [compactView, filteredTeams, colFilters, sortCol, sortDir]);
+  const matchingTeamCount = compactView ? tableData.length : filteredTeams.length;
+  const shownTeamCount = Math.min(visibleCount, matchingTeamCount);
 
   const followTeamMutation = useMutation({
     mutationFn: async (team: Team) => apiClient.post<FollowedTeam>('/followed-teams', {
@@ -574,26 +594,21 @@ export default function TeamsPage() {
     </div>
   );
 
-  const renderCompactTable = () => {
-    const tableData = applyTableSortFilter(
-      filteredTeams,
-      colFilters,
-      sortCol,
-      sortDir,
-      (col, team) => {
-        switch (col) {
-          case 'name':
-            return String(team.name || '');
-          case 'sport':
-            return String(team.sport || '');
-          case 'country':
-            return String(team.country || '');
-          default:
-            return '';
-        }
-      }
-    );
+  const renderShowMore = (total: number) => (
+    total > visibleCount ? (
+      <div className="mt-6 flex justify-center">
+        <button
+          type="button"
+          onClick={() => setVisibleCount((count) => count + TEAMS_PAGE_SIZE)}
+          className={`${BUTTON_SECONDARY} min-h-11`}
+        >
+          Show more ({(total - visibleCount).toLocaleString()} remaining)
+        </button>
+      </div>
+    ) : null
+  );
 
+  const renderCompactTable = () => {
     const visibleColumnCount = TEAM_COLUMN_DEFS.filter((column) => isVisible(column.key)).length;
 
     return (
@@ -662,7 +677,7 @@ export default function TeamsPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
-              {tableData.map((team) => {
+              {tableData.slice(0, visibleCount).map((team) => {
                 const isFollowed = team.externalId ? followedTeamIds.has(team.externalId) : false;
                 const followedTeam = team.externalId ? getFollowedTeam(team.externalId) : null;
                 const isExpanded = expandedTeamId === team.externalId;
@@ -676,6 +691,8 @@ export default function TeamsPage() {
                             <img
                               src={team.badgeUrl}
                               alt={team.name}
+                              loading="lazy"
+                              decoding="async"
                               className="max-h-full max-w-full object-contain"
                             />
                           ) : (
@@ -777,7 +794,7 @@ export default function TeamsPage() {
             </tbody>
           </CompactTableFrame>
         )}
-
+        {renderShowMore(tableData.length)}
       </>
     );
   };
@@ -856,14 +873,20 @@ export default function TeamsPage() {
             <input
               type="text"
               value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setVisibleCount(TEAMS_PAGE_SIZE);
+              }}
               placeholder="Filter teams (e.g., Real Madrid, Lakers, Bruins)..."
               className="w-full pl-10 pr-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-red-600 focus:ring-1 focus:ring-red-600"
             />
           </div>
           <select
             value={selectedSport}
-            onChange={(event) => setSelectedSport(event.target.value)}
+            onChange={(event) => {
+              setSelectedSport(event.target.value);
+              setVisibleCount(TEAMS_PAGE_SIZE);
+            }}
             className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-white focus:border-red-600 focus:outline-none focus:ring-2 focus:ring-red-600/20 md:text-base"
             title="Filter by sport"
           >
@@ -875,7 +898,9 @@ export default function TeamsPage() {
           </select>
         </div>
         <p className="mb-6 text-sm text-gray-500">
-          Showing {isLoadingTeams ? '...' : filteredTeams.length} of {allTeams.length} teams
+          {isLoadingTeams
+            ? 'Loading teams...'
+            : `Showing ${shownTeamCount.toLocaleString()} of ${matchingTeamCount.toLocaleString()} ${matchingTeamCount === 1 ? 'team' : 'teams'}${matchingTeamCount !== allTeams.length ? ` (${allTeams.length.toLocaleString()} total)` : ''}`}
           {searchQuery && ` matching "${searchQuery}"`}
           {selectedSport !== 'all' && ` in ${SPORT_FILTERS.find((sport) => sport.id === selectedSport)?.name}`}
         </p>
@@ -905,7 +930,7 @@ export default function TeamsPage() {
               renderCompactTable()
             ) : filteredTeams.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {filteredTeams.map((team) => {
+                {filteredTeams.slice(0, visibleCount).map((team) => {
                   const isFollowed = team.externalId ? followedTeamIds.has(team.externalId) : false;
                   const isExpanded = expandedTeamId === team.externalId;
                   const followedTeam = team.externalId ? getFollowedTeam(team.externalId) : null;
@@ -925,6 +950,8 @@ export default function TeamsPage() {
                             <img
                               src={team.badgeUrl}
                               alt={team.name}
+                              loading="lazy"
+                              decoding="async"
                               className="max-h-full max-w-full object-contain"
                             />
                           ) : (
@@ -1021,6 +1048,7 @@ export default function TeamsPage() {
                 </p>
               </div>
             )}
+            {!compactView && renderShowMore(filteredTeams.length)}
           </div>
         )}
 
