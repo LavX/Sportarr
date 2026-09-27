@@ -393,12 +393,8 @@ public class ReleaseMatchingService
             }
         }
 
-        // VALIDATION 0b: Pre-event scene fake. Opt-in per-indexer via
-        // Indexer.EarlyReleaseLimit (days). When set to a positive value,
-        // reject releases posted to the indexer more than that many days
-        // before the event aired — legitimate recordings of live sports
-        // can't exist before the event. Null/0/missing limit skips the
-        // check entirely so the user controls how aggressive this is.
+        // VALIDATION 0b: Reject releases posted more than seven days before an event.
+        // A positive indexer limit can tighten this cutoff.
         //
         // Normalise both sides to UTC instants before comparing. release.PublishDate
         // comes off indexer feeds as DateTimeKind.Utc, but evt.EventDate is hydrated
@@ -409,21 +405,24 @@ public class ReleaseMatchingService
         // against a UTC publishDate by raw clock-time, letting genuine pre-event
         // scene fakes slip through (or rejecting legitimate releases) depending on
         // which side of the timezone offset the cutoff happened to fall.
-        if (earlyReleaseLimitDays.HasValue && earlyReleaseLimitDays.Value > 0
-            && release.PublishDate != default && evt.EventDate != default)
+        if (release.PublishDate != default && evt.EventDate != default)
         {
+            const int defaultEarlyReleaseLimitDays = 7;
+            var effectiveEarlyReleaseLimitDays = earlyReleaseLimitDays is > 0
+                ? Math.Min(earlyReleaseLimitDays.Value, defaultEarlyReleaseLimitDays)
+                : defaultEarlyReleaseLimitDays;
             var publishUtc = release.PublishDate.Kind == DateTimeKind.Unspecified
                 ? DateTime.SpecifyKind(release.PublishDate, DateTimeKind.Utc)
                 : release.PublishDate.ToUniversalTime();
             var eventUtc = evt.EventDate.Kind == DateTimeKind.Unspecified
                 ? DateTime.SpecifyKind(evt.EventDate, DateTimeKind.Utc)
                 : evt.EventDate.ToUniversalTime();
-            var publishCutoff = eventUtc.AddDays(-earlyReleaseLimitDays.Value);
+            var publishCutoff = eventUtc.AddDays(-effectiveEarlyReleaseLimitDays);
             if (publishUtc < publishCutoff)
             {
                 result.Confidence -= 100;
                 result.IsHardRejection = true;
-                result.Rejections.Add($"Release posted {(eventUtc - publishUtc).TotalHours:F1}h before event aired, exceeds indexer's {earlyReleaseLimitDays.Value}d early-release limit");
+                result.Rejections.Add($"Release posted {(eventUtc - publishUtc).TotalHours:F1}h before event aired, exceeds {effectiveEarlyReleaseLimitDays}d early-release limit");
                 // Matches the log level used by every other Hard rejection
                 // branch in this method — the rejection is the matcher
                 // doing its job, not an operator-actionable event, and
@@ -432,7 +431,7 @@ public class ReleaseMatchingService
                 // alongside fresh releases.
                 _logger.LogDebug(
                     "[Release Matching] Hard rejection: pre-event release '{Release}' posted {PubDate} for event {EventDate} (limit {Limit}d)",
-                    release.Title, publishUtc, eventUtc, earlyReleaseLimitDays.Value);
+                    release.Title, publishUtc, eventUtc, effectiveEarlyReleaseLimitDays);
                 return result;
             }
         }

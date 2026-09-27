@@ -150,10 +150,9 @@ app.MapPost("/api/indexer", async (HttpRequest request, SportarrDbContext db, IL
                             : 0;
                         break;
                     case "earlyReleaseLimit":
-                        // Empty, 0, negative, or non-numeric all persist as null so the
-                        // matcher's opt-in check stays off. Only a positive int enables it.
+                        // Null uses the seven-day default. A positive value can tighten it.
                         indexer.EarlyReleaseLimit = int.TryParse(fieldValue, out var earlyLimit) && earlyLimit > 0
-                            ? earlyLimit
+                            ? Math.Min(earlyLimit, 7)
                             : null;
                         break;
                     case "cookie":
@@ -349,10 +348,9 @@ app.MapPut("/api/indexer/{id:int}", async (int id, HttpRequest request, Sportarr
                             : 0;
                         break;
                     case "earlyReleaseLimit":
-                        // Empty, 0, negative, or non-numeric all persist as null so the
-                        // matcher's opt-in check stays off. Only a positive int enables it.
+                        // Null uses the seven-day default. A positive value can tighten it.
                         indexer.EarlyReleaseLimit = int.TryParse(fieldValue, out var earlyLimitUpdate) && earlyLimitUpdate > 0
-                            ? earlyLimitUpdate
+                            ? Math.Min(earlyLimitUpdate, 7)
                             : null;
                         break;
                     case "cookie":

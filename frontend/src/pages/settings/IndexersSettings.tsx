@@ -204,7 +204,7 @@ export default function IndexersSettings() {
         grabLimit: grabLimit ? parseInt(grabLimit, 10) : undefined,
         requestDelayMs: requestDelayMs ? parseInt(requestDelayMs, 10) : undefined,
         seasonPackSeedTime: seasonPackSeedTime ? parseInt(seasonPackSeedTime, 10) : undefined,
-        earlyReleaseLimit: earlyReleaseLimit ? parseInt(earlyReleaseLimit, 10) : undefined,
+        earlyReleaseLimit: earlyReleaseLimit ? Math.min(parseInt(earlyReleaseLimit, 10), 7) : undefined,
         additionalParameters: additionalParameters || undefined,
         multiLanguages: multiLanguages ? multiLanguages.split(',').map(l => l.trim()) : undefined,
         rejectBlocklistedTorrentHashes: rejectBlocklistedTorrentHashes ? rejectBlocklistedTorrentHashes === 'true' : true,
@@ -987,14 +987,15 @@ export default function IndexersSettings() {
                     handleFormChange('earlyReleaseLimit', undefined);
                   } else {
                     const parsed = parseInt(raw, 10);
-                    handleFormChange('earlyReleaseLimit', Number.isNaN(parsed) ? undefined : parsed);
+                    handleFormChange('earlyReleaseLimit', Number.isNaN(parsed) ? undefined : Math.min(parsed, 7));
                   }
                 }}
                 min="0"
+                max="7"
                 className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
               />
               <p className="text-xs text-gray-500 mt-1">
-                Reject releases posted more than this many days before the event aired. Leave blank or 0 to disable.
+                Releases posted more than 7 days before the event are always rejected. Set a smaller number for a stricter limit. Blank or 0 uses 7 days.
               </p>
             </div>
 
