@@ -23,7 +23,7 @@ public class BroadcasTheNetClientTests
         _rateLimit = new Mock<IRateLimitService>();
 
         _rateLimit
-            .Setup(r => r.WaitAndPulseAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>()))
+            .Setup(r => r.WaitAndPulseAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         var httpClient = new HttpClient(_handler.Object);

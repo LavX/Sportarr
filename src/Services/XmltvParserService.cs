@@ -20,6 +20,7 @@ public class XmltvParserService
 {
     private readonly ILogger<XmltvParserService> _logger;
     private readonly HttpClient _httpClient;
+    private readonly ConfigService _configService;
 
     // Common sports keywords for auto-detection
     private static readonly string[] SportsKeywords = new[]
@@ -37,10 +38,14 @@ public class XmltvParserService
         @"^(\d{14})(?:\s*([+-]\d{4}))?$",
         RegexOptions.Compiled);
 
-    public XmltvParserService(ILogger<XmltvParserService> logger, IHttpClientFactory httpClientFactory)
+    public XmltvParserService(
+        ILogger<XmltvParserService> logger,
+        IHttpClientFactory httpClientFactory,
+        ConfigService configService)
     {
         _logger = logger;
         _httpClient = httpClientFactory.CreateClient("EpgClient");
+        _configService = configService;
         _httpClient.Timeout = TimeSpan.FromMinutes(5); // EPG files can be large
     }
 
@@ -61,11 +66,10 @@ public class XmltvParserService
     private const long MaxDecompressedBytes = 512L * 1024 * 1024;
 
     /// <summary>
-    /// Ceiling on the download itself, matching the bound the whole-buffer
-    /// path applied to the fetched bytes.
+    /// A user can raise the normal download limit for a larger guide. Keep an
+    /// absolute ceiling because a fast endless response can fill temporary
+    /// storage before the download deadline expires.
     /// </summary>
-    private const long MaxDownloadBytes = 128L * 1024 * 1024;
-
     private static readonly TimeSpan DownloadDeadline = TimeSpan.FromMinutes(15);
 
     /// <summary>
@@ -87,6 +91,13 @@ public class XmltvParserService
 
         try
         {
+            var config = await _configService.GetConfigAsync();
+            var maxDownloadSizeMb = Math.Clamp(
+                config.EpgMaxDownloadSizeMb,
+                Config.MinimumEpgMaxDownloadSizeMb,
+                Config.MaximumEpgMaxDownloadSizeMb);
+            var maxDownloadBytes = (long)maxDownloadSizeMb * 1024 * 1024;
+
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             deadline.CancelAfter(DownloadDeadline);
 
@@ -102,9 +113,9 @@ public class XmltvParserService
                 while ((read = await body.ReadAsync(buffer, deadline.Token)) > 0)
                 {
                     total += read;
-                    if (total > MaxDownloadBytes)
+                    if (total > maxDownloadBytes)
                     {
-                        throw new InvalidDataException($"The EPG guide is larger than the {MaxDownloadBytes / (1024 * 1024)} MB download limit.");
+                        throw new InvalidDataException($"The EPG guide is larger than the {maxDownloadSizeMb} MB download limit.");
                     }
 
                     await file.WriteAsync(buffer.AsMemory(0, read), deadline.Token);

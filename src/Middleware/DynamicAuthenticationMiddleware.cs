@@ -40,7 +40,7 @@ public class DynamicAuthenticationMiddleware
         }
 
         // Allow public paths
-        if (IsPublicPath(path))
+        if (IsPublicPath(path, context.Request.Method))
         {
             await _next(context);
             return;
@@ -269,7 +269,7 @@ public class DynamicAuthenticationMiddleware
         }
     }
 
-    private bool IsPublicPath(string path)
+    internal static bool IsPublicPath(string path, string method)
     {
         return path.StartsWith("/assets/") ||
                // Sonarr-compatible SignalR hub for Bazarr. The WebSocket
@@ -285,7 +285,7 @@ public class DynamicAuthenticationMiddleware
                path.StartsWith("/api/logout") ||
                path.StartsWith("/api/auth/check") ||
                path.StartsWith("/api/iptv/stream/") ||  // Stream proxy - media players make their own requests
-               path.StartsWith("/api/v1/stream/") ||    // FFmpeg HLS stream endpoints
+               IsPublicHlsAssetPath(path, method) ||
                path.StartsWith("/api/metadata/agents/") || // Read-only media-server agent metadata (Plex/Emby/Jellyfin send no api key)
                path.StartsWith("/api/metadata/match") ||   // Read-only single-event match for media agents
                path.StartsWith("/api/health") ||           // Agent config validators probe this with no api key
@@ -299,6 +299,19 @@ public class DynamicAuthenticationMiddleware
                // reached anonymously just by ending the final segment in ".png"/".css"/etc
                // (e.g. DELETE /api/system/backup/x.css), bypassing the auth gate entirely.
                (!path.StartsWith("/api/") && IsStaticAssetPath(path));
+    }
+
+    private static bool IsPublicHlsAssetPath(string path, string method)
+    {
+        if (!HttpMethods.IsGet(method) || !path.StartsWith("/api/v1/stream/"))
+        {
+            return false;
+        }
+
+        var parts = path["/api/v1/stream/".Length..]
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 2
+            && (parts[1] == "playlist.m3u8" || parts[1].EndsWith(".ts", StringComparison.Ordinal));
     }
 
     private static bool IsStaticAssetPath(string path)

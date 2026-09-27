@@ -36,10 +36,10 @@ export default function SettingsHeader({
       <div className="md:sticky md:top-0 z-30 bg-gradient-to-r from-gray-900 via-black to-gray-900 border-b border-red-900/30 backdrop-blur-sm mb-8">
         <div className="flex flex-col gap-4 p-4 sm:p-6 md:flex-row md:items-start md:justify-between">
           <div className="min-w-0">
-            <h1 className="text-3xl font-bold text-white mb-1">{title}</h1>
-            {subtitle && <p className="text-gray-400">{subtitle}</p>}
+            <h1 className="break-words text-2xl font-bold text-white md:text-3xl mb-1">{title}</h1>
+            {subtitle && <p className="break-words text-gray-400">{subtitle}</p>}
           </div>
-          <div className="flex flex-wrap items-center gap-3 md:justify-end">
+          <div className="flex min-w-0 flex-wrap items-center gap-3 md:justify-end">
             {children}
             {showSaveButton && onSave && (
               <div className="relative">

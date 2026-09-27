@@ -117,7 +117,8 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
 
 # Copy entrypoint script
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+COPY docker-startup-script.sh /docker-startup-script.sh
+RUN chmod +x /docker-entrypoint.sh /docker-startup-script.sh
 
 # Create sportarr user and set permissions
 RUN groupadd -g 13001 sportarr && \

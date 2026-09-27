@@ -31,10 +31,13 @@ Day-to-day discovery does not depend on the scan. The filesystem watcher picks u
 Open the interactive search and read the rejection column. The usual suspects are the quality profile (the release's quality isn't enabled in the profile assigned to that league) and custom format scores (a format with a large negative score, like a no-release-group rule imported from movie-oriented guides, can push sports TV captures below the minimum). Sports releases often have no release group, so aggressive No-RlsGroup penalties will reject most of them.
 
 **The same event downloaded twice?**
-An event that is already downloading is not searched again, however long the transfer takes, so a second release cannot be grabbed while the first is on its way. If you do see two grabs for one event, check the Activity page for a download that failed or was removed outside Sportarr, since that frees the event to be searched again.
+Background searches skip an event or part while its download is active. Choosing **Auto Search** yourself bypasses this check and can grab another release. If you see an unexpected duplicate, check the Activity page for a download that failed or was removed outside Sportarr, since that frees the event or part to be searched again.
 
 **Nothing found for an event you can see on the tracker?**
-Check the league's quality profile allows the release's quality, and verify the indexer's categories include TV/Sport (5060). Movies categories (2000-series) help on indexers that file sports there.
+Interactive event searches omit category filters so a release filed outside the usual sports categories can still appear. Check the rejection reasons and the league's quality profile. Automatic searches and RSS use the configured categories, so include TV/Sport (5060) and any other categories your indexer uses for sports.
+
+**Repeated searches return the same releases?**
+Sportarr reuses recent search results and preserves their indexer, release group and quality information. Matching requests to the same indexer account can also share a response within one search or RSS operation. Each configured indexer's filtering still applies. An empty or short response does not always mean the indexer has returned every matching release.
 
 ## Indexers
 
@@ -85,4 +88,4 @@ Because the whole domain belongs to Sportarr here, one `location /` block that p
 The event must be monitored, the league needs a mapped channel (or EPG/broadcaster match), and the league's **Automatic DVR scheduling** toggle must be on.
 
 **Recording fails at startup with a connection timed out error?**
-Some providers take 15 to 25 seconds to deliver the first byte of a cold stream. In **Settings > DVR Recordings**, keep **Read Timeout** at 0 or above the slowest start you see, and raise **Max Retry Wait** if the source refuses the stream for the first few seconds.
+Some providers take 15 to 25 seconds to deliver the first byte of a cold stream. In **IPTV > Options > Recording > Advanced**, keep **Read Timeout** at 0 or above the slowest start you see, and raise **Max Retry Wait** if the source refuses the stream for the first few seconds.

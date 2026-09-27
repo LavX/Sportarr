@@ -1,6 +1,7 @@
 using System.Data.Common;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Sportarr.Api.Helpers;
+using Sportarr.Api.Services;
 
 namespace Sportarr.Api.Data;
 
@@ -13,9 +14,34 @@ namespace Sportarr.Api.Data;
 /// Every override is a no-op outside a <see cref="SyncMetrics"/> measured
 /// block (a single AsyncLocal read), so this imposes no meaningful overhead
 /// on normal request-path queries.
+///
+/// It also reports failed commands to the <see cref="DatabaseHealthTracker"/>.
+/// Every query in the app passes through here, so a damaged database is seen
+/// wherever it is first touched, and no health surface has to run a PRAGMA of
+/// its own to find out.
 /// </summary>
 public sealed class CommandCountingInterceptor : DbCommandInterceptor
 {
+    private readonly DatabaseHealthTracker _databaseHealth;
+
+    public CommandCountingInterceptor(DatabaseHealthTracker databaseHealth)
+    {
+        _databaseHealth = databaseHealth;
+    }
+
+    public override void CommandFailed(DbCommand command, CommandErrorEventData eventData)
+    {
+        _databaseHealth.RecordFailure(eventData.Exception);
+        base.CommandFailed(command, eventData);
+    }
+
+    public override Task CommandFailedAsync(
+        DbCommand command, CommandErrorEventData eventData, CancellationToken cancellationToken = default)
+    {
+        _databaseHealth.RecordFailure(eventData.Exception);
+        return base.CommandFailedAsync(command, eventData, cancellationToken);
+    }
+
     public override DbDataReader ReaderExecuted(
         DbCommand command, CommandExecutedEventData eventData, DbDataReader result)
     {

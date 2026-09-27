@@ -27,6 +27,7 @@ public class RssSyncService : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<RssSyncService> _logger;
+    private readonly SemaphoreSlim _syncGate = new(1, 1);
 
     // Track when we last did a sync for catch-up logic
     private DateTime _lastSyncTime = DateTime.MinValue;
@@ -61,13 +62,13 @@ public class RssSyncService : BackgroundService
 
                 _logger.LogInformation("[RSS Sync] Starting RSS sync cycle (interval: {Interval} min)", intervalMinutes);
 
-                await PerformRssSyncAsync(stoppingToken);
+                await SyncNowAsync(stoppingToken);
 
                 _lastSyncTime = DateTime.UtcNow;
 
                 await Task.Delay(syncInterval, stoppingToken);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 // Normal shutdown
                 break;
@@ -83,13 +84,28 @@ public class RssSyncService : BackgroundService
         _logger.LogInformation("[RSS Sync] Service stopped");
     }
 
+    public async Task SyncNowAsync(CancellationToken cancellationToken)
+    {
+        await _syncGate.WaitAsync(cancellationToken);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await PerformRssSyncAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        finally
+        {
+            _syncGate.Release();
+        }
+    }
+
     /// <summary>
     /// Perform a passive RSS sync:
     /// 1. Fetch all RSS feeds (ONE query per indexer)
     /// 2. Match releases locally against monitored events
     /// 3. Grab matching releases
     /// </summary>
-    private async Task PerformRssSyncAsync(CancellationToken cancellationToken)
+    protected virtual async Task PerformRssSyncAsync(CancellationToken cancellationToken)
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
@@ -170,11 +186,32 @@ public class RssSyncService : BackgroundService
         // Note: Specifications is stored as JSON in CustomFormat, not a navigation property, so no Include needed.
         var qualityProfiles = await db.QualityProfiles.ToListAsync(cancellationToken);
         var customFormats = await db.CustomFormats.ToListAsync(cancellationToken);
+        var qualityDefinitions = await db.QualityDefinitions.ToListAsync(cancellationToken);
         var releaseProfiles = await releaseProfileService.LoadReleaseProfilesAsync();
         var earlyReleaseLimits = await db.Indexers
             .Where(i => i.EarlyReleaseLimit.HasValue)
             .Select(i => new { i.Id, i.EarlyReleaseLimit })
             .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit, cancellationToken);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(db, cancellationToken);
+        var releaseDates = recentReleases
+            .Select(release => releaseMatchingService.ParseRelease(release.Title).EventDate)
+            .Where(date => date.HasValue)
+            .Select(date => date!.Value)
+            .ToArray();
+        var datePeerLeagueIds = monitoredEvents
+            .Where(EventDateMatchContext.ShouldLoadPeers)
+            .Select(evt => evt.LeagueId)
+            .Where(leagueId => leagueId.HasValue)
+            .Select(leagueId => leagueId!.Value)
+            .Distinct()
+            .ToArray();
+        var datePeers = await EventDateMatchContext.LoadAsync(
+            db,
+            releaseDates,
+            datePeerLeagueIds,
+            cancellationToken);
+        var roundRaceNumbersByRound = await LoadSupercarsRoundRaceNumbersAsync(
+            db, monitoredEvents, cancellationToken);
 
         _logger.LogDebug("[RSS Sync] Loaded {ProfileCount} quality profiles, {FormatCount} custom formats, {ReleaseProfileCount} release profiles for evaluation",
             qualityProfiles.Count, customFormats.Count, releaseProfiles.Count);
@@ -183,13 +220,21 @@ public class RssSyncService : BackgroundService
         // This is the inverse of the old approach (per-event search)
         foreach (var release in recentReleases)
         {
-            if (cancellationToken.IsCancellationRequested)
-                break;
+            cancellationToken.ThrowIfCancellationRequested();
 
             try
             {
                 // Try to match this release to a monitored event
-                var matchedEvent = FindMatchingEvent(release, monitoredEvents, releaseMatchingService, config.EnableMultiPartEpisodes, earlyReleaseLimits);
+                var matchedEvent = FindMatchingEvent(
+                    release,
+                    monitoredEvents,
+                    releaseMatchingService,
+                    partDetector,
+                    config.EnableMultiPartEpisodes,
+                    earlyReleaseLimits,
+                    knownLeagues,
+                    datePeers,
+                    roundRaceNumbersByRound);
 
                 if (matchedEvent == null)
                     continue;
@@ -203,8 +248,9 @@ public class RssSyncService : BackgroundService
                 if (qualityProfile != null)
                 {
                     EvaluateMatchedRelease(
-                        release, matchedEvent, qualityProfile, customFormats, releaseProfiles,
-                        releaseEvaluator, releaseProfileService, config.EnableMultiPartEpisodes);
+                        release, matchedEvent, qualityProfile, customFormats, qualityDefinitions, releaseProfiles,
+                        releaseEvaluator, releaseProfileService, config.EnableMultiPartEpisodes,
+                        config.DefaultSportsRuntimeMinutes);
 
                     // Skip if evaluation rejected the release
                     if (release.Rejections.Any())
@@ -219,6 +265,7 @@ public class RssSyncService : BackgroundService
                 }
 
                 // Check if we should grab this release (now returns part info too)
+                using var eventDecision = await downloadClientService.EnterEventDecisionAsync(matchedEvent.Id, cancellationToken);
                 var shouldGrab = await ShouldGrabReleaseAsync(
                     db, matchedEvent, release, config, qualityProfile, partDetector, delayProfileService, downloadClientService, cancellationToken);
 
@@ -230,11 +277,15 @@ public class RssSyncService : BackgroundService
                 }
 
                 // GRAB IT! (pass the detected part)
+                var cascadeParts = await GetCascadingPartSearchTargetsAsync(
+                    db, matchedEvent, release.Quality, shouldGrab.ReleasePart, qualityProfile, config, cancellationToken);
                 var grabbed = await GrabReleaseAsync(
                     db, matchedEvent, release, downloadClientService, notificationService, shouldGrab.ReleasePart, cancellationToken);
+                eventDecision.Dispose();
 
                 if (grabbed)
                 {
+                    StartCascadingPartSearchesAfterGrab(matchedEvent, release.Quality, shouldGrab.ReleasePart, cascadeParts);
                     if (matchedEvent.HasFile)
                     {
                         upgradesFound++;
@@ -251,6 +302,10 @@ public class RssSyncService : BackgroundService
                     // Rate limiting between grabs
                     await Task.Delay(1000, cancellationToken);
                 }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -285,19 +340,28 @@ public class RssSyncService : BackgroundService
         Event matchedEvent,
         QualityProfile qualityProfile,
         List<CustomFormat> customFormats,
+        List<QualityDefinition> qualityDefinitions,
         List<ReleaseProfile> releaseProfiles,
         ReleaseEvaluator releaseEvaluator,
         ReleaseProfileService releaseProfileService,
-        bool enableMultiPartEpisodes)
+        bool enableMultiPartEpisodes,
+        int defaultRuntimeMinutes)
     {
+        var isPack = PackImportBoundary.IsPackRelease(
+            release.Title, release.IsPack, release.SportarrLeagueId, release.SportarrEventId);
         var evaluation = releaseEvaluator.EvaluateRelease(
             release,
             qualityProfile,
             customFormats,
+            qualityDefinitions,
             requestedPart: null, // Passive discovery doesn't request specific parts
             sport: matchedEvent.Sport,
             enableMultiPartEpisodes: enableMultiPartEpisodes,
-            allowHighlights: matchedEvent.League?.AllowHighlights ?? false);
+            eventTitle: matchedEvent.Title,
+            runtimeMinutes: defaultRuntimeMinutes,
+            allowHighlights: matchedEvent.League?.AllowHighlights ?? false,
+            isSizeExemptPack: isPack,
+            leagueName: matchedEvent.League?.Name);
 
         // Apply evaluation results to release (same as IndexerSearchService does)
         release.Quality = evaluation.Quality;
@@ -381,9 +445,33 @@ public class RssSyncService : BackgroundService
             .Where(i => i.EarlyReleaseLimit.HasValue)
             .Select(i => new { i.Id, i.EarlyReleaseLimit })
             .ToDictionaryAsync(i => i.Id, i => i.EarlyReleaseLimit, cancellationToken);
+        var knownLeagues = await LeagueMatchContext.LoadAsync(db, cancellationToken);
+        var parsedReleaseDate = releaseMatchingService.ParseRelease(release.Title).EventDate;
+        var datePeerLeagueIds = monitoredEvents
+            .Where(EventDateMatchContext.ShouldLoadPeers)
+            .Select(evt => evt.LeagueId)
+            .Where(leagueId => leagueId.HasValue)
+            .Select(leagueId => leagueId!.Value)
+            .Distinct()
+            .ToArray();
+        var datePeers = await EventDateMatchContext.LoadAsync(
+            db,
+            parsedReleaseDate.HasValue ? new[] { parsedReleaseDate.Value } : Array.Empty<DateTime>(),
+            datePeerLeagueIds,
+            cancellationToken);
+        var roundRaceNumbersByRound = await LoadSupercarsRoundRaceNumbersAsync(
+            db, monitoredEvents, cancellationToken);
 
         var matchedEvent = FindMatchingEvent(
-            release, monitoredEvents, releaseMatchingService, config.EnableMultiPartEpisodes, earlyReleaseLimits);
+            release,
+            monitoredEvents,
+            releaseMatchingService,
+            partDetector,
+            config.EnableMultiPartEpisodes,
+            earlyReleaseLimits,
+            knownLeagues,
+            datePeers,
+            roundRaceNumbersByRound);
 
         if (matchedEvent == null)
         {
@@ -393,6 +481,7 @@ public class RssSyncService : BackgroundService
 
         var qualityProfiles = await db.QualityProfiles.ToListAsync(cancellationToken);
         var customFormats = await db.CustomFormats.ToListAsync(cancellationToken);
+        var qualityDefinitions = await db.QualityDefinitions.ToListAsync(cancellationToken);
         var releaseProfiles = await releaseProfileService.LoadReleaseProfilesAsync();
 
         var qualityProfile = ResolveQualityProfile(matchedEvent, qualityProfiles);
@@ -400,13 +489,15 @@ public class RssSyncService : BackgroundService
         if (qualityProfile != null)
         {
             EvaluateMatchedRelease(
-                release, matchedEvent, qualityProfile, customFormats, releaseProfiles,
-                releaseEvaluator, releaseProfileService, config.EnableMultiPartEpisodes);
+                release, matchedEvent, qualityProfile, customFormats, qualityDefinitions, releaseProfiles,
+                releaseEvaluator, releaseProfileService, config.EnableMultiPartEpisodes,
+                config.DefaultSportsRuntimeMinutes);
 
             if (release.Rejections.Any())
                 return new PushedReleaseOutcome(false, false, matchedEvent.Title, release.Rejections.ToList());
         }
 
+        using var eventDecision = await downloadClientService.EnterEventDecisionAsync(matchedEvent.Id, cancellationToken);
         var shouldGrab = await ShouldGrabReleaseAsync(
             db, matchedEvent, release, config, qualityProfile, partDetector, delayProfileService, downloadClientService, cancellationToken);
 
@@ -420,6 +511,8 @@ public class RssSyncService : BackgroundService
                 new List<string> { shouldGrab.Reason });
         }
 
+        var cascadeParts = await GetCascadingPartSearchTargetsAsync(
+            db, matchedEvent, release.Quality, shouldGrab.ReleasePart, qualityProfile, config, cancellationToken);
         var grabbed = await GrabReleaseAsync(
             db, matchedEvent, release, downloadClientService, notificationService, shouldGrab.ReleasePart, cancellationToken);
 
@@ -429,6 +522,8 @@ public class RssSyncService : BackgroundService
                 new List<string> { "Failed to send release to a download client" });
         }
 
+        eventDecision.Dispose();
+        StartCascadingPartSearchesAfterGrab(matchedEvent, release.Quality, shouldGrab.ReleasePart, cascadeParts);
         return new PushedReleaseOutcome(true, false, matchedEvent.Title, new List<string>());
     }
 
@@ -508,8 +603,12 @@ public class RssSyncService : BackgroundService
         ReleaseSearchResult release,
         List<Event> monitoredEvents,
         ReleaseMatchingService matchingService,
+        EventPartDetector partDetector,
         bool enableMultiPartEpisodes,
-        IReadOnlyDictionary<int, int?> earlyReleaseLimits)
+        IReadOnlyDictionary<int, int?> earlyReleaseLimits,
+        IReadOnlyCollection<League> knownLeagues,
+        IReadOnlyCollection<Event> datePeers,
+        IReadOnlyDictionary<(int? LeagueId, string? Season, string? Round), List<int>> roundRaceNumbersByRound)
     {
         Event? bestMatch = null;
         int bestConfidence = int.MinValue;
@@ -524,7 +623,6 @@ public class RssSyncService : BackgroundService
         // safe.
         var preParsed = matchingService.ParseRelease(release.Title);
         var earlyLimit = ReleaseMatchingService.ResolveEarlyReleaseLimit(release, earlyReleaseLimits);
-
         foreach (var evt in monitoredEvents)
         {
             // No keyword pre-filter. The previous implementation required a
@@ -540,8 +638,13 @@ public class RssSyncService : BackgroundService
             // year-bounds checks, etc.), with preParsed memoized above,
             // so per-event validation is cheap enough to skip the brittle
             // keyword prefilter entirely.
-            var matchResult = matchingService.ValidateRelease(release, evt, null, enableMultiPartEpisodes, preParsed,
-                earlyReleaseLimitDays: earlyLimit);
+            var requestedPart = enableMultiPartEpisodes
+                ? partDetector.DetectPart(release.Title, evt.Sport ?? string.Empty, evt.Title, evt.League?.Name)?.SegmentName
+                : null;
+            roundRaceNumbersByRound.TryGetValue((evt.LeagueId, evt.Season, evt.Round), out var roundRaceNumbers);
+            var matchResult = matchingService.ValidateRelease(release, evt, requestedPart, enableMultiPartEpisodes, preParsed,
+                earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers,
+                knownLeagues: knownLeagues, datePeers: datePeers);
             if (!matchResult.IsMatch || matchResult.IsHardRejection)
                 continue;
 
@@ -589,6 +692,36 @@ public class RssSyncService : BackgroundService
         return bestMatch;
     }
 
+    private static async Task<Dictionary<(int? LeagueId, string? Season, string? Round), List<int>>> LoadSupercarsRoundRaceNumbersAsync(
+        SportarrDbContext db,
+        IReadOnlyCollection<Event> monitoredEvents,
+        CancellationToken cancellationToken)
+    {
+        var leagueIds = monitoredEvents
+            .Where(evt => evt.LeagueId.HasValue &&
+                evt.League?.Name.Contains("Supercars", StringComparison.OrdinalIgnoreCase) == true)
+            .Select(evt => evt.LeagueId!.Value)
+            .Distinct()
+            .ToArray();
+        if (leagueIds.Length == 0)
+        {
+            return new Dictionary<(int?, string?, string?), List<int>>();
+        }
+
+        var scheduleEvents = await db.Events
+            .AsNoTracking()
+            .Where(evt => evt.LeagueId.HasValue && leagueIds.Contains(evt.LeagueId.Value))
+            .Select(evt => new { evt.LeagueId, evt.Season, evt.Round, evt.Title })
+            .ToListAsync(cancellationToken);
+
+        return scheduleEvents
+            .Where(evt => !string.IsNullOrEmpty(evt.Round))
+            .GroupBy(evt => (evt.LeagueId, evt.Season, evt.Round))
+            .ToDictionary(
+                group => group.Key,
+                group => ReleaseMatchingService.RaceNumbersInTitles(group.Select(evt => evt.Title)));
+    }
+
     /// <summary>
     /// Extract literal required keywords from a SearchQueryTemplate.
     /// Strips template tokens ({Year}, {Round:00}, etc.) and returns the
@@ -627,8 +760,8 @@ public class RssSyncService : BackgroundService
 
     /// <summary>
     /// Check if we should grab this release for the matched event.
-    /// Now part-aware and uses total score (QualityScore + CustomFormatScore) for comparisons.
-    /// Can upgrade queued items if a higher-scored release is found.
+    /// The profile rank wins before revision and custom format score.
+    /// A preferred release can replace a queued item.
     /// </summary>
     private async Task<(bool Grab, string Reason, string? ReleasePart)> ShouldGrabReleaseAsync(
         SportarrDbContext db,
@@ -641,6 +774,10 @@ public class RssSyncService : BackgroundService
         DownloadClientService downloadClientService,
         CancellationToken cancellationToken)
     {
+        await db.Entry(evt).ReloadAsync(cancellationToken);
+        if (db.Entry(evt).State == EntityState.Detached || !evt.Monitored)
+            return (false, "Event is no longer monitored", null);
+
         // 0. Minimum age: wait N minutes after the indexer posted the release
         // before grabbing it. Helps Usenet posts settle and gives torrent
         // swarms time to attract seeders.
@@ -658,9 +795,10 @@ public class RssSyncService : BackgroundService
 
         // 1. Detect part FIRST (for fighting sports) - needed for all subsequent checks
         string? releasePart = null;
-        if (EventPartDetector.IsFightingSport(evt.Sport ?? ""))
+        if (EventPartDetector.EventUsesMultiPart(evt.Title, evt.Sport ?? "", evt.League?.Name))
         {
-            var partInfo = partDetector.DetectPart(release.Title, evt.Sport ?? "");
+            var partInfo = partDetector.DetectPart(
+                release.Title, evt.Sport ?? "", evt.Title, evt.League?.Name);
 
             if (config.EnableMultiPartEpisodes)
             {
@@ -698,10 +836,12 @@ public class RssSyncService : BackgroundService
 
         // 2. Check if already in queue (PART-AWARE) - with upgrade logic
         DownloadQueueItem? itemToReplace = null;
-        var replacedScore = 0;
-        var replacementScore = 0;
+        var replacedRank = 0;
+        var replacementRank = 0;
+        var replacedFormatScore = 0;
+        var replacementFormatScore = 0;
 
-        var existingQueueItem = await db.DownloadQueue
+        var existingQueueItem = await db.DownloadQueue.AsNoTracking()
             .Where(d => d.EventId == evt.Id &&
                        (d.Status == DownloadStatus.Queued ||
                         d.Status == DownloadStatus.Downloading))
@@ -710,23 +850,27 @@ public class RssSyncService : BackgroundService
 
         if (existingQueueItem != null)
         {
-            // Recalculate quality scores from quality strings (don't trust stored values from old inverted scoring)
-            var existingTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingQueueItem.Quality) + existingQueueItem.CustomFormatScore;
-            var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
+            var preference = Helpers.ReleasePreferenceComparer.Compare(
+                profile,
+                release.Quality, release.Title, release.CustomFormatScore,
+                existingQueueItem.Quality, existingQueueItem.Title, existingQueueItem.CustomFormatScore,
+                config.DownloadPropersAndRepacks);
 
-            if (newTotalScore > existingTotalScore)
+            if (preference > 0)
             {
                 // The new release wins, but do not cancel the running download
                 // yet. Every check below can still reject this release, and a
                 // cancel here deletes the files of a download that nothing
                 // replaces. The swap happens once the decision is final.
                 itemToReplace = existingQueueItem;
-                replacedScore = existingTotalScore;
-                replacementScore = newTotalScore;
+                replacedRank = Helpers.QualityProfileRanker.GetRank(profile, existingQueueItem.Quality);
+                replacementRank = Helpers.QualityProfileRanker.GetRank(profile, release.Quality);
+                replacedFormatScore = existingQueueItem.CustomFormatScore;
+                replacementFormatScore = release.CustomFormatScore;
             }
             else
             {
-                return (false, $"Better or equal release already queued (score: {existingTotalScore})", releasePart);
+                return (false, "Better or equal release already queued", releasePart);
             }
         }
 
@@ -744,28 +888,30 @@ public class RssSyncService : BackgroundService
         // 3. Check blocklist - supports both torrent (by hash) and Usenet (by title+indexer)
         bool isBlocklisted = false;
 
+        var rejectByHash = true;
         if (!string.IsNullOrEmpty(release.TorrentInfoHash))
         {
-            // Torrent: check by info hash, unless the indexer opted out of
-            // hash-based rejection (RejectBlocklistedTorrentHashes = false).
-            var rejectByHash = await db.Indexers
+            rejectByHash = await db.Indexers
                 .Where(i => i.Name == release.Indexer)
                 .Select(i => (bool?)i.RejectBlocklistedTorrentHashes)
                 .FirstOrDefaultAsync(cancellationToken) ?? true;
-
-            if (rejectByHash)
-            {
-                isBlocklisted = await db.Blocklist
-                    .AnyAsync(b => b.TorrentInfoHash == release.TorrentInfoHash, cancellationToken);
-            }
         }
-        else if (release.Protocol == "Usenet")
+
+        var matchingBlocklistItems = await db.Blocklist
+            .AsNoTracking()
+            .Where(b =>
+                (!string.IsNullOrEmpty(release.TorrentInfoHash) &&
+                 b.TorrentInfoHash == release.TorrentInfoHash) ||
+                (b.Title == release.Title &&
+                 (b.Protocol == "Usenet" || string.IsNullOrEmpty(b.TorrentInfoHash))))
+            .ToListAsync(cancellationToken);
+        isBlocklisted = rejectByHash && !string.IsNullOrEmpty(release.TorrentInfoHash) &&
+                         matchingBlocklistItems.Any(b => string.Equals(
+                             b.TorrentInfoHash, release.TorrentInfoHash, StringComparison.OrdinalIgnoreCase));
+        if (!isBlocklisted)
         {
-            // Usenet: check by title + indexer combination
-            isBlocklisted = await db.Blocklist
-                .AnyAsync(b => b.Title == release.Title &&
-                              b.Indexer == release.Indexer &&
-                              (b.Protocol == "Usenet" || string.IsNullOrEmpty(b.TorrentInfoHash)), cancellationToken);
+            isBlocklisted = new BlocklistMatcher(matchingBlocklistItems)
+                .MatchesTitleIdentity(release.Title, release.Indexer, release.Protocol);
         }
 
         if (isBlocklisted)
@@ -842,28 +988,31 @@ public class RssSyncService : BackgroundService
         }
 
         // 4. Check for recent failed downloads with backoff (part-aware)
-        var recentFailedDownload = await db.DownloadQueue
-            .Where(d => d.EventId == evt.Id && d.Status == DownloadStatus.Failed)
-            .Where(d => releasePart == null ? d.Part == null : d.Part == releasePart)
-            .OrderByDescending(d => d.LastUpdate)
-            .FirstOrDefaultAsync(cancellationToken);
+        var recentFailedDownload = await DownloadRetryState.LatestFailureAsync(
+            db, evt.Id, releasePart, cancellationToken);
 
         if (recentFailedDownload != null)
         {
+            var retryBlockReason = Helpers.DownloadFailurePolicy.AutomaticRetryBlockReason(
+                recentFailedDownload, config);
+            if (retryBlockReason != null)
+                return (false, retryBlockReason, releasePart);
+
             var retryDelays = new[] { 30, 60, 120, 240, 480 }; // minutes
             var retryCount = recentFailedDownload.RetryCount ?? 0;
             var delayMinutes = retryCount < retryDelays.Length ? retryDelays[retryCount] : retryDelays[^1];
-            var nextRetryTime = (recentFailedDownload.LastUpdate ?? DateTime.UtcNow).AddMinutes(delayMinutes);
+            var nextRetryTime = (recentFailedDownload.FailedAt ?? recentFailedDownload.LastUpdate ?? recentFailedDownload.Added).AddMinutes(delayMinutes);
 
             if (DateTime.UtcNow < nextRetryTime)
                 return (false, $"Backoff until {nextRetryTime:HH:mm}", releasePart);
         }
 
         // 5. Check existing files (PART-AWARE, SCORE-BASED)
-        await db.Entry(evt).Collection(e => e.Files).LoadAsync(cancellationToken);
+        var currentFiles = await db.EventFiles.AsNoTracking()
+            .Where(f => f.EventId == evt.Id).ToListAsync(cancellationToken);
         var existingFile = releasePart != null
-            ? evt.Files.FirstOrDefault(f => f.PartName == releasePart && f.Exists)
-            : evt.Files.FirstOrDefault(f => f.PartName == null && f.Exists);
+            ? currentFiles.FirstOrDefault(f => f.PartName == releasePart && f.Exists)
+            : currentFiles.FirstOrDefault(f => f.PartName == null && f.Exists);
 
         if (existingFile != null)
         {
@@ -878,46 +1027,10 @@ public class RssSyncService : BackgroundService
                 return (false, refusal, releasePart);
             }
 
-            var existingTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingFile.Quality) + existingFile.CustomFormatScore;
-            var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
-            _logger.LogInformation("[RSS Sync] File upgrade detected: {OldScore} -> {NewScore} for {Part}",
-                existingTotalScore, newTotalScore, releasePart ?? "full event");
-        }
-
-        // 5b. CASCADING UPGRADE: When downloading a higher quality part, search for other parts at the new quality
-        // This ensures all parts of a multi-part event have consistent quality for Plex compatibility
-        if (releasePart != null && config.EnableMultiPartEpisodes)
-        {
-            // Check if other parts exist with LOWER quality than this release
-            var otherPartFiles = evt.Files
-                .Where(f => f.PartName != null && f.PartName != releasePart && f.Exists)
-                .ToList();
-
-            if (otherPartFiles.Any())
-            {
-                var newResolution = ExtractResolution(release.Quality);
-                var newTotalScore = ReleaseEvaluator.CalculateQualityScoreFromName(release.Quality) + release.CustomFormatScore;
-
-                // Find parts that need upgrading to match the new release quality
-                var partsNeedingUpgrade = otherPartFiles
-                    .Where(f =>
-                    {
-                        var existingScore = ReleaseEvaluator.CalculateQualityScoreFromName(f.Quality) + f.CustomFormatScore;
-                        return newTotalScore > existingScore;
-                    })
-                    .Select(f => f.PartName!)
-                    .ToList();
-
-                if (partsNeedingUpgrade.Any())
-                {
-                    _logger.LogInformation(
-                        "[RSS Sync] Cascading upgrade: Found {Part} at {Quality}, triggering search for {Count} other parts: {Parts}",
-                        releasePart, release.Quality, partsNeedingUpgrade.Count, string.Join(", ", partsNeedingUpgrade));
-
-                    // Trigger immediate searches for other parts at the new quality (fire-and-forget)
-                    _ = TriggerCascadingPartSearchesAsync(evt, partsNeedingUpgrade, release.Quality ?? "Unknown", newResolution);
-                }
-            }
+            _logger.LogInformation("[RSS Sync] File upgrade detected: profile rank {OldRank}, CF {OldCf} -> profile rank {NewRank}, CF {NewCf} for {Part}",
+                Helpers.QualityProfileRanker.GetRank(profile, existingFile.Quality), existingFile.CustomFormatScore,
+                Helpers.QualityProfileRanker.GetRank(profile, release.Quality), release.CustomFormatScore,
+                releasePart ?? "full event");
         }
 
         // 6. Check quality profile. The caller resolved it once, through the
@@ -931,98 +1044,79 @@ public class RssSyncService : BackgroundService
         if (qualityProfile == null)
             return (false, "No quality profile", releasePart);
 
-        // 7. Check delay profile: hold release for N minutes so a higher-quality
-        // release can win before we commit. Bypass conditions grab immediately;
-        // otherwise persist to PendingReleases and let the
-        // PendingReleaseReaperService pick the best-of-window once the timer
-        // expires.
+        // 7. An active hold owns the event part until the reaper settles it.
+        var pendingGroup = await db.PendingReleases
+            .Where(p => p.EventId == evt.Id
+                && p.Part == releasePart
+                && p.Status == PendingReleaseStatus.Pending)
+            .ToListAsync(cancellationToken);
+        var alreadyPending = pendingGroup.FirstOrDefault(p =>
+            (!string.IsNullOrWhiteSpace(release.Guid)
+                && string.Equals(p.Guid, release.Guid, StringComparison.Ordinal)
+                && string.Equals(p.Indexer, release.Indexer, StringComparison.OrdinalIgnoreCase))
+            || (!string.IsNullOrWhiteSpace(release.DownloadUrl)
+                && string.Equals(p.DownloadUrl, release.DownloadUrl, StringComparison.Ordinal)));
+        if (alreadyPending != null)
+            return (false, $"Held by delay profile until {alreadyPending.ReleasableAt:HH:mm}", releasePart);
+
+        // 8. Hold new releases while a pending group exists. A new candidate
+        // must join the same choice even when its own delay has elapsed.
         var delayProfile = await delayProfileService.GetDelayProfileForEventAsync(evt.Id);
-        if (delayProfile != null)
-        {
-            var protocolDelay = release.Protocol.Equals("Usenet", StringComparison.OrdinalIgnoreCase)
+        var protocolDelay = delayProfile == null ? 0
+            : release.Protocol.Equals("Usenet", StringComparison.OrdinalIgnoreCase)
                 ? delayProfile.UsenetDelay
                 : delayProfile.TorrentDelay;
+        var bypass = delayProfile?.BypassIfAboveCustomFormatScore == true
+            && release.CustomFormatScore >= delayProfile.MinimumCustomFormatScore;
+        var nowUtc = DateTime.UtcNow;
+        var releasableAt = protocolDelay > 0 && !bypass
+            ? release.PublishDate.AddMinutes(protocolDelay)
+            : nowUtc;
 
-            if (protocolDelay > 0)
+        if (pendingGroup.Count > 0 || releasableAt > nowUtc)
+        {
+            db.PendingReleases.Add(new PendingRelease
             {
-                var bypass = false;
-                if (delayProfile.BypassIfAboveCustomFormatScore &&
-                    release.CustomFormatScore >= delayProfile.MinimumCustomFormatScore)
-                {
-                    bypass = true;
-                    _logger.LogDebug("[RSS Sync] Delay bypassed - CF score {Score} >= minimum {Min}",
-                        release.CustomFormatScore, delayProfile.MinimumCustomFormatScore);
-                }
+                EventId = evt.Id,
+                Title = release.Title,
+                Guid = release.Guid,
+                DownloadUrl = release.DownloadUrl,
+                InfoUrl = release.InfoUrl,
+                Indexer = release.Indexer,
+                IndexerId = release.IndexerId,
+                TorrentInfoHash = release.TorrentInfoHash,
+                Protocol = release.Protocol,
+                Size = release.Size,
+                Quality = release.Quality,
+                Source = release.Source,
+                Codec = release.Codec,
+                Language = release.Language,
+                ReleaseGroup = release.ReleaseGroup,
+                QualityScore = release.QualityScore,
+                CustomFormatScore = release.CustomFormatScore,
+                Score = release.Score,
+                MatchScore = release.MatchScore,
+                Part = releasePart,
+                IsPack = PackImportBoundary.IsPackRelease(release.Title, release.IsPack,
+                    release.SportarrLeagueId, release.SportarrEventId),
+                Seeders = release.Seeders,
+                Leechers = release.Leechers,
+                PublishDate = release.PublishDate,
+                AddedToPendingAt = nowUtc,
+                ReleasableAt = releasableAt,
+                Reason = $"DelayProfile-{release.Protocol}-{protocolDelay}m",
+                Status = PendingReleaseStatus.Pending
+            });
+            await db.SaveChangesAsync(cancellationToken);
 
-                if (!bypass)
-                {
-                    // Honor age of the release — the delay clock starts at
-                    // PublishDate, so older releases may already be past the window.
-                    var elapsedSincePublish = DateTime.UtcNow - release.PublishDate;
-                    var releasableAt = release.PublishDate.AddMinutes(protocolDelay);
+            _logger.LogInformation(
+                "[RSS Sync] Held release '{Title}' for event '{Event}' until {ReleasableAt} ({Delay}m delay)",
+                release.Title, evt.Title, releasableAt, protocolDelay);
 
-                    if (elapsedSincePublish.TotalMinutes >= protocolDelay)
-                    {
-                        // Already past the delay window - grab now.
-                        _logger.LogDebug("[RSS Sync] Delay already elapsed for '{Title}' (published {Mins:F0}m ago)",
-                            release.Title, elapsedSincePublish.TotalMinutes);
-                    }
-                    else
-                    {
-                        // Hold this release. Insert into PendingReleases unless we
-                        // already track it (same Guid for same event).
-                        var alreadyPending = await db.PendingReleases
-                            .AnyAsync(p => p.EventId == evt.Id
-                                && p.Guid == release.Guid
-                                && p.Status == PendingReleaseStatus.Pending,
-                                cancellationToken);
-
-                        if (!alreadyPending)
-                        {
-                            db.PendingReleases.Add(new PendingRelease
-                            {
-                                EventId = evt.Id,
-                                Title = release.Title,
-                                Guid = release.Guid,
-                                DownloadUrl = release.DownloadUrl,
-                                InfoUrl = release.InfoUrl,
-                                Indexer = release.Indexer,
-                                IndexerId = release.IndexerId,
-                                TorrentInfoHash = release.TorrentInfoHash,
-                                Protocol = release.Protocol,
-                                Size = release.Size,
-                                Quality = release.Quality,
-                                Source = release.Source,
-                                Codec = release.Codec,
-                                Language = release.Language,
-                                ReleaseGroup = release.ReleaseGroup,
-                                QualityScore = release.QualityScore,
-                                CustomFormatScore = release.CustomFormatScore,
-                                Score = release.Score,
-                                MatchScore = release.MatchScore,
-                                Part = releasePart,
-                                Seeders = release.Seeders,
-                                Leechers = release.Leechers,
-                                PublishDate = release.PublishDate,
-                                AddedToPendingAt = DateTime.UtcNow,
-                                ReleasableAt = releasableAt,
-                                Reason = $"DelayProfile-{release.Protocol}-{protocolDelay}m",
-                                Status = PendingReleaseStatus.Pending
-                            });
-                            await db.SaveChangesAsync(cancellationToken);
-
-                            _logger.LogInformation(
-                                "[RSS Sync] Held release '{Title}' for event '{Event}' until {ReleasableAt} ({Delay}m delay)",
-                                release.Title, evt.Title, releasableAt, protocolDelay);
-                        }
-
-                        return (false, $"Held by delay profile until {releasableAt:HH:mm}", releasePart);
-                    }
-                }
-            }
+            return (false, $"Held by delay profile until {releasableAt:HH:mm}", releasePart);
         }
 
-        // 8. Check if release quality is allowed AND has no rejections.
+        // 9. Check if release quality is allowed AND has no rejections.
         // Approved=true alone isn't sufficient: ReleaseEvaluator sets Approved=true
         // even when rejections (e.g. MinFormatScore below threshold, size limits,
         // 0 seeders) were added, leaving downstream filters to enforce them.
@@ -1036,8 +1130,9 @@ public class RssSyncService : BackgroundService
         if (itemToReplace != null)
         {
             await RemoveAndCancelQueueItemAsync(db, itemToReplace, downloadClientService, cancellationToken);
-            _logger.LogInformation("[RSS Sync] Replacing queued item with better release: {OldScore} -> {NewScore} for {Part}",
-                replacedScore, replacementScore, releasePart ?? "full event");
+            _logger.LogInformation("[RSS Sync] Replacing queued item with better release: profile rank {OldRank}, CF {OldCf} -> profile rank {NewRank}, CF {NewCf} for {Part}",
+                replacedRank, replacedFormatScore, replacementRank, replacementFormatScore,
+                releasePart ?? "full event");
         }
 
         return (true, "OK", releasePart);
@@ -1089,6 +1184,9 @@ public class RssSyncService : BackgroundService
                     _logger.LogWarning(ex, "[RSS Sync] Failed to cancel download {DownloadId}, proceeding anyway",
                         current.DownloadId);
                 }
+
+                // Complete local cleanup after the client removal attempt.
+                cancellationToken = CancellationToken.None;
             }
 
             db.DownloadQueue.Remove(current);
@@ -1151,6 +1249,7 @@ public class RssSyncService : BackgroundService
 
         // Send to download client with seed config from indexer. Packs use
         // the pack-specific seed time when the indexer defines one.
+        using var acquisition = await downloadClientService.BeginAcquisitionAsync(cancellationToken);
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
             release.DownloadUrl,
@@ -1167,6 +1266,12 @@ public class RssSyncService : BackgroundService
             _logger.LogError("[RSS Sync] Failed to add to download client: {Client}", downloadClient.Name);
             return false;
         }
+
+        var torrentInfoHash = Helpers.TorrentHashHelper.ResolveTrackedInfoHash(
+            release.Protocol, release.TorrentInfoHash, downloadId);
+
+        // Record an accepted client job even if the caller cancels.
+        cancellationToken = AcceptedDownloadPersistence.AfterAdd(downloadId, cancellationToken);
 
         // Recent/older event queue priority (issue #220) - same logic as the
         // automatic-search grab path, duplicated here because RSS sync and
@@ -1189,6 +1294,9 @@ public class RssSyncService : BackgroundService
             _logger.LogWarning(ex, "[RSS Sync] Error setting queue priority for {DownloadId}", downloadId);
         }
 
+        var previousFailedDownload = await DownloadRetryState.LatestFailureAsync(
+            db, evt.Id, releasePart, cancellationToken);
+
         // Add to download queue
         var queueItem = new DownloadQueueItem
         {
@@ -1208,12 +1316,14 @@ public class RssSyncService : BackgroundService
             Indexer = release.Indexer,
             IndexerId = indexerRecord?.Id,
             Protocol = release.Protocol,
-            TorrentInfoHash = release.TorrentInfoHash,
-            RetryCount = 0,
+            TorrentInfoHash = torrentInfoHash,
+            RetryCount = previousFailedDownload?.RetryCount ?? 0,
             LastUpdate = DateTime.UtcNow,
             QualityScore = release.QualityScore,
             CustomFormatScore = release.CustomFormatScore,
             Part = releasePart,  // Use the part passed from ShouldGrabReleaseAsync
+            IsPack = PackImportBoundary.IsPackRelease(release.Title, release.IsPack,
+                release.SportarrLeagueId, release.SportarrEventId),
             IsManualSearch = false // RSS sync is always automatic
         };
 
@@ -1279,7 +1389,7 @@ public class RssSyncService : BackgroundService
             DownloadUrl = release.DownloadUrl,
             Guid = release.Guid,
             Protocol = release.Protocol,
-            TorrentInfoHash = release.TorrentInfoHash,
+            TorrentInfoHash = torrentInfoHash,
             Size = release.Size,
             Quality = release.Quality,
             Codec = release.Codec,
@@ -1319,6 +1429,58 @@ public class RssSyncService : BackgroundService
     }
 
     #region Cascading Part Upgrade Helpers
+
+    private static async Task<List<string>> GetCascadingPartSearchTargetsAsync(
+        SportarrDbContext db,
+        Event evt,
+        string? releaseQuality,
+        string? releasePart,
+        QualityProfile? profile,
+        Config config,
+        CancellationToken cancellationToken)
+    {
+        if (releasePart == null || !config.EnableMultiPartEpisodes || profile == null)
+            return new List<string>();
+
+        var otherPartFiles = await db.EventFiles.AsNoTracking()
+            .Where(f => f.EventId == evt.Id && f.PartName != null && f.PartName != releasePart && f.Exists)
+            .ToListAsync(cancellationToken);
+        return GetCascadingPartSearchTargets(otherPartFiles, releaseQuality, releasePart, profile, config);
+    }
+
+    internal static List<string> GetCascadingPartSearchTargets(
+        IEnumerable<EventFile> currentFiles,
+        string? releaseQuality,
+        string? releasePart,
+        QualityProfile? profile,
+        Config config)
+    {
+        if (releasePart == null || !config.EnableMultiPartEpisodes || profile == null)
+            return new List<string>();
+
+        return currentFiles
+            .Where(f => f.PartName != null && f.PartName != releasePart && f.Exists)
+            .Where(f => Helpers.QualityProfileRanker.Compare(profile, releaseQuality, f.Quality) > 0)
+            .Select(f => f.PartName!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    internal void StartCascadingPartSearchesAfterGrab(
+        Event evt,
+        string? releaseQuality,
+        string? releasePart,
+        List<string> partsNeedingUpgrade)
+    {
+        if (partsNeedingUpgrade.Count == 0)
+            return;
+
+        _logger.LogInformation(
+            "[RSS Sync] Cascading upgrade: Grabbed {Part} at {Quality}, searching for {Count} lower-quality parts: {Parts}",
+            releasePart, releaseQuality, partsNeedingUpgrade.Count, string.Join(", ", partsNeedingUpgrade));
+        _ = TriggerCascadingPartSearchesAsync(
+            evt, partsNeedingUpgrade, releaseQuality ?? "Unknown", ExtractResolution(releaseQuality));
+    }
 
     // Track active cascading searches to prevent circular triggers
     private static readonly HashSet<string> _activeCascadeSearches = new();

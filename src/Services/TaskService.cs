@@ -3,6 +3,7 @@ using Sportarr.Api.Data;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using System.Linq.Expressions;
 
 namespace Sportarr.Api.Services;
 
@@ -11,6 +12,9 @@ namespace Sportarr.Api.Services;
 /// </summary>
 public class TaskService : ITaskService
 {
+    internal static Expression<Func<Indexer, bool>> EventSearchIndexerFilter =>
+        indexer => indexer.Enabled && indexer.EnableInteractiveSearch;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TaskService> _logger;
     private readonly ConcurrentDictionary<int, CancellationTokenSource> _cancellationTokens = new();
@@ -637,82 +641,16 @@ public class TaskService : ITaskService
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
-
-        try
+        var dbTask = await db.Tasks.FindAsync(new object[] { task.Id }, cancellationToken);
+        if (dbTask != null)
         {
-            var dbTask = await db.Tasks.FindAsync(task.Id);
-            if (dbTask != null)
-            {
-                dbTask.Progress = 10;
-                dbTask.Message = "Loading indexers with RSS enabled...";
-                await db.SaveChangesAsync();
-            }
-
-            // Get all enabled indexers with RSS enabled
-            var indexers = await db.Indexers
-                .Where(i => i.Enabled && i.EnableRss)
-                .ToListAsync(cancellationToken);
-
-            _logger.LogInformation("[RSS SYNC] Found {Count} indexers with RSS enabled", indexers.Count);
-
-            if (indexers.Count == 0)
-            {
-                if (dbTask != null)
-                {
-                    dbTask.Progress = 100;
-                    dbTask.Message = "No RSS-enabled indexers found";
-                    await db.SaveChangesAsync();
-                }
-                return;
-            }
-
-            if (dbTask != null)
-            {
-                dbTask.Progress = 30;
-                dbTask.Message = $"Checking RSS feeds from {indexers.Count} indexers...";
-                await db.SaveChangesAsync();
-            }
-
-            int totalNewReleases = 0;
-            int progressStep = indexers.Count > 0 ? 60 / indexers.Count : 60;
-            int currentProgress = 30;
-
-            // Check RSS feed for each indexer
-            foreach (var indexer in indexers)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                _logger.LogInformation("[RSS SYNC] Checking RSS for: {Name}", indexer.Name);
-
-                if (dbTask != null)
-                {
-                    currentProgress = Math.Min(90, currentProgress + progressStep);
-                    dbTask.Progress = currentProgress;
-                    dbTask.Message = $"Checking RSS: {indexer.Name}...";
-                    await db.SaveChangesAsync();
-                }
-
-                // Note: Actual RSS feed parsing logic would go here
-                // This would typically fetch the RSS feed URL and parse new releases
-                // For now, we log that the check was performed
-                await Task.Delay(300, cancellationToken); // Simulate RSS fetch
-            }
-
-            if (dbTask != null)
-            {
-                dbTask.Progress = 100;
-                dbTask.Message = $"RSS sync complete - checked {indexers.Count} feeds, found {totalNewReleases} new releases";
-                await db.SaveChangesAsync();
-            }
-
-            _logger.LogInformation("[RSS SYNC] Completed - checked {Count} feeds, found {Found} new releases",
-                indexers.Count, totalNewReleases);
+            dbTask.Progress = 10;
+            dbTask.Message = "RSS sync is in progress...";
+            await db.SaveChangesAsync(cancellationToken);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[RSS SYNC] Error during RSS sync");
-            throw;
-        }
+
+        var rssSync = scope.ServiceProvider.GetRequiredService<RssSyncService>();
+        await rssSync.SyncNowAsync(cancellationToken);
     }
 
     /// <summary>
@@ -868,7 +806,7 @@ public class TaskService : ITaskService
 
             // Get all enabled indexers
             var indexers = await db.Indexers
-                .Where(i => i.Enabled && i.EnableAutomaticSearch)
+                .Where(EventSearchIndexerFilter)
                 .ToListAsync(cancellationToken);
 
             _logger.LogInformation("[EVENT SEARCH] Found {Count} enabled indexers", indexers.Count);
@@ -1144,7 +1082,8 @@ public class TaskService : ITaskService
         using var scope = _scopeFactory.CreateScope();
         var importService = scope.ServiceProvider.GetRequiredService<LibraryImportService>();
 
-        var result = await importService.ScanFolderAsync(folderPath, includeSubfolders, onProgress);
+        var result = await importService.ScanFolderAsync(
+            folderPath, includeSubfolders, onProgress, includeIgnoredFiles: true);
 
         // Same rationale as LibraryImportAsync above: the result column
         // carries the same LibraryScanResult shape the old inline response

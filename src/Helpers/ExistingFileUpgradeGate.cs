@@ -34,10 +34,6 @@ public static class ExistingFileUpgradeGate
         // returns 0 for null, empty, "Unknown", or any other unparseable
         // string, so the gate below covers all three cases in one check.
         var existingQualityScoreOnly = ReleaseEvaluator.CalculateQualityScoreFromName(existingFile.Quality);
-        var existingTotalScore = existingQualityScoreOnly + existingFile.CustomFormatScore;
-        var newQualityScoreOnly = ReleaseEvaluator.CalculateQualityScoreFromName(releaseQuality);
-        var newTotalScore = newQualityScoreOnly + releaseCustomFormatScore;
-
         // REFUSE-UNKNOWN-UPGRADE GATE: Library imports whose filenames lacked a
         // quality keyword get persisted with Quality="Unknown" (or null/empty),
         // which scores 0. Every discovered release then looks like an upgrade
@@ -54,36 +50,52 @@ public static class ExistingFileUpgradeGate
             return "Upgrades are disabled for this quality profile";
         }
 
-        // Quality first, the way the import judges (ImportUpgradeRule): a
-        // lower quality is never an upgrade, whatever its custom format score,
-        // and a higher quality always is. Only at the same quality do the
-        // custom format score and the revision decide. Judging by the total
-        // grabbed releases the importer then refused, and refused releases
-        // the importer would have taken.
-        if (newQualityScoreOnly < existingQualityScoreOnly)
+        // Profile rank comes first. A lower rank is never an upgrade.
+        // Revision and custom format score decide between equal ranks.
+        var qualityComparison = QualityProfileRanker.Compare(profile, releaseQuality, existingFile.Quality);
+        if (qualityComparison < 0)
         {
             return $"Existing file is of higher quality ({existingFile.Quality})";
         }
-        var sameQuality = newQualityScoreOnly == existingQualityScoreOnly;
+        var sameQuality = qualityComparison == 0;
 
-        // A proper/repack of the SAME quality is a legitimate upgrade: the
-        // original was broken and re-released fixed. Gated on the Download
-        // Propers and Repacks setting.
+        // A proper or repack at the same rank can replace a broken release.
         var existingRevision = ReleaseRevision.Parse(existingFile.OriginalTitle ?? existingFile.Quality);
         var releaseRevision = ReleaseRevision.Parse(releaseTitle);
         var revisionUpgrade = sameQuality &&
             config.DownloadPropersAndRepacks == "preferAndUpgrade" &&
             releaseRevision > existingRevision;
 
-        // An older revision of the same quality is refused while propers are
-        // preferred, whatever its custom format score: the importer would
-        // refuse it too.
+        // Refuse an older revision at the same rank when propers are preferred.
         if (sameQuality && config.DownloadPropersAndRepacks != "doNotPrefer" && releaseRevision < existingRevision)
         {
             return $"Existing file is a newer revision ({existingFile.OriginalTitle ?? existingFile.Quality})";
         }
 
-        if (sameQuality && releaseCustomFormatScore <= existingFile.CustomFormatScore && !revisionUpgrade)
+        var qualityCutoffMet = false;
+        var formatCutoffMet = false;
+        if (profile?.CutoffQuality != null)
+        {
+            var cutoffRank = QualityProfileRanker.GetCutoffRank(profile, profile.CutoffQuality.Value);
+            qualityCutoffMet = cutoffRank > 0
+                && QualityProfileRanker.GetRank(profile, existingFile.Quality) >= cutoffRank;
+        }
+        if (profile?.CutoffFormatScore != null)
+        {
+            formatCutoffMet = existingFile.CustomFormatScore >= profile.CutoffFormatScore.Value;
+        }
+
+        if (!revisionUpgrade && qualityCutoffMet
+            && (formatCutoffMet || profile?.CutoffFormatScore == null))
+        {
+            return "Existing file meets the quality profile cutoff";
+        }
+
+        var qualityImprovementAllowed = qualityComparison > 0 && !qualityCutoffMet;
+
+        if (!qualityImprovementAllowed
+            && releaseCustomFormatScore <= existingFile.CustomFormatScore
+            && !revisionUpgrade)
         {
             return $"Existing file has same or better custom format score ({existingFile.CustomFormatScore} vs {releaseCustomFormatScore})";
         }
@@ -108,9 +120,8 @@ public static class ExistingFileUpgradeGate
         // with the default increment of one no proper was ever grabbed.
         if (profile != null && !revisionUpgrade)
         {
-            var isQualityUpgrade = newQualityScoreOnly > existingQualityScoreOnly;
             var formatGain = releaseCustomFormatScore - existingFile.CustomFormatScore;
-            if (!isQualityUpgrade && formatGain < profile.FormatScoreIncrement)
+            if (!qualityImprovementAllowed && formatGain < profile.FormatScoreIncrement)
             {
                 return $"Custom-format gain {formatGain} below minimum score increment {profile.FormatScoreIncrement}";
             }

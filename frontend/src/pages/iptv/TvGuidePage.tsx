@@ -20,9 +20,11 @@ import { toast } from 'sonner';
 import apiClient from '../../api/client';
 import PageHeader from '../../components/PageHeader';
 import PageShell from '../../components/PageShell';
+import TvGuideMobileControls from '../../components/TvGuideMobileControls';
 import { useUISettings } from '../../hooks/useUISettings';
 import { useMediaQuery } from '../../hooks/useMediaQuery';
 import { formatTimeInTimezone, formatDateInTimezone } from '../../utils/timezone';
+import { getPhoneGuideReferenceTime } from './tvGuidePresentation';
 
 // Types
 interface TvGuideProgram {
@@ -229,8 +231,8 @@ export default function TvGuidePage() {
     }
   };
 
-  // EPG source setup lives on the IPTV Sources page now; the guide only reads
-  // and syncs guide data. The cogwheel links to Sources rather than hosting a
+  // Guide-source setup lives in IPTV Options. The guide only reads and syncs
+  // guide data. The cogwheel links there rather than hosting a
   // second copy of the source manager.
 
   const scheduleDvr = async (program: TvGuideProgram) => {
@@ -342,6 +344,13 @@ export default function TvGuidePage() {
   const phoneChannels = useMemo(() => {
     if (!guideData) return [];
     const nowMs = currentTime.getTime();
+    const referenceMs = getPhoneGuideReferenceTime(
+      currentTime,
+      new Date(guideData.startTime),
+      new Date(guideData.endTime),
+      timeOffset
+    );
+    const isCurrentWindow = referenceMs === nowMs;
     return guideData.channels
       .map((channel) => {
         const programs = [...channel.programs].sort(
@@ -349,32 +358,32 @@ export default function TvGuidePage() {
         );
         const current =
           programs.find(
-            (p) => new Date(p.startTime).getTime() <= nowMs && nowMs < new Date(p.endTime).getTime()
+            (p) => new Date(p.startTime).getTime() <= referenceMs && referenceMs < new Date(p.endTime).getTime()
           ) ?? null;
-        const upcoming = programs.filter((p) => new Date(p.startTime).getTime() > nowMs);
+        const upcoming = programs.filter((p) => new Date(p.startTime).getTime() > referenceMs);
         const headline = current ?? upcoming[0] ?? null;
         const next = current ? upcoming[0] ?? null : upcoming[1] ?? null;
         const progress = current
           ? Math.min(
               100,
               Math.round(
-                ((nowMs - new Date(current.startTime).getTime()) /
+                ((referenceMs - new Date(current.startTime).getTime()) /
                   Math.max(1, new Date(current.endTime).getTime() - new Date(current.startTime).getTime())) *
                   100
               )
             )
           : 0;
         const minutesUntil =
-          !current && upcoming[0]
-            ? Math.max(1, Math.round((new Date(upcoming[0].startTime).getTime() - nowMs) / 60000))
+          isCurrentWindow && !current && upcoming[0]
+            ? Math.max(1, Math.round((new Date(upcoming[0].startTime).getTime() - referenceMs) / 60000))
             : null;
         return {
           channel,
           headline,
           next,
-          isLive: current !== null,
-          isLiveSports: current?.isSportsProgram === true,
-          progress,
+          isLive: isCurrentWindow && current !== null,
+          isLiveSports: isCurrentWindow && current?.isSportsProgram === true,
+          progress: isCurrentWindow ? progress : 0,
           minutesUntil,
         };
       })
@@ -383,7 +392,7 @@ export default function TvGuidePage() {
           x.isLiveSports ? 0 : x.isLive ? 1 : x.headline ? 2 : 3;
         return rank(a) - rank(b);
       });
-  }, [guideData, currentTime]);
+  }, [guideData, currentTime, timeOffset]);
 
   if (loading && !guideData) {
     return (
@@ -392,6 +401,10 @@ export default function TvGuidePage() {
       </div>
     );
   }
+
+  const guideDateLabel = guideData
+    ? `${formatDateInTimezone(guideData.startTime, timezone, { weekday: 'short', month: 'short', day: 'numeric' })} · ${formatTime(guideData.startTime)}–${formatTime(guideData.endTime)}`
+    : 'Guide window unavailable';
 
   return (
     <div className="flex flex-col h-full">
@@ -402,12 +415,12 @@ export default function TvGuidePage() {
             subtitle="Browse EPG data and schedule DVR recordings"
             className="mb-4"
             subtitleClassName="text-sm"
-            actions={
+            actions={!isPhone ? (
               <>
                 <button
-                  onClick={() => navigate('/iptv/sources')}
+                  onClick={() => navigate('/iptv/settings/advanced')}
                   className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors"
-                  title="Configure EPG sources on the Sources page"
+                  title="Configure guide sources in IPTV Options"
                 >
                   <Cog6ToothIcon className="w-5 h-5" />
                 </button>
@@ -420,11 +433,23 @@ export default function TvGuidePage() {
                   Sync EPG
                 </button>
               </>
-            }
+            ) : undefined}
           />
 
-          {/* Time Navigation */}
-          <div className="flex flex-wrap items-center justify-between gap-2">
+          {isPhone ? (
+            <TvGuideMobileControls
+              dateLabel={guideDateLabel}
+              syncing={syncing}
+              filtersOpen={showFilters}
+              onSync={syncEpgSources}
+              onOptions={() => navigate('/iptv/settings/advanced')}
+              onPrevious={() => setTimeOffset(prev => prev - 6)}
+              onNow={() => setTimeOffset(0)}
+              onNext={() => setTimeOffset(prev => prev + 6)}
+              onFilters={() => setShowFilters(!showFilters)}
+            />
+          ) : (
+          <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setTimeOffset(prev => prev - 6)}
@@ -467,10 +492,11 @@ export default function TvGuidePage() {
               </button>
             </div>
           </div>
+          )}
 
           {/* Filter Panel */}
           {showFilters && (
-            <div className="mt-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+            <div id="tv-guide-filters" className="mt-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
               <div className="flex flex-wrap gap-4">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input
@@ -579,10 +605,10 @@ export default function TvGuidePage() {
             <p className="text-sm mt-2">
               {epgSources.length === 0 ? (
                 <button
-                  onClick={() => navigate('/iptv/sources')}
+                  onClick={() => navigate('/iptv/settings/advanced')}
                   className="text-red-400 underline transition-colors hover:text-red-300"
                 >
-                  Add an EPG source on the Sources page to get started
+                  Add a guide source in IPTV Options to get started
                 </button>
               ) : (
                 'Try syncing your EPG sources or adjusting filters'

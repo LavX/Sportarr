@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -6,17 +8,17 @@ namespace Sportarr.Api.Services;
 /// <summary>
 /// In-memory cache for Custom Format match results.
 ///
-/// Caches which custom formats match a given release title, avoiding expensive
+/// Caches which custom formats match a release's evidence, avoiding expensive
 /// regex evaluation on every search. The actual SCORE lookup is still done at
 /// runtime since scores depend on the quality profile being used.
 ///
 /// Cache key: Normalized release title
-/// Cache value: List of matched format IDs
+/// Cache value: Matched format IDs and an immutable evidence fingerprint
 ///
 /// This dramatically speeds up repeated searches because:
 /// - Format matching involves many regex operations (expensive)
 /// - Score lookup is just a dictionary lookup (cheap)
-/// - Release titles are immutable from indexers
+/// - Evidence changes cause a cache miss
 /// - Custom formats rarely change (only on sync/edit)
 ///
 /// Invalidation triggers:
@@ -86,6 +88,8 @@ public class CustomFormatMatchCache : IDisposable
         /// Format version when cached (for invalidation)
         /// </summary>
         public long FormatVersion { get; set; }
+
+        public string? EvidenceFingerprint { get; init; }
     }
 
     public CustomFormatMatchCache(ILogger<CustomFormatMatchCache> logger)
@@ -136,7 +140,7 @@ public class CustomFormatMatchCache : IDisposable
     /// </summary>
     /// <param name="releaseTitle">The release title</param>
     /// <returns>Cached matches if valid, null if not found or stale</returns>
-    public CachedFormatMatches? TryGetCached(string releaseTitle)
+    public CachedFormatMatches? TryGetCached(string releaseTitle, string? evidenceFingerprint = null)
     {
         var key = NormalizeKey(releaseTitle);
 
@@ -145,6 +149,9 @@ public class CustomFormatMatchCache : IDisposable
             // Check if cache entry is from current format version
             if (cached.FormatVersion == CurrentFormatVersion)
             {
+                if (evidenceFingerprint != null && cached.EvidenceFingerprint != evidenceFingerprint)
+                    return null;
+
                 _logger.LogDebug("[CF Cache] HIT for '{Title}' - {Count} matched formats",
                     releaseTitle, cached.MatchedFormatIds.Count);
                 return cached;
@@ -166,7 +173,7 @@ public class CustomFormatMatchCache : IDisposable
     /// </summary>
     /// <param name="releaseTitle">The release title</param>
     /// <param name="matchedFormats">List of matched formats with their info</param>
-    public void Store(string releaseTitle, List<(int FormatId, string FormatName)> matchedFormats)
+    public void Store(string releaseTitle, List<(int FormatId, string FormatName)> matchedFormats, string? evidenceFingerprint = null)
     {
         var key = NormalizeKey(releaseTitle);
 
@@ -175,7 +182,8 @@ public class CustomFormatMatchCache : IDisposable
             MatchedFormatIds = matchedFormats.Select(m => m.FormatId).ToList(),
             MatchedFormatNames = matchedFormats.Select(m => m.FormatName).ToList(),
             CachedAt = DateTime.UtcNow,
-            FormatVersion = CurrentFormatVersion
+            FormatVersion = CurrentFormatVersion,
+            EvidenceFingerprint = evidenceFingerprint
         };
 
         _cache[key] = cached;
@@ -188,6 +196,22 @@ public class CustomFormatMatchCache : IDisposable
         {
             CleanupOldEntries();
         }
+    }
+
+    // Match evidence must not change when a caller edits its language list.
+    public static string CreateEvidenceFingerprint(ReleaseSearchResult release)
+    {
+        var evidence = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            Version = 1,
+            release.Title,
+            release.Size,
+            MultiLanguageNames = release.MultiLanguageNames?.ToArray(),
+            release.IndexerFlags,
+            release.SportarrEventId,
+            release.SportarrLeagueId
+        });
+        return Convert.ToHexString(SHA256.HashData(evidence));
     }
 
     /// <summary>

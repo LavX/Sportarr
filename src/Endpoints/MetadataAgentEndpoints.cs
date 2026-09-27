@@ -277,15 +277,32 @@ public static class MetadataAgentEndpoints
         // Plex/Emby/Jellyfin plugins call {ApiUrl}/api/health and require
         // status == "healthy" before they'll accept a local instance, so this
         // must return the same shape the cloud does.
+        //
+        // It is also the only auth-exempt endpoint, so it is what external
+        // monitoring watches. A damaged database answers 503, because a
+        // monitor that reads only the status code has to see it too.
+        //
         // Allow cross-origin browser probes (the plugin config pages' "Test
         // Connection" button) to read this public, auth-exempt endpoint.
-        app.MapGet("/api/health", () => Results.Ok(new
+        app.MapGet("/api/health", (DatabaseHealthTracker databaseHealth) =>
         {
-            status = "healthy",
-            version = Sportarr.Api.Version.AppVersion,
-            build = Sportarr.Api.Version.GetFullVersion(),
-            timestamp = DateTime.UtcNow
-        })).RequireCors(ServiceCollectionExtensions.PublicProbeCorsPolicy);
+            // One read. Two would let the body and the status code disagree.
+            var damaged = databaseHealth.IsDamaged;
+            var body = new
+            {
+                status = damaged ? "unhealthy" : "healthy",
+                version = Sportarr.Api.Version.AppVersion,
+                build = Sportarr.Api.Version.GetFullVersion(),
+                timestamp = DateTime.UtcNow,
+                error = damaged
+                    ? "Database commands are failing because the stored data is damaged. Check System > Health for what to do."
+                    : null
+            };
+
+            return damaged
+                ? Results.Json(body, statusCode: StatusCodes.Status503ServiceUnavailable)
+                : Results.Ok(body);
+        }).RequireCors(ServiceCollectionExtensions.PublicProbeCorsPolicy);
 
         // Season poster proxy. The Jellyfin/Emby image providers build
         // {ApiUrl}/api/images/league/{id}/poster directly for season art, so

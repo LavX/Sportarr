@@ -142,11 +142,10 @@ export default function Layout() {
       activeIcon: SignalSolidIcon,
       path: '/iptv',
       children: [
-        { label: 'Sources', path: '/iptv/sources' },
+        { label: 'Guide', path: '/iptv/guide' },
         { label: 'Channels', path: '/iptv/channels' },
-        { label: 'TV Guide', path: '/iptv/guide' },
         { label: 'Recordings', path: '/iptv/recordings' },
-        { label: 'DVR Settings', path: '/iptv/dvr-settings' },
+        { label: 'Options', path: '/iptv/settings' },
       ],
     },
     {
@@ -227,8 +226,10 @@ export default function Layout() {
   };
 
   const isActive = (path?: string, children?: { path: string }[]) => {
-    if (path) return navPath === path;
-    if (children) return children.some((child) => navPath === child.path);
+    if (path) return navPath === path || navPath.startsWith(`${path}/`);
+    if (children) {
+      return children.some((child) => navPath === child.path || navPath.startsWith(`${child.path}/`));
+    }
     return false;
   };
 
@@ -240,7 +241,9 @@ export default function Layout() {
       if (item.path && location.pathname === item.path) return true;
       // Check if current path matches any of the item's children
       if (item.children) {
-        return item.children.some((child) => location.pathname === child.path);
+        return item.children.some((child) =>
+          location.pathname === child.path || location.pathname.startsWith(`${child.path}/`)
+        );
       }
       return false;
     });
@@ -362,7 +365,9 @@ export default function Layout() {
                       chip
                         icon={item.icon}
                         activeIcon={item.activeIcon}
-                        active={item.children.some((child) => navPath === child.path)}
+                        active={item.children.some((child) =>
+                          navPath === child.path || navPath.startsWith(`${child.path}/`)
+                        )}
                       />
                       <span>{item.label}</span>
                     </div>
@@ -382,7 +387,7 @@ export default function Layout() {
                           onMouseEnter={() => preloadRoute(child.path)}
                           onFocus={() => preloadRoute(child.path)}
                           className={`block px-4 py-2.5 pl-12 text-sm transition-colors ${
-                            navPath === child.path
+                            navPath === child.path || navPath.startsWith(`${child.path}/`)
                               ? 'bg-red-900/30 text-white border-l-4 border-red-600'
                               : 'text-gray-400 hover:bg-red-900/10 hover:text-white'
                           }`}
@@ -477,7 +482,7 @@ export default function Layout() {
           `<main>` is the actual scroll container for the app shell,
           so the gutter has to be reserved here too. */}
       <main
-        className="flex-1 overflow-y-auto [touch-action:pan-y_pinch-zoom] bg-gradient-to-br from-gray-950 via-black to-gray-950 pb-[calc(4.5rem+env(safe-area-inset-bottom))] xl:pb-0"
+        className="min-w-0 flex-1 overflow-y-auto [touch-action:pan-y_pinch-zoom] bg-gradient-to-br from-gray-950 via-black to-gray-950 pb-[calc(4.5rem+env(safe-area-inset-bottom))] xl:pb-0"
         style={{ scrollbarGutter: 'stable' }}
       >
         <HealthBanner />

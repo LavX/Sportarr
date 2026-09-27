@@ -119,6 +119,7 @@ app.MapPost("/api/release/grab", async (
     }
 
     logger.LogInformation("[GRAB] Manual grab requested for event {EventId}: {Title}", eventId, release.Title);
+    using var eventDecision = await downloadClientService.EnterEventDecisionAsync(eventId, context.RequestAborted);
 
     // Pull the league + bound root folder along with the event so the
     // category cascade (Phase 4) can resolve the per-root override
@@ -132,6 +133,47 @@ app.MapPost("/api/release/grab", async (
         logger.LogWarning("[GRAB] Event {EventId} not found", eventId);
         return Results.NotFound(new { success = false, message = "Event not found" });
     }
+
+    List<Event>? selectedSeasonEvents = null;
+    if (requestBody.TryGetValue("isSeasonPack", out var seasonPackElement) &&
+        seasonPackElement.ValueKind == JsonValueKind.True)
+    {
+        if (!requestBody.TryGetValue("matchedEventIds", out var selectedIdsElement) ||
+            selectedIdsElement.ValueKind != JsonValueKind.Array)
+            return Results.BadRequest(new { success = false, message = "Season packs require selected event IDs" });
+
+        var selectedIds = new List<int>();
+        var uniqueIds = new HashSet<int>();
+        foreach (var element in selectedIdsElement.EnumerateArray())
+        {
+            if (element.ValueKind != JsonValueKind.Number || !element.TryGetInt32(out var selectedId) ||
+                selectedId <= 0 || !uniqueIds.Add(selectedId))
+                return Results.BadRequest(new { success = false, message = "Selected event IDs must be distinct positive integers" });
+            selectedIds.Add(selectedId);
+        }
+
+        if (!uniqueIds.Contains(eventId) || string.IsNullOrWhiteSpace(evt.Season))
+            return Results.BadRequest(new { success = false, message = "Season packs require the selected event and its season" });
+
+        var selectedEvents = await db.Events.Where(e => selectedIds.Contains(e.Id)).ToListAsync();
+        if (selectedEvents.Count != selectedIds.Count ||
+            selectedEvents.Any(e => e.LeagueId != evt.LeagueId || !string.Equals(e.Season, evt.Season, StringComparison.Ordinal)))
+            return Results.BadRequest(new { success = false, message = "Selected events must exist in the same league and season" });
+
+        // Keep the submitted season scope across calendar-year boundaries.
+        var eventsById = selectedEvents.ToDictionary(e => e.Id);
+        selectedSeasonEvents = selectedIds.Select(id => eventsById[id]).ToList();
+        release.IsPack = true;
+    }
+
+    var grabConfig = await configService.GetConfigAsync();
+    var acquiredIdentity = Sportarr.Api.Helpers.PartIdentityResolver.Resolve(
+        release.Part, release.Title, null, evt.Sport, evt.Title, evt.League?.Name,
+        grabConfig.EnableMultiPartEpisodes, release.IsPack);
+    // Keep supplied markers so import can preserve their precedence.
+    var acquiredPart = acquiredIdentity.Kind == Sportarr.Api.Helpers.PartIdentityKind.CompleteEventLabel
+        ? "Full Event"
+        : acquiredIdentity.Part?.SegmentName ?? release.Part;
 
     // Get enabled download client matching the release protocol. Uses the
     // canonical DownloadClientService.GetClientTypesForProtocol map rather
@@ -202,6 +244,7 @@ app.MapPost("/api/release/grab", async (
         "Unknown/Other");
 
     // Add download to client (category only, no path) with seed config from indexer
+    using var acquisition = await downloadClientService.BeginAcquisitionAsync(context.RequestAborted);
     AddDownloadResult downloadResult;
     try
     {
@@ -254,6 +297,8 @@ app.MapPost("/api/release/grab", async (
     }
 
     var downloadId = downloadResult.DownloadId;
+    var torrentInfoHash = Sportarr.Api.Helpers.TorrentHashHelper.ResolveTrackedInfoHash(
+        release.Protocol, release.TorrentInfoHash, downloadId);
 
     logger.LogInformation("[GRAB] Download added to client successfully!");
     logger.LogInformation("[GRAB] Download ID (Hash): {DownloadId}", downloadId);
@@ -283,10 +328,10 @@ app.MapPost("/api/release/grab", async (
 
     // Check if this is a pack download
     var isPack = release.IsPack;
-    List<Event> packEvents = new();
-    Guid? packGroupId = null;
+    List<Event> packEvents = selectedSeasonEvents ?? new();
+    Guid? packGroupId = selectedSeasonEvents != null ? Guid.NewGuid() : null;
 
-    if (isPack)
+    if (isPack && selectedSeasonEvents == null)
     {
         // For pack downloads, find all matching events and create queue entries for each.
         var packImportService = context.RequestServices.GetRequiredService<PackImportService>();
@@ -334,13 +379,14 @@ app.MapPost("/api/release/grab", async (
             Indexer = release.Indexer,
             IndexerId = grabIndexerRecord?.Id,
             Protocol = release.Protocol,
-            TorrentInfoHash = release.TorrentInfoHash,
+            TorrentInfoHash = torrentInfoHash,
             RetryCount = 0,
             LastUpdate = DateTime.UtcNow,
             QualityScore = release.QualityScore,
             CustomFormatScore = release.CustomFormatScore,
-            Part = release.Part,
-            IsPack = isPack && packEvents.Count > 1,
+            // A pack selection belongs only to its selected event.
+            Part = packEvent.Id == eventId ? acquiredPart : null,
+            IsPack = isPack,
             PackGroupId = packGroupId,
             IsManualSearch = true // Release grab is user-initiated (interactive search)
         };
@@ -359,14 +405,14 @@ app.MapPost("/api/release/grab", async (
         DownloadUrl = release.DownloadUrl,
         Guid = release.Guid,
         Protocol = release.Protocol,
-        TorrentInfoHash = release.TorrentInfoHash,
+        TorrentInfoHash = torrentInfoHash,
         Size = release.Size,
         Quality = release.Quality,
         Codec = release.Codec,
         Source = release.Source,
         QualityScore = release.QualityScore,
         CustomFormatScore = release.CustomFormatScore,
-        PartName = release.Part,
+        PartName = acquiredPart,
         GrabbedAt = DateTime.UtcNow,
         DownloadClientId = downloadClient.Id,
         DownloadId = downloadId
@@ -411,6 +457,8 @@ app.MapPost("/api/release/grab", async (
                 statusCode: 500);
         }
     }
+
+    acquisition.Dispose();
 
     // Interactive/manual grabs from the search UI never fired OnGrab at all -
     // only the automatic-search, RSS-sync, and pending-release-reaper paths

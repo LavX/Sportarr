@@ -73,6 +73,25 @@ public class ReleaseEvaluatorTests
     }
 
     [Fact]
+    public void EvaluateRelease_UsesQualityProfileOrderForScore()
+    {
+        var profile = new QualityProfile
+        {
+            Name = "Reordered",
+            Items =
+            [
+                new QualityItem { Name = "HDTV-1080p", Quality = 6, Allowed = true },
+                new QualityItem { Name = "WEBDL-2160p", Quality = 19, Allowed = true },
+            ],
+        };
+
+        var preferred = _evaluator.EvaluateRelease(Release("Event.1080p.HDTV"), profile);
+        var other = _evaluator.EvaluateRelease(Release("Event.2160p.WEB-DL"), profile);
+
+        preferred.QualityScore.Should().BeGreaterThan(other.QualityScore);
+    }
+
+    [Fact]
     public void EvaluateRelease_ShouldRejectWhenQualityNotInProfile()
     {
         // Arrange
@@ -583,4 +602,13 @@ public class ReleaseEvaluatorTests
         // Assert
         evaluation.CustomFormatScore.Should().Be(expectedScore);
     }
+
+    private static ReleaseSearchResult Release(string title) => new()
+    {
+        Title = title,
+        Guid = title,
+        DownloadUrl = "https://example.invalid/download",
+        Indexer = "TestIndexer",
+        Size = 1024 * 1024 * 1024,
+    };
 }

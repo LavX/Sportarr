@@ -16,6 +16,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import apiClient from '../api/client';
 import FileBrowserModal from './FileBrowserModal';
+import { toApiIndexer } from '../utils/indexerPayload';
 
 /**
  * First-run setup guide. Walks a new install from nothing to a working setup in
@@ -200,6 +201,8 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
   const [ixTest, setIxTest] = useState<{ ok: boolean; msg: string } | null>(null);
   const [addedIndexers, setAddedIndexers] = useState<{ id: number; label: string; raw: any }[]>([]);
   const [editingIndexerId, setEditingIndexerId] = useState<number | null>(null);
+  const [ixOriginalImplementation, setIxOriginalImplementation] = useState<string | null>(null);
+  const [ixTypeChanged, setIxTypeChanged] = useState(false);
   const [sportarrApiKey, setSportarrApiKey] = useState('');
 
   // Existing-install awareness: when the guide is reopened on a configured
@@ -461,19 +464,50 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     tags: [] as number[],
   });
 
-  const buildIndexerPayload = () => ({
-    name: ixName.trim() || (ixProtocol === 'usenet' ? 'Newznab' : 'Torznab'),
-    implementation: ixProtocol === 'usenet' ? 'Newznab' : 'Torznab',
-    protocol: ixProtocol,
-    enabled: true,
-    enableRss: true,
-    enableAutomaticSearch: true,
-    enableInteractiveSearch: true,
-    priority: 25,
-    baseUrl: ixUrl.trim(),
-    apiKey: ixApiKey.trim(),
-    categories: [] as number[],
-  });
+  const buildIndexerPayload = () => {
+    const selectedImplementation = ixProtocol === 'usenet' ? 'Newznab' : 'Torznab';
+    const implementation = editingIndexerId != null && !ixTypeChanged && ixOriginalImplementation
+      ? ixOriginalImplementation
+      : selectedImplementation;
+    const edited = toApiIndexer({
+      name: ixName.trim() || (ixProtocol === 'usenet' ? 'Newznab' : 'Torznab'),
+      implementation,
+      enabled: true,
+      enableRss: true,
+      enableAutomaticSearch: true,
+      enableInteractiveSearch: true,
+      priority: 25,
+      baseUrl: ixUrl.trim(),
+      apiKey: ixApiKey.trim(),
+      categories: [],
+    });
+    if (editingIndexerId == null) return edited;
+
+    const existing = addedIndexers.find((indexer) => indexer.id === editingIndexerId)?.raw;
+    if (!existing || !Array.isArray(existing.fields)) return { ...edited, id: editingIndexerId };
+
+    const editedFields = new Map(
+      edited.fields
+        .filter((field) => field.name === 'baseUrl' || field.name === 'apiKey')
+        .map((field) => [field.name, field.value]),
+    );
+    const fields = existing.fields.map((field: { name: string; value: string | string[] }) => (
+      editedFields.has(field.name)
+        ? { ...field, value: editedFields.get(field.name)! }
+        : field
+    ));
+    for (const [name, value] of editedFields) {
+      if (!fields.some((field: { name: string }) => field.name === name)) fields.push({ name, value });
+    }
+
+    return {
+      ...existing,
+      id: editingIndexerId,
+      name: edited.name,
+      implementation: edited.implementation,
+      fields,
+    };
+  };
 
   const testClient = async () => {
     setBusy(true);
@@ -500,7 +534,10 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
       await apiClient.post('/indexer/test', buildIndexerPayload());
       setIxTest({ ok: true, msg: 'Connected' });
     } catch (err: any) {
-      setIxTest({ ok: false, msg: err?.response?.data?.error || err?.message || 'Could not connect' });
+      setIxTest({
+        ok: false,
+        msg: err?.response?.data?.message || err?.response?.data?.error || err?.message || 'Could not connect',
+      });
     } finally {
       setBusy(false);
     }
@@ -656,6 +693,8 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     setIxApiKey('');
     setIxTest(null);
     setEditingIndexerId(null);
+    setIxOriginalImplementation(null);
+    setIxTypeChanged(false);
   };
 
   const saveIndexer = async (): Promise<boolean> => {
@@ -667,20 +706,19 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     try {
       const payload = buildIndexerPayload();
       if (editingIndexerId != null) {
-        const existing = addedIndexers.find((x) => x.id === editingIndexerId);
-        const { data } = await apiClient.put(`/indexer/${editingIndexerId}`, { ...existing?.raw, ...payload, id: editingIndexerId });
+        const { data } = await apiClient.put(`/indexer/${editingIndexerId}`, payload);
         setAddedIndexers((prev) => prev.map((x) => (x.id === editingIndexerId
-          ? { id: editingIndexerId, label: payload.name, raw: data ?? { ...existing?.raw, ...payload } }
+          ? { id: editingIndexerId, label: payload.name, raw: data?.fields ? data : payload }
           : x)));
         toast.success('Indexer updated');
       } else {
         const { data } = await apiClient.post<any>('/indexer', payload);
-        setAddedIndexers((prev) => [...prev, { id: data?.id, label: payload.name, raw: data ?? payload }]);
+        setAddedIndexers((prev) => [...prev, { id: data?.id, label: payload.name, raw: { ...payload, id: data?.id } }]);
       }
       return true;
     } catch (err: any) {
       toast.error('Could not save the indexer', {
-        description: err?.response?.data?.error || err?.message,
+        description: err?.response?.data?.message || err?.response?.data?.error || err?.message,
       });
       return false;
     } finally {
@@ -698,10 +736,18 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
 
   const editIndexer = (entry: { id: number; raw: any }) => {
     const x = entry.raw ?? {};
-    setIxProtocol((x.protocol === 'torrent' ? 'torrent' : 'usenet'));
+    const fields = new Map<string, string | string[]>(
+      Array.isArray(x.fields)
+        ? x.fields.map((field: { name: string; value: string | string[] }) => [field.name, field.value])
+        : [],
+    );
+    const implementation = x.implementation ?? (x.type === 1 ? 'Newznab' : 'Torznab');
+    setIxProtocol(implementation === 'Newznab' ? 'usenet' : 'torrent');
+    setIxOriginalImplementation(implementation);
+    setIxTypeChanged(false);
     setIxName(x.name ?? '');
-    setIxUrl(x.baseUrl ?? x.url ?? '');
-    setIxApiKey(x.apiKey ?? '');
+    setIxUrl(String(fields.get('baseUrl') ?? x.baseUrl ?? x.url ?? ''));
+    setIxApiKey(String(fields.get('apiKey') ?? x.apiKey ?? ''));
     setIxTest(null);
     setEditingIndexerId(entry.id);
   };
@@ -1464,7 +1510,7 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
                     {(['usenet', 'torrent'] as const).map((p) => (
                       <button
                         key={p}
-                        onClick={() => { setIxProtocol(p); setIxTest(null); }}
+                        onClick={() => { setIxProtocol(p); setIxTypeChanged(true); setIxTest(null); }}
                         className={`flex-1 rounded-lg border px-4 py-2 text-sm capitalize transition-colors ${
                           ixProtocol === p ? 'border-red-500 bg-red-950/20 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700'
                         }`}
@@ -1483,8 +1529,8 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
                   <input type="text" value={ixUrl} onChange={(e) => setIxUrl(e.target.value)} placeholder="https://indexer.example.com" className={inputCls} />
                 </div>
                 <div>
-                  <label className={labelCls}>API Key</label>
-                  <input type="text" value={ixApiKey} onChange={(e) => setIxApiKey(e.target.value)} className={inputCls} />
+                  <label htmlFor="onboarding-indexer-api-key" className={labelCls}>API Key</label>
+                  <input id="onboarding-indexer-api-key" type="text" value={ixApiKey} onChange={(e) => setIxApiKey(e.target.value)} className={inputCls} />
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
                   <button onClick={testIndexer} disabled={busy} className="rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-50">

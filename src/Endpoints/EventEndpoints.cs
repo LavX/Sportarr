@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Sportarr.Api.Data;
 using Sportarr.Api.Helpers;
@@ -18,8 +19,9 @@ public static class EventEndpoints
     public static IEndpointRouteBuilder MapEventEndpoints(this IEndpointRouteBuilder app)
     {
 // API: Get all events (universal for all sports)
-app.MapGet("/api/events", async (SportarrDbContext db) =>
+app.MapGet("/api/events", async (SportarrDbContext db, ConfigService configService) =>
 {
+    var config = await configService.GetConfigAsync();
     var events = await db.Events
         .AsNoTracking()
         .Include(e => e.League)        // Universal (UFC, Premier League, NBA, etc.)
@@ -30,7 +32,7 @@ app.MapGet("/api/events", async (SportarrDbContext db) =>
         .ToListAsync();
 
     // Convert to DTOs to avoid JsonPropertyName serialization issues
-    var response = events.Select(EventResponse.FromEvent).ToList();
+    var response = events.Select(e => EventResponse.FromEvent(e, config.EnableMultiPartEpisodes, filesLoaded: true)).ToList();
     return Results.Ok(response);
 });
 
@@ -78,8 +80,9 @@ app.MapGet("/api/events/search", async (string? q, int? limit, int? excludeEvent
 });
 
 // API: Get single event (universal for all sports)
-app.MapGet("/api/events/{id:int}", async (int id, SportarrDbContext db) =>
+app.MapGet("/api/events/{id:int}", async (int id, SportarrDbContext db, ConfigService configService) =>
 {
+    var config = await configService.GetConfigAsync();
     var evt = await db.Events
         .AsNoTracking()
         .Include(e => e.League)        // Universal (UFC, Premier League, NBA, etc.)
@@ -91,7 +94,7 @@ app.MapGet("/api/events/{id:int}", async (int id, SportarrDbContext db) =>
     if (evt is null) return Results.NotFound();
 
     // Return DTO to avoid JsonPropertyName serialization issues
-    return Results.Ok(EventResponse.FromEvent(evt));
+    return Results.Ok(EventResponse.FromEvent(evt, config.EnableMultiPartEpisodes, filesLoaded: true));
 });
 
 // API: Create event (universal for all sports)
@@ -198,7 +201,7 @@ app.MapPost("/api/events", async (CreateEventRequest request, SportarrDbContext 
 
 // API: Update event (universal for all sports)
 app.MapPut("/api/events/{id:int}", async (int id, JsonElement body, SportarrDbContext db, EventDvrService eventDvrService,
-    EventStreamService eventStream) =>
+    EventStreamService eventStream, ConfigService configService) =>
 {
     var evt = await db.Events.FindAsync(id);
     if (evt is null) return Results.NotFound();
@@ -255,6 +258,20 @@ app.MapPut("/api/events/{id:int}", async (int id, JsonElement body, SportarrDbCo
             evt.QualityProfileId = qualityProfileIdValue.GetInt32();
     }
 
+    if (body.TryGetProperty("title", out _) || body.TryGetProperty("sport", out _) ||
+        body.TryGetProperty("leagueId", out _) || body.TryGetProperty("monitoredParts", out _))
+    {
+        await db.Entry(evt).Collection(e => e.Files).LoadAsync();
+        var targetLeague = evt.LeagueId.HasValue
+            ? await db.Leagues.FindAsync(evt.LeagueId.Value)
+            : null;
+        var currentConfig = await configService.GetConfigAsync();
+        var presentParts = evt.Files.Where(f => f.Exists).Select(f => f.PartNumber).ToArray();
+        evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(evt.Sport, evt.Title,
+            targetLeague?.Name, evt.MonitoredParts, targetLeague?.MonitoredParts,
+            presentParts, currentConfig.EnableMultiPartEpisodes);
+    }
+
     // Read the modified fields BEFORE stamping LastUpdate. That stamp is set on
     // every request, so it would make an edit that changed nothing look like a
     // change and raise a stream event for it.
@@ -292,7 +309,8 @@ app.MapPut("/api/events/{id:int}", async (int id, JsonElement body, SportarrDbCo
     if (evt is null) return Results.NotFound();
 
     // Return DTO to avoid JsonPropertyName serialization issues
-    return Results.Ok(EventResponse.FromEvent(evt));
+    var config = await configService.GetConfigAsync();
+    return Results.Ok(EventResponse.FromEvent(evt, config.EnableMultiPartEpisodes, filesLoaded: true));
 });
 
 // API: Delete event
@@ -372,7 +390,7 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
     SportarrDbContext db,
     ILogger<Program> logger,
     ConfigService configService,
-    AutomaticSearchService searchService,
+    IServiceScopeFactory scopeFactory,
     NotificationService notificationService,
     IMetadataWriterService metadataWriterService) =>
 {
@@ -430,6 +448,18 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
         logger.LogWarning("[FILES] File not found on disk (already deleted?): {FilePath}", file.FilePath);
     }
 
+    var ownedGrabs = new List<GrabHistory>();
+    if (!string.IsNullOrWhiteSpace(file.FilePath))
+    {
+        ownedGrabs = await db.GrabHistory
+            .Where(g => g.EventId == file.EventId && g.DestinationPath == file.FilePath)
+            .ToListAsync();
+        foreach (var grab in ownedGrabs)
+        {
+            grab.FileExists = false;
+        }
+    }
+
     // Remove from database
     db.Remove(file);
 
@@ -447,9 +477,13 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
 
     // Update event's HasFile status
     var remainingFiles = evt.Files.Where(f => f.Id != fileId && f.Exists).ToList();
+    var fileConfig = await configService.GetConfigAsync();
+    evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(
+        evt.Sport, evt.Title, evt.League?.Name, evt.MonitoredParts,
+        evt.League?.MonitoredParts, remainingFiles.Select(f => f.PartNumber).ToArray(),
+        fileConfig.EnableMultiPartEpisodes);
     if (!remainingFiles.Any())
     {
-        evt.HasFile = false;
         evt.FilePath = null;
         evt.FileSize = null;
         evt.Quality = null;
@@ -485,15 +519,24 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
     // Handle blocklist action if specified
     if (blocklistAction == "blocklistAndSearch" || blocklistAction == "blocklistOnly")
     {
-        // Add to blocklist using originalTitle if available, otherwise use filename
-        var releaseTitle = file.OriginalTitle ?? Path.GetFileNameWithoutExtension(file.FilePath);
+        var sourceGrab = ownedGrabs
+            .OrderBy(g => g.Superseded)
+            .ThenByDescending(g => g.GrabbedAt)
+            .FirstOrDefault();
+        var releaseTitle = sourceGrab?.Title
+            ?? file.ReleaseTitle
+            ?? file.OriginalTitle
+            ?? Path.GetFileNameWithoutExtension(file.FilePath);
         if (!string.IsNullOrEmpty(releaseTitle))
         {
             var blocklistEntry = new BlocklistItem
             {
                 EventId = eventId,
                 Title = releaseTitle,
-                TorrentInfoHash = $"manual-block-{DateTime.UtcNow.Ticks}", // Synthetic hash for non-torrent blocks
+                TorrentInfoHash = sourceGrab?.TorrentInfoHash,
+                Indexer = sourceGrab?.Indexer,
+                Protocol = sourceGrab?.Protocol,
+                Part = file.PartName,
                 Reason = BlocklistReason.ManualBlock,
                 Message = "Deleted from file management",
                 BlockedAt = DateTime.UtcNow
@@ -511,14 +554,17 @@ app.MapDelete("/api/events/{eventId:int}/files/{fileId:int}", async (
             var partName = file.PartName;
             _ = Task.Run(async () =>
             {
+                using var scope = scopeFactory.CreateScope();
+                var scopedSearch = scope.ServiceProvider.GetRequiredService<AutomaticSearchService>();
+                var scopedLogger = scope.ServiceProvider.GetRequiredService<ILogger<AutomaticSearchService>>();
                 try
                 {
-                    logger.LogInformation("[FILES] Searching for replacement for event {EventId}, part: {Part}", eventId, partName ?? "all");
-                    await searchService.SearchAndDownloadEventAsync(eventId, qualityProfileId, partName, isManualSearch: true);
+                    scopedLogger.LogInformation("[FILES] Searching for replacement for event {EventId}, part: {Part}", eventId, partName ?? "all");
+                    await scopedSearch.SearchAndDownloadEventAsync(eventId, qualityProfileId, partName, isManualSearch: true);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", eventId);
+                    scopedLogger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", eventId);
                 }
             });
         }
@@ -577,7 +623,7 @@ app.MapDelete("/api/events/{id:int}/files", async (
     SportarrDbContext db,
     ILogger<Program> logger,
     ConfigService configService,
-    AutomaticSearchService searchService,
+    IServiceScopeFactory scopeFactory,
     NotificationService notificationService,
     IMetadataWriterService metadataWriterService) =>
 {
@@ -664,14 +710,35 @@ app.MapDelete("/api/events/{id:int}/files", async (
         }
     }
 
+    var removablePaths = removableFiles
+        .Select(file => file.FilePath)
+        .Where(path => !string.IsNullOrWhiteSpace(path))
+        .Distinct()
+        .ToList();
+    var ownedGrabs = removablePaths.Count == 0
+        ? new List<GrabHistory>()
+        : await db.GrabHistory
+            .Where(grab => grab.EventId == id &&
+                grab.DestinationPath != null &&
+                removablePaths.Contains(grab.DestinationPath))
+            .ToListAsync();
+    foreach (var grab in ownedGrabs)
+    {
+        grab.FileExists = false;
+    }
+
     db.RemoveRange(removableFiles);
 
     // Update event status. A file that would not delete is still the event's
     // file, so the event keeps pointing at it.
     var keptFiles = evt.Files.Except(removableFiles).ToList();
+    var fileConfig = await configService.GetConfigAsync();
+    evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(
+        evt.Sport, evt.Title, evt.League?.Name, evt.MonitoredParts,
+        evt.League?.MonitoredParts, keptFiles.Where(f => f.Exists).Select(f => f.PartNumber).ToArray(),
+        fileConfig.EnableMultiPartEpisodes);
     if (keptFiles.Count == 0)
     {
-        evt.HasFile = false;
         evt.FilePath = null;
         evt.FileSize = null;
         evt.Quality = null;
@@ -708,18 +775,37 @@ app.MapDelete("/api/events/{id:int}/files", async (
         // while it sits there invited the replacement search to download a
         // second copy beside the one being kept.
         var releasesToBlocklist = removableFiles
-            .Select(f => f.OriginalTitle ?? Path.GetFileNameWithoutExtension(f.FilePath))
-            .Where(t => !string.IsNullOrEmpty(t))
-            .Distinct()
+            .Select(file =>
+            {
+                var grab = ownedGrabs
+                    .Where(candidate => candidate.DestinationPath == file.FilePath)
+                    .OrderBy(candidate => candidate.Superseded)
+                    .ThenByDescending(candidate => candidate.GrabbedAt)
+                    .FirstOrDefault();
+                var title = grab?.Title
+                    ?? file.ReleaseTitle
+                    ?? file.OriginalTitle
+                    ?? Path.GetFileNameWithoutExtension(file.FilePath);
+                return new { File = file, Grab = grab, Title = title };
+            })
+            .Where(candidate => !string.IsNullOrEmpty(candidate.Title))
+            .GroupBy(candidate => !string.IsNullOrEmpty(candidate.Grab?.TorrentInfoHash)
+                ? $"hash:{candidate.Grab.TorrentInfoHash}"
+                : $"title:{candidate.Title}|{candidate.Grab?.Indexer}|{candidate.Grab?.Protocol}",
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .ToList();
 
-        foreach (var releaseTitle in releasesToBlocklist)
+        foreach (var release in releasesToBlocklist)
         {
             var blocklistEntry = new BlocklistItem
             {
                 EventId = id,
-                Title = releaseTitle!,
-                TorrentInfoHash = $"manual-block-{DateTime.UtcNow.Ticks}-{releaseTitle!.GetHashCode()}", // Synthetic hash
+                Title = release.Title!,
+                TorrentInfoHash = release.Grab?.TorrentInfoHash,
+                Indexer = release.Grab?.Indexer,
+                Protocol = release.Grab?.Protocol,
+                Part = release.File.PartName,
                 Reason = BlocklistReason.ManualBlock,
                 Message = "Deleted from file management (delete all)",
                 BlockedAt = DateTime.UtcNow
@@ -738,14 +824,17 @@ app.MapDelete("/api/events/{id:int}/files", async (
             var qualityProfileId = evt.QualityProfileId ?? evt.League?.QualityProfileId;
             _ = Task.Run(async () =>
             {
+                using var scope = scopeFactory.CreateScope();
+                var scopedSearch = scope.ServiceProvider.GetRequiredService<AutomaticSearchService>();
+                var scopedLogger = scope.ServiceProvider.GetRequiredService<ILogger<AutomaticSearchService>>();
                 try
                 {
-                    logger.LogInformation("[FILES] Searching for replacement for event {EventId}", id);
-                    await searchService.SearchAndDownloadEventAsync(id, qualityProfileId, null, isManualSearch: true);
+                    scopedLogger.LogInformation("[FILES] Searching for replacement for event {EventId}", id);
+                    await scopedSearch.SearchAndDownloadEventAsync(id, qualityProfileId, null, isManualSearch: true);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", id);
+                    scopedLogger.LogError(ex, "[FILES] Failed to search for replacement for event {EventId}", id);
                 }
             });
         }
@@ -767,9 +856,10 @@ app.MapDelete("/api/events/{id:int}/files", async (
 });
 
 // API: Update event monitored parts (for fighting sports multi-part episodes)
-app.MapPut("/api/events/{id:int}/parts", async (int id, JsonElement body, SportarrDbContext db, ILogger<Program> logger) =>
+app.MapPut("/api/events/{id:int}/parts", async (int id, JsonElement body, SportarrDbContext db, ConfigService configService, ILogger<Program> logger) =>
 {
-    var evt = await db.Events.FindAsync(id);
+    var evt = await db.Events.Include(e => e.League).Include(e => e.Files)
+        .FirstOrDefaultAsync(e => e.Id == id);
     if (evt is null) return Results.NotFound();
 
     if (body.TryGetProperty("monitoredParts", out var partsValue))
@@ -777,6 +867,8 @@ app.MapPut("/api/events/{id:int}/parts", async (int id, JsonElement body, Sporta
         evt.MonitoredParts = partsValue.ValueKind == JsonValueKind.Null
             ? null
             : partsValue.GetString();
+        var config = await configService.GetConfigAsync();
+        evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(evt, config.EnableMultiPartEpisodes);
 
         logger.LogInformation("[EVENT] Updated monitored parts for event {EventId} ({EventTitle}) to: {Parts}",
             id, evt.Title, evt.MonitoredParts ?? "null (use league default)");
@@ -794,6 +886,7 @@ app.MapPut("/api/leagues/{leagueId:int}/seasons/{season}/toggle", async (
     string season,
     JsonElement body,
     SportarrDbContext db,
+    ConfigService configService,
     ILogger<Program> logger) =>
 {
     var league = await db.Leagues.FindAsync(leagueId);
@@ -806,11 +899,14 @@ app.MapPut("/api/leagues/{leagueId:int}/seasons/{season}/toggle", async (
 
     // Get all events for this league and season
     var events = await db.Events
+        .Include(e => e.Files)
         .Where(e => e.LeagueId == leagueId && e.Season == season)
         .ToListAsync();
 
     if (events.Count == 0)
         return Results.NotFound($"No events found for season {season}");
+
+    var config = await configService.GetConfigAsync();
 
     logger.LogInformation("[SEASON TOGGLE] {Action} season {Season} for league {LeagueName} ({EventCount} events)",
         monitored ? "Monitoring" : "Unmonitoring", season, league.Name, events.Count);
@@ -871,6 +967,8 @@ app.MapPut("/api/leagues/{leagueId:int}/seasons/{season}/toggle", async (
             // When toggling OFF: Clear parts (unmonitor everything)
             evt.MonitoredParts = null;
         }
+
+        evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(evt, config.EnableMultiPartEpisodes, league);
 
         evt.LastUpdate = DateTime.UtcNow;
     }

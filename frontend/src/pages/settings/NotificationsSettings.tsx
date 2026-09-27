@@ -3,6 +3,7 @@ import { PlusIcon, PencilIcon, TrashIcon, BellIcon, XMarkIcon, CheckCircleIcon }
 import { apiGet, apiPost, apiPut, apiDelete } from '../../utils/api';
 import SettingsHeader from '../../components/SettingsHeader';
 import TagSelector from '../../components/TagSelector';
+import { BADGE_BLUE } from '../../utils/designTokens';
 
 interface NotificationsSettingsProps {
   showAdvanced?: boolean;
@@ -19,6 +20,7 @@ interface Notification {
   onRecordingStarted?: boolean;
   onRecordingCompleted?: boolean;
   onRecordingFailed?: boolean;
+  onEpgSyncCompleted?: boolean;
   onUpgrade?: boolean;
   onRename?: boolean;
   onHealthIssue?: boolean;
@@ -138,7 +140,7 @@ const notificationTemplates: NotificationTemplate[] = [
     implementation: 'Webhook',
     description: 'Send JSON notifications to a custom URL (works with media-automation tools like Autoscan)',
     icon: '🔗',
-    fields: ['webhook', 'method', 'username', 'password', 'headers', 'onGrab', 'onDownload', 'onUpgrade', 'onRename', 'onEventAdded', 'onEventDelete', 'onEventFileDelete', 'onEventFileDeleteForUpgrade', 'onHealthIssue', 'onHealthRestored', 'onApplicationUpdate', 'onManualInteractionRequired', 'onRecordingStarted', 'onRecordingCompleted', 'onRecordingFailed']
+    fields: ['webhook', 'method', 'username', 'password', 'headers', 'onGrab', 'onDownload', 'onUpgrade', 'onRename', 'onEventAdded', 'onEventDelete', 'onEventFileDelete', 'onEventFileDeleteForUpgrade', 'onHealthIssue', 'onHealthRestored', 'onApplicationUpdate', 'onManualInteractionRequired', 'onRecordingStarted', 'onRecordingCompleted', 'onRecordingFailed', 'onEpgSyncCompleted']
   },
   {
     name: 'Notifiarr',
@@ -215,7 +217,7 @@ const notificationTemplates: NotificationTemplate[] = [
     implementation: 'CustomScript',
     description: 'Run a script on events with details passed as SPORTARR_* environment variables',
     icon: '📜',
-    fields: ['scriptPath', 'arguments', 'onGrab', 'onDownload', 'onUpgrade', 'onRename', 'onEventAdded', 'onEventDelete', 'onEventFileDelete', 'onEventFileDeleteForUpgrade', 'onHealthIssue', 'onHealthRestored', 'onApplicationUpdate', 'onManualInteractionRequired', 'onRecordingStarted', 'onRecordingCompleted', 'onRecordingFailed']
+    fields: ['scriptPath', 'arguments', 'onGrab', 'onDownload', 'onUpgrade', 'onRename', 'onEventAdded', 'onEventDelete', 'onEventFileDelete', 'onEventFileDeleteForUpgrade', 'onHealthIssue', 'onHealthRestored', 'onApplicationUpdate', 'onManualInteractionRequired', 'onRecordingStarted', 'onRecordingCompleted', 'onRecordingFailed', 'onEpgSyncCompleted']
   },
   // Media Server Connections (like Sonarr/Radarr)
   {
@@ -292,6 +294,7 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
     onRecordingCompleted: true,
     onRecordingFailed: true,
     onRecordingStarted: false,
+    onEpgSyncCompleted: false,
     includeHealthWarnings: false,
     useSsl: true,
     port: 587,
@@ -326,6 +329,7 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
       onRecordingCompleted: true,
       onRecordingFailed: true,
       onRecordingStarted: false,
+      onEpgSyncCompleted: false,
       onEventFileDelete: template.implementation === 'Kodi' ? true : undefined,
       includeHealthWarnings: false,
       useSsl: template.implementation === 'Email',
@@ -407,6 +411,7 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
         onRecordingCompleted: true,
         onRecordingFailed: true,
         onRecordingStarted: false,
+        onEpgSyncCompleted: false,
         includeHealthWarnings: false,
         tags: []
       });
@@ -489,6 +494,7 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
       onRecordingCompleted: true,
       onRecordingFailed: true,
       onRecordingStarted: false,
+      onEpgSyncCompleted: false,
       includeHealthWarnings: false,
       tags: []
     });
@@ -600,6 +606,9 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
                       )}
                       {notification.onApplicationUpdate && (
                         <span className="px-2 py-1 bg-cyan-900/30 text-cyan-400 rounded">App Updates</span>
+                      )}
+                      {notification.onEpgSyncCompleted && (
+                        <span className={BADGE_BLUE}>EPG Sync</span>
                       )}
                     </div>
                   </div>
@@ -1662,6 +1671,18 @@ export default function NotificationsSettings({ showAdvanced = false }: Notifica
                             className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
                           />
                           <span className="text-sm font-medium text-gray-300">On Recording Failed</span>
+                        </label>
+                      )}
+
+                      {selectedTemplate?.fields.includes('onEpgSyncCompleted') && (
+                        <label className="flex items-center space-x-3 cursor-pointer p-3 bg-black/30 rounded-lg hover:bg-black/50 transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={formData.onEpgSyncCompleted || false}
+                            onChange={(e) => handleFormChange('onEpgSyncCompleted', e.target.checked)}
+                            className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
+                          />
+                          <span className="text-sm font-medium text-gray-300">On EPG Sync Complete</span>
                         </label>
                       )}
 

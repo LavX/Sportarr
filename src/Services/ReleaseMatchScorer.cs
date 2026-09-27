@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -40,10 +41,10 @@ public class ReleaseMatchScorer
         // USA circuits (F1, IndyCar, NASCAR, MotoGP)
         { "USA", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "Las Vegas", "Vegas", "Miami", "Miami Gardens", "Austin", "COTA", "Circuit of the Americas",
-              "Indianapolis", "Indy", "Daytona", "Laguna Seca", "Road America", "Watkins Glen", "Road Atlanta" } },
+              "Indianapolis", "Indy", "Daytona", "Laguna Seca", "Road America", "Watkins Glen", "Road Atlanta", "Portland" } },
         { "United States", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { "Las Vegas", "Vegas", "Miami", "Miami Gardens", "Austin", "COTA", "Circuit of the Americas",
-              "Indianapolis", "Indy", "Daytona", "Laguna Seca", "Road America", "Watkins Glen", "Road Atlanta" } },
+              "Indianapolis", "Indy", "Daytona", "Laguna Seca", "Road America", "Watkins Glen", "Road Atlanta", "Portland" } },
 
         // Italy circuits (F1, MotoGP)
         { "Italy", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -53,18 +54,18 @@ public class ReleaseMatchScorer
 
         // Britain/UK circuits (F1, MotoGP, WEC)
         { "Britain", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Silverstone", "Brands Hatch", "Donington" } },
+            { "Silverstone", "Brands Hatch", "Donington", "London", "ExCeL" } },
         { "British", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Silverstone", "Brands Hatch", "Donington" } },
+            { "Silverstone", "Brands Hatch", "Donington", "London", "ExCeL" } },
         { "UK", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Silverstone", "Brands Hatch", "Donington" } },
+            { "Silverstone", "Brands Hatch", "Donington", "London", "ExCeL" } },
         { "Great Britain", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Silverstone", "Brands Hatch", "Donington" } },
+            { "Silverstone", "Brands Hatch", "Donington", "London", "ExCeL" } },
         // The metadata source names this round "United Kingdom" while
         // releases say "Great Britain", so the event's own location has to
         // be a key too, the same way USA and United States both are above.
         { "United Kingdom", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Silverstone", "Brands Hatch", "Donington" } },
+            { "Silverstone", "Brands Hatch", "Donington", "London", "ExCeL" } },
 
         // Spain circuits (F1, MotoGP)
         { "Spain", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -74,9 +75,9 @@ public class ReleaseMatchScorer
 
         // Japan circuits (F1, MotoGP, WEC)
         { "Japan", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Suzuka", "Motegi", "Twin Ring", "Fuji" } },
+            { "Suzuka", "Motegi", "Twin Ring", "Fuji", "Tokyo" } },
         { "Japanese", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Suzuka", "Motegi", "Twin Ring", "Fuji" } },
+            { "Suzuka", "Motegi", "Twin Ring", "Fuji", "Tokyo" } },
 
         // Australia circuits (F1, MotoGP)
         { "Australia", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -86,9 +87,9 @@ public class ReleaseMatchScorer
 
         // China circuits (F1)
         { "China", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Shanghai" } },
+            { "Shanghai", "Sanya", "Haitang Bay" } },
         { "Chinese", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Shanghai" } },
+            { "Shanghai", "Sanya", "Haitang Bay" } },
 
         // Brazil circuits (F1, MotoGP)
         { "Brazil", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -150,9 +151,9 @@ public class ReleaseMatchScorer
 
         // Saudi Arabia circuits (F1)
         { "Saudi Arabia", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Jeddah" } },
+            { "Jeddah", "Diriyah" } },
         { "Saudi", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Jeddah" } },
+            { "Jeddah", "Diriyah" } },
 
         // UAE circuits (F1)
         { "UAE", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -186,9 +187,9 @@ public class ReleaseMatchScorer
 
         // Germany circuits (MotoGP)
         { "Germany", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Sachsenring", "Hockenheim", "Nurburgring" } },
+            { "Sachsenring", "Hockenheim", "Nurburgring", "Berlin" } },
         { "German", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Sachsenring", "Hockenheim", "Nurburgring" } },
+            { "Sachsenring", "Hockenheim", "Nurburgring", "Berlin" } },
 
         // Argentina circuits (MotoGP)
         { "Argentina", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -208,9 +209,9 @@ public class ReleaseMatchScorer
 
         // Indonesia circuits (MotoGP)
         { "Indonesia", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Mandalika", "Lombok" } },
+            { "Mandalika", "Lombok", "Jakarta" } },
         { "Indonesian", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Mandalika", "Lombok" } },
+            { "Mandalika", "Lombok", "Jakarta" } },
 
         // India circuits (MotoGP)
         { "India", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -262,8 +263,10 @@ public class ReleaseMatchScorer
     private static readonly Regex _yearRegex = new(@"\b((?:19[3-9]\d|20\d\d))\b", RegexOptions.Compiled);
     private static readonly Regex _parseRoundRegex = new(@"(?:Round|R|Week|W)[\.\s]*(\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _gameNumberRegex = new(@"\bGame[\.\s_-]*(\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _isoDateRegex = new(@"\b((?:19[3-9]\d|20\d\d))[.\-\s](\d{2})[.\-\s](\d{2})\b", RegexOptions.Compiled);
-    private static readonly Regex _euroDateRegex = new(@"\b(\d{2})[.\-\s](\d{2})[.\-\s]((?:19[3-9]\d|20\d\d))\b", RegexOptions.Compiled);
+    private static readonly Regex _isoDateRegex = new(@"(?<!\d)((?:19[3-9]\d|20\d\d))[._/\-\s](0?[1-9]|1[0-2])[._/\-\s](0?[1-9]|[12]\d|3[01])(?!\d)", RegexOptions.Compiled);
+    private static readonly Regex _euroDateRegex = new(@"(?<!\d)(\d{1,2})[._/\-\s](\d{1,2})[._/\-\s]((?:19[3-9]\d|20\d\d))(?!\d)", RegexOptions.Compiled);
+    private static readonly Regex _shortEuroDateRegex = new(@"(?<!\d)(\d{2})[._/\-\s](\d{2})[._/\-\s](\d{2})(?![\p{L}\p{M}\p{N}]|:\d{2})", RegexOptions.Compiled);
+    private static readonly Regex _compactIsoDateRegex = new(@"(?<!\d)((?:19[3-9]\d|20\d\d))(\d{2})(\d{2})(?!\d)", RegexOptions.Compiled);
 
     // DetectSportPrefix patterns - hit per release in the parse pass.
     private static readonly Regex _formula3WordRegex = new(@"\bFORMULA[\.\-\s]*3\b", RegexOptions.Compiled);
@@ -275,6 +278,7 @@ public class ReleaseMatchScorer
     private static readonly Regex _moto2Regex = new(@"\bMOTO[\.\-\s]*2\b", RegexOptions.Compiled);
 
     // Motorsport session-type detection - per-event hot path inside GetSessionTypeMatchScore.
+    private static readonly Regex _f1ShowRegex = new(@"\b(?:the[\s\-_.]*)?f1[\s\-_.]+show\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _preRaceRegex = new(@"\b(pre[\s\-_.]*race|build[\s\-_.]*up|grid[\s\-_.]*walk)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _postRaceRegex = new(@"\b(post[\s\-_.]*race|race[\s\-_.]*analysis|podium)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _practiceRegex = new(@"\b(fp[123]|free\s*practice|practice\s*[123]?)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -288,6 +292,21 @@ public class ReleaseMatchScorer
     private static readonly Regex _anySessionIndicatorRegex = new(
         @"\b(fp[123]|free\s*practice|practice|qualifying|qualifyers?|qualifiers?|quali|q[123]|sprint|shootout|full\s*event|pre[\s\-_.]*race|post[\s\-_.]*race|build[\s\-_.]*up|grid[\s\-_.]*walk|podium|race[\s\-_.]*analysis)\b",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _rallyStageRegex = new(
+        @"\b(?:ss|stage)\s*(\d{1,3})\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex _dayMonthRegex = new(
+        @"(?<![\p{L}\p{M}\p{N}])(?<day>0?[1-9]|[12]\d|3[01])[\s._/-]+(?<month>0?[1-9]|1[0-2])(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex _audioChannelPrefixRegex = new(
+        @"(?:^|[\s._-])(?:AAC|AC3|E[\s._-]*AC[\s._-]*3|DDP?|TRUEHD|ATMOS|DTS(?:[\s._-]+HD)?(?:[\s._-]+MA)?|FLAC|MP3|OPUS)[\s._-]*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex _mastersTournamentRegex = new(
+        @"\bmasters\s+tournament\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex _augustaMastersReleaseRegex = new(
+        @"\b(?:the\s+)?augusta\s+masters\b|\bthe\s+masters\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     // Fighting-event identity regexes - hit per release for UFC/Bellator/PFL events.
     // Season 10 events are titled "... season 10 Week 1" and its releases are
@@ -317,7 +336,9 @@ public class ReleaseMatchScorer
     // it is named exactly "ONE" or pairs the word with the promotion's own
     // suffix; a release qualifies only with that suffix or "Fight Night".
     private static readonly Regex _oneLeagueRegex = new(@"^\s*one\s*(?:championship|fc)?\s*$|\bone\s+(?:championship|fc)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _oneReleaseRegex = new(@"\bone[\s._-]+(?:championship|fc)\b|\bone[\s._-]+fight[\s._-]*night\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _oneReleaseRegex = new(
+        @"\bone[\s._-]+(?:championship|fc)\b|\bone[\s._-]+(?:fight[\s._-]*night|friday[\s._-]*fights|samurai)[\s._-]+\d{1,3}\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _fightNightRegex = new(@"fight\s*night", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _vsFightersRegex = new(@"[:\s]([a-z]+)\s*(?:vs|v)\s*([a-z]+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -387,17 +408,27 @@ public class ReleaseMatchScorer
     /// Calculate match score for a release against an event.
     /// Returns 0-100, higher is better.
     /// </summary>
-    public int CalculateMatchScore(string releaseTitle, Event evt)
+    public int CalculateMatchScore(
+        string releaseTitle,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        string? requestedPart = null,
+        bool enableMultiPartEpisodes = true,
+        IReadOnlyList<int>? roundRaceNumbers = null)
     {
         var parsed = ParseReleaseTitle(releaseTitle);
-        return CalculateMatchScoreInternal(releaseTitle, parsed, evt);
+        return CalculateMatchScoreInternal(
+            releaseTitle, parsed, evt, knownLeagues, requestedPart, enableMultiPartEpisodes,
+            roundRaceNumbers);
     }
 
     /// <summary>
     /// Calculate match score with pre-parsed release metadata (for cached releases).
     /// </summary>
     public int CalculateMatchScore(string releaseTitle, int? year, int? month, int? day,
-        int? roundNumber, string? sportPrefix, Event evt)
+        int? roundNumber, string? sportPrefix, Event evt,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        IReadOnlyList<int>? roundRaceNumbers = null)
     {
         var parsed = new ParsedRelease
         {
@@ -407,21 +438,34 @@ public class ReleaseMatchScorer
             RoundNumber = roundNumber,
             SportPrefix = sportPrefix
         };
-        return CalculateMatchScoreInternal(releaseTitle, parsed, evt);
+        return CalculateMatchScoreInternal(
+            releaseTitle, parsed, evt, knownLeagues, roundRaceNumbers: roundRaceNumbers);
     }
 
-    private int CalculateMatchScoreInternal(string releaseTitle, ParsedRelease parsed, Event evt)
+    private int CalculateMatchScoreInternal(
+        string releaseTitle,
+        ParsedRelease parsed,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues,
+        string? requestedPart = null,
+        bool enableMultiPartEpisodes = true,
+        IReadOnlyList<int>? roundRaceNumbers = null)
     {
         var score = 0;
         var eventSportPrefix = GetSportPrefix(evt.League?.Name, evt.Sport);
+        var isCombatEvent = EventPartDetector.IsFightingSport(evt.Sport ?? string.Empty);
         // Use the broadcast-local year so end-of-year shows (AEW Dec 31 8pm
         // Eastern = Jan 1 UTC) match releases titled with the broadcast year.
         var eventYear = (evt.BroadcastDate ?? evt.EventDate.Date).Year;
+        var ehfSeasonStartMatches = parsed.Year.HasValue && parsed.Year != eventYear &&
+            LeagueReleaseNamePolicy.HasMatchingEHFSeasonStartIdentity(releaseTitle, evt, parsed.Year.Value);
 
         // === REQUIRED CRITERIA (score 0 if these don't match) ===
 
         // Year must match - this is required
-        if (parsed.Year.HasValue && parsed.Year != eventYear)
+        if (parsed.Year.HasValue && parsed.Year != eventYear &&
+            !CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(releaseTitle, evt) &&
+            !ehfSeasonStartMatches)
             return 0;
 
         // Cross-sport detection - reject releases from completely different sports
@@ -429,10 +473,115 @@ public class ReleaseMatchScorer
         if (ContainsDifferentSport(releaseTitle, evt))
             return 0;
 
+        if (CricketRugbyReleaseNamePolicy.HasIdentityConflict(releaseTitle, evt))
+            return 0;
+        if (LeagueReleaseNamePolicy.HasIdentityConflict(releaseTitle, evt))
+            return 0;
+        if (SearchNormalizationService.HasCyclingCategoryConflict(
+                releaseTitle, evt.Title ?? string.Empty, evt.League?.Name, evt.Sport))
+            return 0;
+        if (SearchNormalizationService.HasParticipantCategoryConflict(releaseTitle, evt))
+            return 0;
+        var supercarsRoundRaceIdentity = LeagueReleaseNamePolicy.EvaluateSupercarsRoundRaceIdentity(
+            releaseTitle, evt, roundRaceNumbers);
+        if (supercarsRoundRaceIdentity == false)
+            return 0;
+        if (LeagueReleaseNamePolicy.HasUnresolvedSupercarsRaceIdentity(releaseTitle, evt))
+        {
+            if (supercarsRoundRaceIdentity != true) return 0;
+        }
+
+        var normalizedReleaseTitle = NormalizeTitle(releaseTitle);
+        var normalizedEventTitle = NormalizeTitle(evt.Title ?? "");
+        if (CricketRugbyReleaseNamePolicy.HasStrongEventIdentity(releaseTitle, evt))
+            score += 20;
+        var hasLeagueReleaseIdentity = LeagueReleaseNamePolicy.HasStrongEventIdentity(releaseTitle, evt);
+        if (hasLeagueReleaseIdentity)
+            score += 20;
+        if (hasLeagueReleaseIdentity &&
+            (evt.League?.Name.Contains("World Snooker", StringComparison.OrdinalIgnoreCase) == true ||
+             evt.League?.Name.Equals("Formula E", StringComparison.OrdinalIgnoreCase) == true ||
+             LeagueReleaseNamePolicy.UsesCompleteCatalogIdentity(evt)))
+            return AutoGrabMatchScore + 20;
+        var tennisIdentity = string.Equals(evt.Sport, "Tennis", StringComparison.OrdinalIgnoreCase)
+            ? SearchNormalizationService.EvaluateTennisIdentity(releaseTitle, evt.Title ?? string.Empty)
+            : TennisIdentityMatch.Unknown;
+        if (tennisIdentity is TennisIdentityMatch.ParticipantMismatch or TennisIdentityMatch.TournamentMismatch)
+            return 0;
+
+        var isNascarCup = eventSportPrefix == "NASCAR" &&
+            evt.League?.Name.Contains("NASCAR Cup", StringComparison.OrdinalIgnoreCase) == true;
+        var nascarNamedIdentity = isNascarCup && normalizedReleaseTitle.Contains(
+            normalizedEventTitle, StringComparison.OrdinalIgnoreCase);
+        var nascarReleaseRound = isNascarCup
+            ? parsed.RoundNumber ?? ExtractReleaseRoundNumber(normalizedReleaseTitle)
+            : null;
+        var nascarRoundIdentity = isNascarCup &&
+            nascarReleaseRound.HasValue &&
+            int.TryParse(evt.Round, out var parsedNascarEventRound) &&
+            nascarReleaseRound == parsedNascarEventRound;
+        var nascarReleaseDate = isNascarCup
+            ? BuildParsedDate(parsed, eventYear) ?? ExtractDayMonthDate(releaseTitle, eventYear)
+            : null;
+        var nascarVenueIdentity = isNascarCup &&
+            SearchNormalizationService.HasExactDateAndLocationMatch(
+                releaseTitle,
+                evt.Venue,
+                evt.Location,
+                nascarReleaseDate,
+                (evt.BroadcastDate ?? evt.EventDate).Date);
+
+        if (SearchNormalizationService.HasConflictingNascarSeries(
+                releaseTitle, evt.Title ?? string.Empty, evt.League?.Name))
+        {
+            return 0;
+        }
+
+        if (isNascarCup &&
+            SearchNormalizationService.HasConflictingNascarSession(releaseTitle, evt.Title ?? string.Empty))
+        {
+            return 0;
+        }
+
+        if (isNascarCup && SearchNormalizationService.HasConflictingNascarRaceDistance(
+                releaseTitle, evt.Title ?? string.Empty))
+        {
+            return 0;
+        }
+
+        if (isNascarCup && !nascarNamedIdentity && !nascarRoundIdentity && !nascarVenueIdentity)
+        {
+            return 0;
+        }
+
+        if (eventSportPrefix == "WRC")
+        {
+            var eventStage = ExtractRallyStageNumber(normalizedEventTitle);
+            var releaseStage = ExtractRallyStageNumber(normalizedReleaseTitle);
+            if (eventStage.HasValue && releaseStage != eventStage)
+                return 0;
+            if (!eventStage.HasValue && releaseStage.HasValue)
+                return 0;
+            if (eventStage.HasValue &&
+                !SearchNormalizationService.HasRallyIdentityMatch(releaseTitle, evt.Title ?? string.Empty))
+                return 0;
+        }
+
+        // A named team league is definitive even when team metadata is incomplete.
+        // Do not let a shared city or nickname bridge different competitions.
+        if (IsTeamSport(eventSportPrefix) && IsTeamSport(parsed.SportPrefix) &&
+            HasExplicitTeamLeagueToken(releaseTitle, parsed.SportPrefix!) &&
+            !string.Equals(eventSportPrefix, parsed.SportPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
         // === SCORING CRITERIA ===
 
         // Base score for matching year (if year info exists)
-        if (parsed.Year.HasValue && parsed.Year == eventYear)
+        if (parsed.Year.HasValue && (parsed.Year == eventYear ||
+            CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(releaseTitle, evt) ||
+            ehfSeasonStartMatches))
             score += 15;
 
         // Dynamic league name matching - works with ANY sport (AMA Motocross, WRC, Tennis, etc.)
@@ -465,6 +614,14 @@ public class ReleaseMatchScorer
         // This is the primary identity signal for individual/tournament-format sports that
         // do not have team or motorsport-style matchers below.
         score += GetEventTitleMatchScore(releaseTitle, evt.Title);
+        if (tennisIdentity == TennisIdentityMatch.Match)
+            score += 20;
+        if (string.Equals(evt.Sport, "Golf", StringComparison.OrdinalIgnoreCase) &&
+            _mastersTournamentRegex.IsMatch(normalizedEventTitle) &&
+            _augustaMastersReleaseRegex.IsMatch(normalizedReleaseTitle))
+        {
+            score += 15;
+        }
 
         // Sport prefix match for motorsport - HARD REJECT if different motorsport series detected
         // This prevents Formula E releases from matching Formula 1 events (both have similar structure)
@@ -487,25 +644,6 @@ public class ReleaseMatchScorer
         }
 
         // Round number match.
-        // Two semantic conventions collide on the integer round
-        // field:
-        //   * Release filenames use "Round N" / "Week N" for the
-        //     position of the event within the season, typically
-        //     1-50 across every sport (motorsport rounds, NFL
-        //     weeks, soccer matchdays, playoff round 1-4 in
-        //     colloquial usage).
-        //   * Some metadata sources encode categorical info into
-        //     the integer round field (notably TheSportsDB stores
-        //     125/150/175/200 for the four NHL/NBA playoff stages).
-        //     Those aren't round numbers, just encoded category
-        //     ids that happen to be ints.
-        //
-        // Equality is a hard reject only when both sides are in
-        // the realistic-round range (<= MaxRealisticRoundNumber).
-        // Outside that range the two numbers are using different
-        // schemes and direct comparison is meaningless - skip the
-        // round signal and let team match, date match, and game
-        // number match (below) carry the disambiguation.
         const int MaxRealisticRoundNumber = 50;
         // Fighting events ignore the Round FIELD here. It counts the
         // league's chronological card position (a DWCS "season 10 Week 1"
@@ -514,7 +652,7 @@ public class ReleaseMatchScorer
         // before the fighting matcher below could identify it. A week in
         // the event TITLE is real identity and stays comparable, so a
         // wrong-week release still hard-rejects.
-        var eventRound = !IsFightingSport(eventSportPrefix) && !string.IsNullOrEmpty(evt.Round)
+        var eventRound = !isCombatEvent && !IsFightingSport(eventSportPrefix) && !string.IsNullOrEmpty(evt.Round)
             ? ExtractRoundNumber(evt.Round)
             : null;
         if (!eventRound.HasValue && !string.IsNullOrEmpty(evt.Title))
@@ -523,13 +661,22 @@ public class ReleaseMatchScorer
             if (titleRoundMatch.Success && int.TryParse(titleRoundMatch.Groups[1].Value, out var titleRound))
                 eventRound = titleRound;
         }
-        if (eventRound.HasValue && parsed.RoundNumber.HasValue
-            && eventRound.Value <= MaxRealisticRoundNumber
-            && parsed.RoundNumber.Value <= MaxRealisticRoundNumber)
+        if (eventRound.HasValue && parsed.RoundNumber.HasValue)
         {
-            if (parsed.RoundNumber == eventRound)
+            var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+            var parsedDate = BuildParsedDate(parsed, eventDate.Year);
+            var hasExactPreseasonDate = eventRound == 500 &&
+                SearchNormalizationService.HasExactDatedPreseasonIdentity(releaseTitle, parsedDate, evt);
+            var roundsMatch = parsed.RoundNumber == eventRound ||
+                (parsed.RoundNumber == 0 && eventRound == 500) ||
+                (parsed.RoundNumber == 500 && eventRound == 0) ||
+                hasExactPreseasonDate;
+            if (roundsMatch)
                 score += IsRoundBasedSport(eventSportPrefix) ? 25 : 15;
-            else
+            else if (nascarNamedIdentity)
+                score += 25;
+            else if (eventRound == 500 || parsed.RoundNumber == 500 ||
+                     eventRound <= MaxRealisticRoundNumber && parsed.RoundNumber <= MaxRealisticRoundNumber)
                 return 0; // Real round mismatch (Round 19 != Round 22, Masters R1 != R2)
         }
 
@@ -580,7 +727,8 @@ public class ReleaseMatchScorer
             // Session type matching (for motorsport)
             // CRITICAL: Ensures Race searches don't show Practice/Qualifying results
             // This prevents "Abu Dhabi Grand Prix" (Race) from matching "Abu Dhabi GP FP1"
-            var sessionScore = GetSessionTypeMatchScore(releaseTitle, evt.Title);
+            var sessionScore = GetSessionTypeMatchScore(
+                releaseTitle, evt.Title ?? string.Empty, evt.League?.Name, eventSportPrefix);
             if (sessionScore < 0)
                 return 0; // Wrong session type - reject immediately
             score += sessionScore; // 0-15 points for matching session type
@@ -591,7 +739,13 @@ public class ReleaseMatchScorer
         // These negative scores should cause immediate rejection (return 0)
         if (IsTeamSport(eventSportPrefix))
         {
-            var teamScore = GetTeamMatchScore(releaseTitle, evt);
+            var hasExactCatalogPair = eventSportPrefix == "CanadianTeamCompetition" &&
+                    LeagueReleaseNamePolicy.HasExactCanadianTeamPair(releaseTitle, evt) ||
+                eventSportPrefix == "ChampionsHockeyLeague" &&
+                    LeagueReleaseNamePolicy.HasExactChampionsHockeyLeagueTeamPair(releaseTitle, evt);
+            var teamScore = hasExactCatalogPair
+                    ? 40
+                    : GetTeamMatchScore(releaseTitle, evt, knownLeagues);
             if (teamScore < 0)
                 return 0; // Wrong game or not a game at all - reject immediately
             score += teamScore; // 0-40 points for matching teams
@@ -607,21 +761,53 @@ public class ReleaseMatchScorer
         if (IsDateBasedSport(eventSportPrefix)
             || (evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue))
         {
-            var dateScore = GetDateMatchScore(parsed, evt);
+            var dateScore = GetDateMatchScore(releaseTitle, parsed, evt);
             if (dateScore < 0)
                 return 0; // A different day between the same teams is a different game
             score += dateScore; // 0-20 points
         }
 
+        var combatIdentity = SearchNormalizationService.EvaluateCombatIdentity(
+            releaseTitle,
+            evt.Title ?? string.Empty,
+            evt.League?.Name,
+            evt.Sport,
+            requestedPart,
+            enableMultiPartEpisodes);
+        if (combatIdentity == CombatIdentityMatch.Mismatch && !hasLeagueReleaseIdentity)
+            return 0;
+        if (isCombatEvent)
+        {
+            var combatReleaseDate = BuildParsedDate(parsed, eventYear) ??
+                                    ExtractDayMonthDate(releaseTitle, eventYear);
+            if (combatReleaseDate.HasValue)
+            {
+                var eventDate = (evt.BroadcastDate ?? evt.EventDate).Date;
+                var daysDifference = Math.Abs((combatReleaseDate.Value.Date - eventDate).TotalDays);
+                var requiresExactDate = SearchNormalizationService.RequiresExactCombatDate(
+                    evt.Title ?? string.Empty, evt.League?.Name, evt.Sport);
+                if ((requiresExactDate && daysDifference != 0) ||
+                    (daysDifference > 3 &&
+                     !SearchNormalizationService.HasDayMonthDateToken(releaseTitle, eventDate)))
+                {
+                    return 0;
+                }
+            }
+        }
+
         // Fighting event matching (UFC number, fighters)
         // CRITICAL: Fighting matching can return negative scores for wrong events
-        if (IsFightingSport(eventSportPrefix))
+        if (isCombatEvent || IsFightingSport(eventSportPrefix))
         {
             var fightScore = GetFightingEventMatchScore(releaseTitle, evt.Title);
-            if (fightScore < 0)
+            if (fightScore < 0 && combatIdentity != CombatIdentityMatch.Match && !hasLeagueReleaseIdentity)
                 return 0; // Wrong event - reject immediately
-            score += fightScore; // 0-40 points for matching events
+            if (fightScore > 0)
+                score += fightScore; // 0-40 points for matching events
         }
+
+        if (combatIdentity == CombatIdentityMatch.Match)
+            score += 25;
 
         // Ensure score is within bounds (0-100)
         return Math.Clamp(score, 0, 100);
@@ -661,11 +847,21 @@ public class ReleaseMatchScorer
         // like "NHL SC 2026 / Round 1 / Game 6 / 30.04.2026 / ..." and the
         // matcher can't bonus the day, hurting overall score.
         var dateMatch = _isoDateRegex.Match(title);
+        if (!dateMatch.Success)
+        {
+            dateMatch = _compactIsoDateRegex.Match(title);
+        }
         if (dateMatch.Success)
         {
             parsed.Year = int.Parse(dateMatch.Groups[1].Value);
             parsed.Month = int.Parse(dateMatch.Groups[2].Value);
             parsed.Day = int.Parse(dateMatch.Groups[3].Value);
+        }
+        else if (SearchNormalizationService.ParseCoupangMonthFirstDate(title) is DateTime coupangDate)
+        {
+            parsed.Year = coupangDate.Year;
+            parsed.Month = coupangDate.Month;
+            parsed.Day = coupangDate.Day;
         }
         else
         {
@@ -674,15 +870,39 @@ public class ReleaseMatchScorer
             // capture will fail validation in GetDateMatchScore (try/catch
             // around new DateTime(...)).
             var euroDateMatch = _euroDateRegex.Match(title);
+            var parsedEuroDate = false;
             if (euroDateMatch.Success
                 && int.TryParse(euroDateMatch.Groups[1].Value, out var euroDay)
-                && int.TryParse(euroDateMatch.Groups[2].Value, out var euroMonth)
-                && euroDay is >= 1 and <= 31
-                && euroMonth is >= 1 and <= 12)
+                && int.TryParse(euroDateMatch.Groups[2].Value, out var euroMonth))
             {
-                parsed.Year = int.Parse(euroDateMatch.Groups[3].Value);
-                parsed.Month = euroMonth;
-                parsed.Day = euroDay;
+                if (euroMonth > 12 && euroDay <= 12)
+                {
+                    (euroDay, euroMonth) = (euroMonth, euroDay);
+                }
+
+                if (euroDay is >= 1 and <= 31 && euroMonth is >= 1 and <= 12)
+                {
+                    parsed.Year = int.Parse(euroDateMatch.Groups[3].Value);
+                    parsed.Month = euroMonth;
+                    parsed.Day = euroDay;
+                    parsedEuroDate = true;
+                }
+            }
+
+            if (!parsedEuroDate)
+            {
+                var shortDateMatch = _shortEuroDateRegex.Match(title);
+                if (shortDateMatch.Success
+                    && int.TryParse(shortDateMatch.Groups[1].Value, out var shortDay)
+                    && int.TryParse(shortDateMatch.Groups[2].Value, out var shortMonth)
+                    && shortDay is >= 1 and <= 31
+                    && shortMonth is >= 1 and <= 12)
+                {
+                    var shortYear = int.Parse(shortDateMatch.Groups[3].Value);
+                    parsed.Year = shortYear >= 50 ? 1900 + shortYear : 2000 + shortYear;
+                    parsed.Month = shortMonth;
+                    parsed.Day = shortDay;
+                }
             }
         }
 
@@ -751,8 +971,12 @@ public class ReleaseMatchScorer
         // Team sports
         if (normalized.Contains("NFL") && !normalized.Contains("UEFA"))
             return "NFL";
-        if (normalized.Contains("NBA"))
-            return "NBA";
+        if (CricketRugbyReleaseNamePolicy.ReleaseLeagueKey(title) is { } cricketRugbyLeague)
+            return cricketRugbyLeague;
+        if (LeagueReleaseNamePolicy.ReleaseLeagueKey(title) is { } priorityLeague)
+            return priorityLeague;
+        if (BasketballLeagueIdentity.Detect(title) is { } basketballLeague)
+            return basketballLeague;
         if (normalized.Contains("NHL"))
             return "NHL";
         if (normalized.Contains("MLB"))
@@ -808,10 +1032,22 @@ public class ReleaseMatchScorer
                 return "UFC";
             if (_oneLeagueRegex.IsMatch(leagueName))
                 return "ONE";
+            if (upper == "PFL" || upper.Contains("PROFESSIONAL FIGHTERS LEAGUE"))
+                return "PFL";
+            if (upper.Contains("BOXING"))
+                return "Boxing";
+            if (upper.Contains("WWE"))
+                return "WWE";
+            if (upper.Contains("AEW") || upper.Contains("ALL ELITE WRESTLING"))
+                return "AEW";
             if (upper.Contains("NFL"))
                 return "NFL";
-            if (upper.Contains("NBA"))
-                return "NBA";
+            if (CricketRugbyReleaseNamePolicy.LeagueKey(leagueName) is { } cricketRugbyLeague)
+                return cricketRugbyLeague;
+            if (LeagueReleaseNamePolicy.LeagueKey(leagueName) is { } priorityLeague)
+                return priorityLeague;
+            if (BasketballLeagueIdentity.Detect(leagueName) is { } basketballLeague)
+                return basketballLeague;
             if (upper.Contains("NHL"))
                 return "NHL";
             if (upper.Contains("MLB"))
@@ -984,8 +1220,29 @@ public class ReleaseMatchScorer
     /// - Qualifying: Qualifying, Q1, Q2, Q3 (but NOT Sprint Qualifying)
     /// - Race: Race, Grand Prix, Main Race (with no other session type indicator)
     /// </summary>
-    private int GetSessionTypeMatchScore(string releaseTitle, string eventTitle)
+    private int GetSessionTypeMatchScore(
+        string releaseTitle,
+        string eventTitle,
+        string? leagueName,
+        string? eventSportPrefix)
     {
+        if (eventSportPrefix is "WSBK" or "WEC" ||
+            (eventSportPrefix == "IndyCar" &&
+             EventPartDetector.DetectMotorsportSessionIdentity(
+                 eventTitle, leagueName, releaseTitle: false) == "Final Practice"))
+        {
+            var detailedEvent = EventPartDetector.DetectMotorsportSessionIdentity(
+                eventTitle, leagueName, releaseTitle: false);
+            var detailedRelease = EventPartDetector.DetectMotorsportSessionIdentity(
+                releaseTitle, leagueName, releaseTitle: true);
+            if (detailedEvent == null) return 0;
+            if (detailedRelease == null)
+                return detailedEvent == "Race" ? 5 : -50;
+            return string.Equals(detailedEvent, detailedRelease, StringComparison.OrdinalIgnoreCase)
+                ? 15
+                : -50;
+        }
+
         var normalizedRelease = NormalizeTitle(releaseTitle);
         var normalizedEvent = NormalizeTitle(eventTitle);
 
@@ -1017,6 +1274,7 @@ public class ReleaseMatchScorer
     private enum MotorsportSessionType
     {
         Unknown,        // Can't determine, or generic event
+        Ancillary,      // Studio and race-weekend coverage
         Practice,       // FP1, FP2, FP3, Free Practice
         SprintQualifying, // Sprint Qualifying, Sprint Shootout
         Sprint,         // Sprint race (not qualifying)
@@ -1030,6 +1288,9 @@ public class ReleaseMatchScorer
     /// </summary>
     private MotorsportSessionType DetectSessionType(string normalizedTitle)
     {
+        if (_f1ShowRegex.IsMatch(normalizedTitle))
+            return MotorsportSessionType.Ancillary;
+
         // Check for PRE-RACE and POST-RACE shows FIRST (must come before Race check)
         // These are NOT the actual race - they're coverage/analysis shows
         // Patterns: "Pre-Race", "Pre Race Show", "Post-Race", "Post Race Analysis", "Grid Walk", "Build Up", "Podium"
@@ -1138,23 +1399,23 @@ public class ReleaseMatchScorer
             { "Qatar", new[] { "Lusail", "Qatari" } },
             { "Brazil", new[] { "Brazilian", "Interlagos", "Sao Paulo" } },
             { "Mexico", new[] { "Mexican", "Mexico City" } },
-            { "China", new[] { "Chinese", "Shanghai" } },
-            { "USA", new[] { "United States", "American", "COTA", "Austin", "Circuit of the Americas" } },
+            { "China", new[] { "Chinese", "Shanghai", "Sanya", "Haitang Bay" } },
+            { "USA", new[] { "United States", "American", "COTA", "Austin", "Circuit of the Americas", "Portland" } },
             { "Las Vegas", new[] { "Vegas" } },
             { "Miami", new[] { "Miami Gardens" } },
             { "Abu Dhabi", new[] { "AbuDhabi", "Yas Marina" } },
             { "Monaco", new[] { "Monte Carlo", "Monegasque" } },
             { "Austria", new[] { "Austrian", "Spielberg", "Red Bull Ring" } },
-            { "Britain", new[] { "British", "Silverstone", "UK", "Great Britain", "United Kingdom" } },
-            { "United Kingdom", new[] { "British", "Britain", "Silverstone", "UK", "Great Britain" } },
+            { "Britain", new[] { "British", "Silverstone", "UK", "Great Britain", "United Kingdom", "London", "ExCeL" } },
+            { "United Kingdom", new[] { "British", "Britain", "Silverstone", "UK", "Great Britain", "London", "ExCeL" } },
             { "Italy", new[] { "Italian", "Monza", "Imola", "Mugello", "Misano" } },
             { "Belgium", new[] { "Belgian", "Spa", "Spa-Francorchamps" } },
-            { "Japan", new[] { "Japanese", "Suzuka", "Motegi", "Fuji" } },
+            { "Japan", new[] { "Japanese", "Suzuka", "Motegi", "Fuji", "Tokyo" } },
             { "Singapore", new[] { "Singaporean", "Marina Bay" } },
             { "Australia", new[] { "Australian", "Melbourne", "Albert Park", "Phillip Island" } },
             { "Canada", new[] { "Canadian", "Montreal" } },
             { "Azerbaijan", new[] { "Azerbaijani", "Baku" } },
-            { "Saudi Arabia", new[] { "Saudi", "Jeddah" } },
+            { "Saudi Arabia", new[] { "Saudi", "Jeddah", "Diriyah" } },
             { "Netherlands", new[] { "Dutch", "Zandvoort" } },
             { "Hungary", new[] { "Hungarian", "Budapest", "Hungaroring" } },
             { "Spain", new[] { "Spanish", "Barcelona", "Catalunya", "Jerez", "Valencia", "Aragon" } },
@@ -1162,10 +1423,10 @@ public class ReleaseMatchScorer
             { "Emilia Romagna", new[] { "Emilia-Romagna", "San Marino" } },
             { "Portugal", new[] { "Portuguese", "Portimao", "Algarve" } },
             { "France", new[] { "French", "Le Mans", "Paul Ricard" } },
-            { "Germany", new[] { "German", "Sachsenring", "Hockenheim", "Nurburgring" } },
+            { "Germany", new[] { "German", "Sachsenring", "Hockenheim", "Nurburgring", "Berlin" } },
             { "Malaysia", new[] { "Malaysian", "Sepang" } },
             { "Thailand", new[] { "Thai", "Buriram", "Chang" } },
-            { "Indonesia", new[] { "Indonesian", "Mandalika", "Lombok" } },
+            { "Indonesia", new[] { "Indonesian", "Mandalika", "Lombok", "Jakarta" } },
             { "India", new[] { "Indian", "Buddh" } },
             { "Argentina", new[] { "Termas de Rio Hondo" } },
             { "Kazakhstan", new[] { "Sokol" } },
@@ -1283,7 +1544,10 @@ public class ReleaseMatchScorer
     /// Returns negative score if both teams don't match (to reject wrong games).
     /// CRITICAL: For "Team A vs Team B" events, BOTH teams must be present in the release.
     /// </summary>
-    private int GetTeamMatchScore(string releaseTitle, Event evt)
+    private int GetTeamMatchScore(
+        string releaseTitle,
+        Event evt,
+        IReadOnlyCollection<League>? knownLeagues)
     {
         var normalizedRelease = NormalizeTitle(releaseTitle);
         var homeScore = 0;
@@ -1305,6 +1569,26 @@ public class ReleaseMatchScorer
             var (hasMatch, score) = CheckTeamMatch(normalizedRelease, evt.AwayTeamName);
             awayHasMatch = hasMatch;
             awayScore = score;
+        }
+
+        (bool hasMatch, int score) homeVariantMatch = !homeHasMatch && !string.IsNullOrEmpty(evt.HomeTeamName)
+            ? CheckRegularPluralTeamMatch(normalizedRelease, evt.HomeTeamName)
+            : (false, 0);
+        (bool hasMatch, int score) awayVariantMatch = !awayHasMatch && !string.IsNullOrEmpty(evt.AwayTeamName)
+            ? CheckRegularPluralTeamMatch(normalizedRelease, evt.AwayTeamName)
+            : (false, 0);
+        if ((homeVariantMatch.hasMatch || awayVariantMatch.hasMatch) && ReleaseMatchingService.AllowsRegularPluralTeamMatch(
+            releaseTitle,
+            normalizedRelease,
+            evt.League,
+            knownLeagues,
+            NormalizeTitle(evt.HomeTeamName ?? ""),
+            NormalizeTitle(evt.AwayTeamName ?? "")))
+        {
+            if (homeVariantMatch.hasMatch)
+                (homeHasMatch, homeScore) = homeVariantMatch;
+            if (awayVariantMatch.hasMatch)
+                (awayHasMatch, awayScore) = awayVariantMatch;
         }
 
         // Check if this looks like a game release (has "vs", "@", "at", or team matchup indicators)
@@ -1365,60 +1649,54 @@ public class ReleaseMatchScorer
     /// </summary>
     private const int WrongDate = -100;
 
-    private int GetDateMatchScore(ParsedRelease parsed, Event evt)
+    private int GetDateMatchScore(string releaseTitle, ParsedRelease parsed, Event evt)
     {
         var score = 0;
         var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+        var releaseDate = BuildParsedDate(parsed, eventDate.Year) ??
+            SportsFileNameParser.ParseMonthFirstWrittenDate(releaseTitle) ??
+            ExtractDayMonthDate(releaseTitle, eventDate.Year, ignoreAmbiguousHyphenatedPair: true);
 
         // Month match (10 points) - kept as-is; works correctly for all cases within the same month.
-        if (parsed.Month.HasValue && parsed.Month == eventDate.Month)
+        if (releaseDate.HasValue && releaseDate.Value.Month == eventDate.Month)
             score += 10;
 
         // Day match (up to 10 points) with ±1 day tolerance for UTC/venue-local day rollover.
-        if (parsed.Month.HasValue && parsed.Day.HasValue)
+        if (releaseDate.HasValue)
         {
-            try
+            var diffDays = Math.Abs((releaseDate.Value - eventDate).TotalDays);
+            var allowsObservedDateDrift = LeagueReleaseNamePolicy.AllowsObservedDateDrift(
+                releaseTitle, evt, releaseDate.Value);
+            if (diffDays == 0)
             {
-                // The release's own year decides which season's meeting this
-                // is. Rebuilding with the event's year made last season's
-                // game on another day look like a wrong day at worst, and a
-                // game on the same calendar day a year apart look identical.
-                var parsedDate = new DateTime(parsed.Year ?? eventDate.Year, parsed.Month.Value, parsed.Day.Value);
-                var diffDays = Math.Abs((parsedDate - eventDate).TotalDays);
-                if (diffDays == 0)
-                {
-                    score += 10;                  // exact day
-                }
-                else if (diffDays <= 1 && !(evt.BroadcastDate.HasValue && evt.BroadcastDateVerified && evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue))
-                {
-                    // Off-by-one absorbs the UTC-vs-venue rollover, but only
-                    // while the broadcast-local date is unknown. With it in
-                    // hand and both teams known, the neighboring day is the
-                    // neighboring game of a series that can play daily.
-                    score += 8;
-                }
-                else if (evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue)
-                {
-                    // Both teams are known, so the day is what tells one
-                    // fixture from another. The same two teams meet again on
-                    // the next day of an MLB series and repeatedly through an
-                    // NBA or NHL season, and the team score alone carries a
-                    // release well past the auto-grab threshold, so a five
-                    // point deduction never stopped the wrong game being
-                    // grabbed and imported as this one.
-                    return WrongDate;
-                }
-                else
-                {
-                    // No teams to anchor the fixture. A multi-day event can
-                    // legitimately carry a date away from the row's own, so
-                    // this stays a nudge rather than a rejection.
-                    score -= 5;
-                }
+                score += 10;                  // exact day
             }
-            catch (ArgumentOutOfRangeException)
+            else if (diffDays <= 1 && (allowsObservedDateDrift ||
+                !(evt.BroadcastDate.HasValue && evt.BroadcastDateVerified && evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue)))
             {
-                // Invalid day for month (e.g. "Feb 30") - leave score alone
+                // Off-by-one absorbs the UTC-vs-venue rollover, but only
+                // while the broadcast-local date is unknown. With it in
+                // hand and both teams known, the neighboring day is the
+                // neighboring game of a series that can play daily.
+                score += 8;
+            }
+            else if (evt.HomeTeamId.HasValue && evt.AwayTeamId.HasValue)
+            {
+                // Both teams are known, so the day is what tells one
+                // fixture from another. The same two teams meet again on
+                // the next day of an MLB series and repeatedly through an
+                // NBA or NHL season, and the team score alone carries a
+                // release well past the auto-grab threshold, so a five
+                // point deduction never stopped the wrong game being
+                // grabbed and imported as this one.
+                return WrongDate;
+            }
+            else
+            {
+                // No teams to anchor the fixture. A multi-day event can
+                // legitimately carry a date away from the row's own, so
+                // this stays a nudge rather than a rejection.
+                score -= 5;
             }
         }
 
@@ -1609,12 +1887,80 @@ public class ReleaseMatchScorer
         return match.Success && int.TryParse(match.Groups[1].Value, out var race) ? race : null;
     }
 
+    private static int? ExtractRallyStageNumber(string title)
+    {
+        var match = _rallyStageRegex.Match(title);
+        return match.Success && int.TryParse(match.Groups[1].Value, out var stage) ? stage : null;
+    }
+
+    private static DateTime? BuildParsedDate(ParsedRelease parsed, int fallbackYear)
+    {
+        if (!parsed.Month.HasValue || !parsed.Day.HasValue) return null;
+
+        var year = parsed.Year ?? fallbackYear;
+        try
+        {
+            return new DateTime(year, parsed.Month.Value, parsed.Day.Value);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    private static DateTime? ExtractDayMonthDate(string title, int year,
+        bool ignoreAmbiguousHyphenatedPair = false)
+    {
+        var searchableTitle = SearchNormalizationService.PrepareReleaseIdentityTitle(title);
+        var gameNumber = _gameNumberRegex.Match(searchableTitle);
+        for (var match = _dayMonthRegex.Match(searchableTitle); match.Success;
+             match = _dayMonthRegex.Match(searchableTitle, match.Index + 1))
+        {
+            if (gameNumber.Success && match.Groups["day"].Index == gameNumber.Groups[1].Index)
+            {
+                continue;
+            }
+
+            if (_audioChannelPrefixRegex.IsMatch(searchableTitle[..match.Index]))
+            {
+                continue;
+            }
+
+            if (!int.TryParse(match.Groups["day"].Value, out var day) ||
+                !int.TryParse(match.Groups["month"].Value, out var month) ||
+                day > DateTime.DaysInMonth(year, month))
+            {
+                continue;
+            }
+
+            // An unpadded hyphen pair can be a game score.
+            // Do not reject a fixture on that token alone.
+            if (ignoreAmbiguousHyphenatedPair && match.Value.Contains('-') &&
+                (match.Groups["day"].Length < 2 || match.Groups["month"].Length < 2))
+            {
+                continue;
+            }
+
+            return new DateTime(year, month, day);
+        }
+
+        return null;
+    }
+
     private int? ExtractRoundNumber(string round)
     {
         var match = _digitsRegex.Match(round);
         if (match.Success && int.TryParse(match.Groups[1].Value, out var roundNum))
             return roundNum;
         return null;
+    }
+
+    private static int? ExtractReleaseRoundNumber(string title)
+    {
+        var match = _parseRoundRegex.Match(title);
+        return match.Success && int.TryParse(match.Groups[1].Value, out var round)
+            ? round
+            : null;
     }
 
     #endregion
@@ -1632,7 +1978,8 @@ public class ReleaseMatchScorer
     private bool IsDateBasedSport(string? sportPrefix)
     {
         if (string.IsNullOrEmpty(sportPrefix)) return false;
-        return sportPrefix is "NFL" or "NBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
+        return sportPrefix is "NFL" or "NBA" or "WNBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga" or
+            "IPL" or "BBL" or "SixNations" or "RugbyChampionship" or "NRL";
     }
 
     private bool IsMotorsport(string? sportPrefix)
@@ -1643,16 +1990,22 @@ public class ReleaseMatchScorer
             or "IndyCar" or "NASCAR" or "WEC" or "WSBK" or "WRC";
     }
 
+    private static bool HasExplicitTeamLeagueToken(string title, string sportPrefix) =>
+        sportPrefix is "NBA" or "WNBA"
+            ? BasketballLeagueIdentity.Detect(title) == sportPrefix
+            : Regex.IsMatch(title, $@"(?<![A-Za-z0-9]){Regex.Escape(sportPrefix)}(?![A-Za-z0-9])", RegexOptions.IgnoreCase);
+
     private bool IsTeamSport(string? sportPrefix)
     {
         if (string.IsNullOrEmpty(sportPrefix)) return false;
-        return sportPrefix is "NFL" or "NBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga";
+        return sportPrefix is "NFL" or "NBA" or "WNBA" or "NHL" or "MLB" or "MLS" or "EPL" or "UCL" or "LaLiga" or
+            "CanadianTeamCompetition" or "ChampionsHockeyLeague";
     }
 
     private bool IsFightingSport(string? sportPrefix)
     {
         if (string.IsNullOrEmpty(sportPrefix)) return false;
-        return sportPrefix is "UFC" or "Bellator" or "PFL" or "Boxing" or "WWE" or "ONE";
+        return sportPrefix is "UFC" or "Bellator" or "PFL" or "Boxing" or "WWE" or "AEW" or "ONE";
     }
 
     #endregion
@@ -1766,6 +2119,25 @@ public class ReleaseMatchScorer
         return (hasMatch, score);
     }
 
+    private (bool hasMatch, int score) CheckRegularPluralTeamMatch(string normalizedRelease, string teamName)
+    {
+        var teamWords = NormalizeTitle(teamName)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(w => w.Length > 2 && !IsCommonWord(w))
+            .ToList();
+
+        if (teamWords.Count == 0
+            || !TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, teamWords[^1]))
+        {
+            return (false, 0);
+        }
+
+        var matchedWordCount = teamWords
+            .Take(teamWords.Count - 1)
+            .Count(w => normalizedRelease.Contains(w, StringComparison.OrdinalIgnoreCase)) + 1;
+        return (true, (int)(20.0 * matchedWordCount / teamWords.Count));
+    }
+
     /// <summary>
     /// Fallback team matching using abbreviations and variations from TeamNameVariationData.
     /// Catches abbreviation-only releases like "OKC vs LAL" that word matching would miss.
@@ -1876,6 +2248,16 @@ public class ReleaseMatchScorer
             if (pattern.IsMatch(releaseTitle))
             {
                 var sportLower = sport.ToLowerInvariant();
+                if (LeagueReleaseNamePolicy.AllowsCrossSportLabel(releaseTitle, evt, sport))
+                {
+                    continue;
+                }
+                if (sport == "WSBK" &&
+                    Regex.IsMatch(eventLeague, @"\b(?:wsbk|sbk|world\s*superbike|worldsbk)\b",
+                        RegexOptions.IgnoreCase))
+                {
+                    continue;
+                }
                 if (eventSport.Contains(sportLower) || eventLeague.Contains(sportLower) || eventTitle.Contains(sportLower))
                     continue;
 

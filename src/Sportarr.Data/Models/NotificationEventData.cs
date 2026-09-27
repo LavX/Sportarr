@@ -86,6 +86,13 @@ public class NotificationEventData
     public string? RecordingTitle { get; set; }
     public int? ChannelId { get; set; }
 
+    public int? EpgSourceId { get; set; }
+    public string? EpgSourceName { get; set; }
+    public int? ChannelCount { get; set; }
+    public int? ProgramCount { get; set; }
+    public int? AutoMappedChannelCount { get; set; }
+    public DateTime? CompletedAt { get; set; }
+
     /// <summary>
     /// Flattens the set properties to a dictionary for CustomScript's
     /// SPORTARR_{KEY} environment-variable passthrough, which needs a
@@ -138,6 +145,12 @@ public class NotificationEventData
         if (RecordingId.HasValue) dict["recordingId"] = RecordingId.Value;
         if (RecordingTitle != null) dict["recordingTitle"] = RecordingTitle;
         if (ChannelId.HasValue) dict["channelId"] = ChannelId.Value;
+        if (EpgSourceId.HasValue) dict["epgSourceId"] = EpgSourceId.Value;
+        if (EpgSourceName != null) dict["epgSourceName"] = EpgSourceName;
+        if (ChannelCount.HasValue) dict["channelCount"] = ChannelCount.Value;
+        if (ProgramCount.HasValue) dict["programCount"] = ProgramCount.Value;
+        if (AutoMappedChannelCount.HasValue) dict["autoMappedChannelCount"] = AutoMappedChannelCount.Value;
+        if (CompletedAt.HasValue) dict["completedAt"] = CompletedAt.Value.ToString("O");
         return dict;
     }
 }
@@ -192,6 +205,12 @@ public class WebhookPayload
     public int? RecordingId { get; set; }
     public string? RecordingTitle { get; set; }
     public int? ChannelId { get; set; }
+    public int? EpgSourceId { get; set; }
+    public string? EpgSourceName { get; set; }
+    public int? ChannelCount { get; set; }
+    public int? ProgramCount { get; set; }
+    public int? AutoMappedChannelCount { get; set; }
+    public DateTime? CompletedAt { get; set; }
 }
 
 /// <summary>Mirrors Sonarr's WebhookSeries - every identity field for the event nested in one place.</summary>

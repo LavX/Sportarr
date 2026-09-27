@@ -32,12 +32,34 @@ public interface IIndexerSearchService
         List<SkippedIndexer>? skippedIndexers = null,
         bool allowHighlights = false,
         string? sportarrId = null,
-        bool useCategoryFilter = true);
+        bool useCategoryFilter = true,
+        bool interactiveSearch = true,
+        string? leagueName = null);
+
+    Task<SearchOperationOutcome> SearchAllIndexersDetailedAsync(
+        string query,
+        int maxResultsPerIndexer = 10000,
+        int? qualityProfileId = null,
+        string? requestedPart = null,
+        string? sport = null,
+        bool enableMultiPartEpisodes = true,
+        string? eventTitle = null,
+        List<int>? leagueTags = null,
+        List<SkippedIndexer>? skippedIndexers = null,
+        bool allowHighlights = false,
+        string? sportarrId = null,
+        bool useCategoryFilter = true,
+        bool interactiveSearch = true,
+        bool forceRefresh = false,
+        bool cacheSuccessfulSources = false,
+        string? leagueName = null);
 
     /// <summary>
     /// Search a single indexer
     /// </summary>
     Task<List<ReleaseSearchResult>> SearchIndexerAsync(Indexer indexer, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true);
+
+    Task<IndexerSearchOutcome> SearchIndexerDetailedAsync(Indexer indexer, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true);
 
     /// <summary>
     /// Select the best release from search results

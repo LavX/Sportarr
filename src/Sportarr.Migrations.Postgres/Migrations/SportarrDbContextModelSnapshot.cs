@@ -718,6 +718,9 @@ namespace Sportarr.Api.Migrations.Postgres.Migrations
                     b.Property<int>("EventId")
                         .HasColumnType("integer");
 
+                    b.Property<DateTime?>("FailedAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<string>("GrabCategory")
                         .HasColumnType("text");
 
@@ -2814,6 +2817,9 @@ namespace Sportarr.Api.Migrations.Postgres.Migrations
 
                     b.Property<string>("InfoUrl")
                         .HasColumnType("text");
+
+                    b.Property<bool?>("IsPack")
+                        .HasColumnType("boolean");
 
                     b.Property<string>("Language")
                         .HasColumnType("text");

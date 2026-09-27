@@ -69,10 +69,10 @@ public class IndexerStatusService
     /// </summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, SemaphoreSlim> StatusGates = new();
 
-    private static async Task<T> WithStatusLockAsync<T>(int indexerId, Func<Task<T>> action)
+    private static async Task<T> WithStatusLockAsync<T>(int indexerId, Func<Task<T>> action, CancellationToken cancellationToken = default)
     {
         var gate = StatusGates.GetOrAdd(indexerId, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync();
+        await gate.WaitAsync(cancellationToken);
         try
         {
             return await action();
@@ -96,6 +96,76 @@ public class IndexerStatusService
             gate.Release();
         }
     }
+
+    public async Task ReserveQueryAttemptAsync(int indexerId, CancellationToken cancellationToken = default)
+    {
+        if (indexerId <= 0)
+            throw new IndexerQueryAdmissionException(indexerId, QueryAdmissionFailure.Denied, "A saved indexer is required");
+
+        try
+        {
+            await WithStatusLockAsync(indexerId, async () =>
+            {
+                await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+                var indexer = await db.Indexers.FirstOrDefaultAsync(i => i.Id == indexerId, cancellationToken);
+                if (indexer == null || !indexer.Enabled)
+                    throw new IndexerQueryAdmissionException(indexerId, QueryAdmissionFailure.Denied, "Indexer is disabled");
+
+                var now = DateTime.UtcNow;
+                var status = await db.IndexerStatuses.FirstOrDefaultAsync(s => s.IndexerId == indexerId, cancellationToken);
+                if (status == null)
+                {
+                    status = new IndexerStatus { IndexerId = indexerId, HourResetTime = now.AddHours(1) };
+                    db.IndexerStatuses.Add(status);
+                }
+
+                if ((status.QueryDisabledUntil.HasValue && status.QueryDisabledUntil.Value > now)
+                    || (status.DisabledUntil.HasValue && status.DisabledUntil.Value > now)
+                    || (status.RateLimitedUntil.HasValue && status.RateLimitedUntil.Value > now))
+                    throw new IndexerQueryAdmissionException(indexerId, QueryAdmissionFailure.Denied, "Indexer query cooldown is active");
+
+                var reset = !status.HourResetTime.HasValue || now >= status.HourResetTime.Value;
+                if (reset)
+                {
+                    status.QueriesThisHour = 0;
+                    status.GrabsThisHour = 0;
+                    status.HourResetTime = now.AddHours(1);
+                }
+
+                if (indexer.QueryLimit.HasValue && status.QueriesThisHour >= indexer.QueryLimit.Value)
+                {
+                    if (reset) await db.SaveChangesAsync(cancellationToken);
+                    throw new IndexerQueryAdmissionException(indexerId, QueryAdmissionFailure.Denied, "Indexer query limit reached");
+                }
+
+                status.QueriesThisHour++;
+                await db.SaveChangesAsync(cancellationToken);
+                return true;
+            }, cancellationToken);
+        }
+        catch (IndexerQueryAdmissionException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new IndexerQueryAdmissionException(indexerId, QueryAdmissionFailure.Persistence,
+                "Could not persist query admission", ex);
+        }
+    }
+
+    public Task RecordSuccessHealthAsync(int indexerId) =>
+        WithStatusLockAsync(indexerId, () => RecordSuccessCoreAsync(indexerId, countQuery: false));
+
+    public Task RecordQueryFailureHealthAsync(int indexerId, string reason) =>
+        WithStatusLockAsync(indexerId, () => RecordQueryFailureCoreAsync(indexerId, reason, countQuery: false));
+
+    public Task RecordConnectionErrorHealthAsync(int indexerId, string reason) =>
+        WithStatusLockAsync(indexerId, () => RecordConnectionErrorCoreAsync(indexerId, reason, countQuery: false));
 
     public Task<IndexerStatus> GetOrCreateStatusAsync(int indexerId) =>
         WithStatusLockAsync(indexerId, () => GetOrCreateStatusCoreAsync(indexerId));
@@ -284,7 +354,7 @@ public class IndexerStatusService
     /// <summary>
     /// Record a successful query to an indexer
     /// </summary>
-    private async Task RecordSuccessCoreAsync(int indexerId)
+    private async Task RecordSuccessCoreAsync(int indexerId, bool countQuery = true)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();
 
@@ -328,13 +398,16 @@ public class IndexerStatusService
         status.LastSuccess = DateTime.UtcNow;
 
         // Reset hourly counters if needed
-        if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+        if (countQuery)
         {
-            status.QueriesThisHour = 0;
-            status.GrabsThisHour = 0;
-            status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+            {
+                status.QueriesThisHour = 0;
+                status.GrabsThisHour = 0;
+                status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            }
+            status.QueriesThisHour++;
         }
-        status.QueriesThisHour++;
 
         await db.SaveChangesAsync();
 
@@ -385,7 +458,7 @@ public class IndexerStatusService
     /// Record a query failure for an indexer (implements exponential backoff)
     /// Only for actual indexer errors, NOT for connection/DNS issues
     /// </summary>
-    private async Task RecordQueryFailureCoreAsync(int indexerId, string reason)
+    private async Task RecordQueryFailureCoreAsync(int indexerId, string reason, bool countQuery = true)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();
 
@@ -408,13 +481,16 @@ public class IndexerStatusService
 
         // A failed query still consumed a request. Counting only successes let
         // an indexer with a query limit be hit well past it.
-        if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+        if (countQuery)
         {
-            status.QueriesThisHour = 0;
-            status.GrabsThisHour = 0;
-            status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+            {
+                status.QueriesThisHour = 0;
+                status.GrabsThisHour = 0;
+                status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            }
+            status.QueriesThisHour++;
         }
-        status.QueriesThisHour++;
 
         // Calculate backoff duration using exponential backoff
         var backoffIndex = Math.Min(status.QueryFailures - 1, BackoffDurations.Length - 1);
@@ -495,7 +571,7 @@ public class IndexerStatusService
     /// Connection errors don't escalate backoff — they're likely user network
     /// issues, not indexer problems.
     /// </summary>
-    private async Task RecordConnectionErrorCoreAsync(int indexerId, string reason)
+    private async Task RecordConnectionErrorCoreAsync(int indexerId, string reason, bool countQuery = true)
     {
         await using var db = await _dbFactory.CreateDbContextAsync();
 
@@ -516,13 +592,16 @@ public class IndexerStatusService
         status.LastConnectionError = DateTime.UtcNow;
 
         // The request went out even though it never landed, so it counts.
-        if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+        if (countQuery)
         {
-            status.QueriesThisHour = 0;
-            status.GrabsThisHour = 0;
-            status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            if (!status.HourResetTime.HasValue || DateTime.UtcNow >= status.HourResetTime.Value)
+            {
+                status.QueriesThisHour = 0;
+                status.GrabsThisHour = 0;
+                status.HourResetTime = DateTime.UtcNow.AddHours(1);
+            }
+            status.QueriesThisHour++;
         }
-        status.QueriesThisHour++;
 
         await db.SaveChangesAsync();
 
@@ -535,7 +614,13 @@ public class IndexerStatusService
     /// Record a failure for an indexer (legacy method for backward compatibility)
     /// Routes to appropriate new method based on error type
     /// </summary>
-    public async Task RecordFailureAsync(int indexerId, string reason)
+    public Task RecordFailureAsync(int indexerId, string reason) =>
+        RecordFailureCoreAsync(indexerId, reason, countQuery: true);
+
+    public Task RecordFailureHealthAsync(int indexerId, string reason) =>
+        RecordFailureCoreAsync(indexerId, reason, countQuery: false);
+
+    private async Task RecordFailureCoreAsync(int indexerId, string reason, bool countQuery)
     {
         // Detect connection errors and route appropriately
         var reasonLower = reason.ToLowerInvariant();
@@ -546,12 +631,14 @@ public class IndexerStatusService
             reasonLower.Contains("network") ||
             reasonLower.Contains("socket"))
         {
-            await RecordConnectionErrorAsync(indexerId, reason);
+            if (countQuery) await RecordConnectionErrorAsync(indexerId, reason);
+            else await RecordConnectionErrorHealthAsync(indexerId, reason);
             return;
         }
 
         // Default to query failure for other errors
-        await RecordQueryFailureAsync(indexerId, reason);
+        if (countQuery) await RecordQueryFailureAsync(indexerId, reason);
+        else await RecordQueryFailureHealthAsync(indexerId, reason);
     }
 
     /// <summary>
@@ -579,18 +666,24 @@ public class IndexerStatusService
         // ONLY Retry-After — no additional exponential backoff on top.
         var waitTime = retryAfter ?? TimeSpan.FromMinutes(5);
 
-        // Cap at 1 hour max wait
-        if (waitTime > TimeSpan.FromHours(1))
+        // Bound untrusted retry times without retrying before a shorter server deadline.
+        if (waitTime > TimeSpan.FromDays(1))
         {
-            waitTime = TimeSpan.FromHours(1);
+            waitTime = TimeSpan.FromDays(1);
         }
 
-        status.RateLimitedUntil = DateTime.UtcNow.Add(waitTime);
+        var now = DateTime.UtcNow;
+        var requestedUntil = now.Add(waitTime);
+        // Keep the longest deadline when in-flight requests finish out of order.
+        if (!status.RateLimitedUntil.HasValue || status.RateLimitedUntil.Value < requestedUntil)
+        {
+            status.RateLimitedUntil = requestedUntil;
+        }
 
         await db.SaveChangesAsync();
 
         _logger.LogWarning("[Indexer Status] Indexer {IndexerId} rate limited (HTTP 429). Retry after {WaitTime} (using Retry-After only, no extra backoff)",
-            indexerId, waitTime);
+            indexerId, status.RateLimitedUntil.Value - now);
     }
 
     /// <summary>

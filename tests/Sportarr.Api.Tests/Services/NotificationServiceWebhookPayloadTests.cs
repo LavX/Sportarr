@@ -312,4 +312,59 @@ public class NotificationServiceWebhookPayloadTests
         json.GetProperty("eventType").GetString().Should().Be("Test");
         json.TryGetProperty("series", out _).Should().BeFalse();
     }
+
+    [Fact]
+    public void EpgSyncCompleted_CarriesSourceCountsAndCompletionTime()
+    {
+        var completedAt = new DateTime(2026, 9, 15, 12, 34, 56, DateTimeKind.Utc);
+        var data = new NotificationEventData
+        {
+            EpgSourceId = 17,
+            EpgSourceName = "Sports Guide",
+            ChannelCount = 42,
+            ProgramCount = 1_234,
+            AutoMappedChannelCount = 8,
+            CompletedAt = completedAt
+        };
+
+        var payload = NotificationService.BuildWebhookPayload(
+            "EPG sync completed",
+            "Sports Guide synced successfully.",
+            NotificationTrigger.OnEpgSyncCompleted,
+            data,
+            "Sportarr");
+        var json = SerializeToJson(payload);
+
+        json.GetProperty("eventType").GetString().Should().Be("EpgSyncCompleted");
+        json.GetProperty("epgSourceId").GetInt32().Should().Be(17);
+        json.GetProperty("epgSourceName").GetString().Should().Be("Sports Guide");
+        json.GetProperty("channelCount").GetInt32().Should().Be(42);
+        json.GetProperty("programCount").GetInt32().Should().Be(1_234);
+        json.GetProperty("autoMappedChannelCount").GetInt32().Should().Be(8);
+        json.GetProperty("completedAt").GetDateTime().Should().Be(completedAt);
+    }
+
+    [Fact]
+    public void EpgSyncCompleted_FlattensDataForCustomScripts()
+    {
+        var completedAt = new DateTime(2026, 9, 15, 12, 34, 56, DateTimeKind.Utc);
+        var data = new NotificationEventData
+        {
+            EpgSourceId = 17,
+            EpgSourceName = "Sports Guide",
+            ChannelCount = 42,
+            ProgramCount = 1_234,
+            AutoMappedChannelCount = 8,
+            CompletedAt = completedAt
+        };
+
+        var values = data.ToDictionary();
+
+        values["epgSourceId"].Should().Be(17);
+        values["epgSourceName"].Should().Be("Sports Guide");
+        values["channelCount"].Should().Be(42);
+        values["programCount"].Should().Be(1_234);
+        values["autoMappedChannelCount"].Should().Be(8);
+        values["completedAt"].Should().Be("2026-09-15T12:34:56.0000000Z");
+    }
 }

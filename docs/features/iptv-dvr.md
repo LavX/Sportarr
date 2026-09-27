@@ -22,26 +22,52 @@ Sportarr includes experimental support for recording live sports events directly
 
 ## Setup
 
-1. Go to **Settings > IPTV Sources** and add your M3U playlist URL or Xtream Codes provider
+1. Go to **IPTV > Options > Providers** and add your M3U playlist URL or Xtream Codes provider. Sportarr syncs the provider and applies automatic channel and guide matching.
 
-    ![IPTV Sources](../images/iptv-sources.png)
+2. Go to **IPTV > Channels** to review the imported lineup. The default view shows every channel. Use **Needs attention** for channels Sportarr could not finish automatically, and open **Manage** only when you need bulk or manual tools.
 
-2. Go to **Settings > IPTV Channels** to view imported channels and map them to leagues
+3. Go to **IPTV > Options > Recording** to set the recording path, padding, and concurrency. Less common encoding, hardware, naming, retention, reconnect, and catchup controls stay under **Advanced**.
 
-    ![IPTV Channels](../images/iptv-channels.png)
+4. Use **IPTV > Recordings** to switch between upcoming, active, completed, and recordings that need attention. Manual scheduling and bulk management are available from **More**.
 
-3. Go to **Settings > DVR Recordings** to configure recording settings and view scheduled or completed recordings
+5. When you monitor an event whose league has a mapped channel, a recording is scheduled automatically.
 
-    ![DVR Recordings](../images/dvr-recordings.png)
-
-4. When you monitor an event whose league has a mapped channel, a recording is scheduled automatically
+External tools can change a scheduled recording's channel, fallback channels,
+time window, or quality through the [assignment API](../APPLICATION_API.md#scheduled-dvr-assignments).
+The update leaves other recording fields intact. Send `expectedChannelId` to
+reject a stale channel choice.
 
 !!! tip "Keeping a league off DVR"
     Each league has an **Automatic DVR scheduling** toggle, available as an **Enable IPTV DVR** checkbox when adding the league and as its own toggle on the league detail page (DVR section) afterward. Turn it off to keep a league on indexer downloads only; the auto-scheduler will never resolve a channel or schedule recordings for it, including through EPG/broadcaster matching with no channel manually mapped, while manual recordings still work. This is what lets you run, say, Formula 1 through indexers only while recording football over IPTV.
 
+## Live channel preview
+
+Channel previews start through the normal stream proxy. When network or media
+playback continues to fail after the bounded browser retry budget, Sportarr
+automatically tries FFmpeg HLS in stream-copy mode. It does not automatically
+enable video normalization because normalization re-encodes the stream and uses
+more CPU.
+
+Open **Playback details** for manual recovery and diagnostics. It contains
+**Retry**, **Restart FFmpeg**, **Live edge**, the live playback profile, and the
+normalization control.
+
+- **Low latency** keeps a smaller buffer and follows the live edge closely.
+- **Balanced** is the default for normal playback.
+- **Resilient** uses longer buffers and more retries for unstable sources.
+
+The selected profile applies only to the current browser session. It changes
+browser buffering and retry behavior without restarting FFmpeg.
+
+Enable **Normalize FFmpeg video** when a source still stutters or produces
+invalid segments in the default stream-copy mode. Normalization re-encodes the
+video as H.264 and uses more CPU. Concurrent viewers share one compatible
+FFmpeg preview process. Closing one viewer no longer stops playback for the
+others.
+
 ## Live event timing
 
-**Settings > DVR Recordings** has two controls for event-linked live captures.
+**IPTV > Options > Recording > Advanced** has controls for event-linked live captures.
 They use fresh source livescores for the exact event and league. They do not
 infer a final result from EPG times, a missing scoreboard, or a disconnected stream.
 
@@ -104,7 +130,7 @@ remapping job or prove what is currently on the channel.
 
 ## Stream reconnection
 
-The **Stream Reconnection** section of **Settings > DVR Recordings** controls how a recording rides out a dropped or slow stream.
+The **Stream Reconnection** section of **IPTV > Options > Recording > Advanced** controls how a recording rides out a dropped or slow stream.
 
 - **Enable auto-reconnect** tells ffmpeg to retry when the stream drops. Retrying a failure during connection setup needs an ffmpeg build of 4.4 or newer. Older builds still retry once the stream has started.
 - **Max Retry Wait** (5 to 300 seconds) caps the wait between retries. Waits grow from one second up to this cap, and retries stop once the next wait would pass it. Raise it for sources that refuse a cold stream for the first few seconds.
@@ -120,7 +146,13 @@ The TV Guide provides an EPG-style grid of your IPTV channels and their programm
 - **DVR integration** - scheduled recordings are highlighted
 - **Quick scheduling** - click any program to view details and schedule a recording
 
-Access it from **IPTV > TV Guide** in the navigation.
+Access it from **IPTV > Guide** in the navigation.
+
+EPG downloads are limited to 256 MB by default. Change **EPG download limit
+(MB)** under **IPTV > Options > Advanced > Refresh schedule and limits** when a
+provider supplies a larger XMLTV file. The allowed range is 1 through 512 MB.
+A separate 512 MB limit still applies after decompression to protect Sportarr
+from damaged or unexpectedly large compressed guides.
 
 ## Filtered M3U/EPG export
 
@@ -137,11 +169,11 @@ Optional query parameters:
 | `favoritesOnly=true` | Only favorite channels |
 | `sourceId=X` | Only channels from a specific source |
 
-The exports respect your channel settings: hidden channels are excluded and only enabled channels are included. Subscription URLs are shown in **Settings > IPTV Sources** under "External App Subscription URLs".
+The exports respect your channel options. Hidden channels are excluded and only enabled channels are included. Subscription URLs are shown under **IPTV > Options > Advanced > External App Subscription**.
 
 ## Use Sportarr as a network tuner (Plex/Jellyfin/Emby Live TV)
 
-Sportarr can also emulate a [SiliconDust HDHomeRun](https://www.silicondust.com/) network tuner. Instead of exporting a playlist for a third-party IPTV app, this lets Plex, Jellyfin, or Emby add Sportarr directly as a Live TV tuner and pull your enabled, sports-tagged IPTV channels as its channel lineup. This is always on - there's no setting to enable it, and it requires no additional configuration beyond having IPTV channels enabled under **Settings > IPTV Channels**.
+Sportarr can also emulate a [SiliconDust HDHomeRun](https://www.silicondust.com/) network tuner. Instead of exporting a playlist for a third-party IPTV app, this lets Plex, Jellyfin, or Emby add Sportarr directly as a Live TV tuner and pull your enabled, sports-tagged IPTV channels as its channel lineup. This is always on. It requires no additional configuration beyond having IPTV channels enabled under **IPTV > Channels**.
 
 Downstream players tune channels through Sportarr's own stream proxy, so the same channel enable/disable and favorites settings that control the M3U/EPG export above also control what shows up as a tuner channel.
 
@@ -174,5 +206,4 @@ Sportarr implements the three endpoints the HDHomeRun HTTP API requires (`/disco
 - Recording quality depends entirely on your IPTV source
 - Stream reconnection depends on the provider and on your ffmpeg build (see Stream reconnection above)
 - Limited error handling for stream failures
-- No hardware acceleration support yet
 - File size estimation is approximate

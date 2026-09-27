@@ -47,7 +47,10 @@ const healthCheckTypeNames: { [key: number]: string } = {
   10: 'Authentication',
   11: 'API Key',
   12: 'Orphaned Events',
-  13: 'Database Corruption'
+  13: 'Database Corruption',
+  14: 'League Folder',
+  15: 'Backups',
+  16: 'Health Check'
 };
 
 const levelNames = ['All OK', 'Notice', 'Warning', 'Error'];

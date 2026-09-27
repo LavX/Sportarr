@@ -20,6 +20,18 @@ public class ReleaseMatchingService
     private readonly SportsFileNameParser _sportsParser;
     private readonly EventPartDetector _partDetector;
 
+    private static readonly Regex TeamGameNumberPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])game[\s._-]*(?<number>0*[1-9][0-9]{0,2})(?![\p{L}\p{M}\p{N}])" +
+        @"(?:[\s._]*(?:[-/&+]|and)[\s._]*(?<number>0*[1-9][0-9]{0,2})(?![\p{L}\p{M}\p{N}]))*",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TeamGameDateMonthPattern = new(
+        @"^[.\s_-](?<month>[0-9]{2})(?=[.\s_-]|$)", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TeamGameGroupBoundaryPattern = new(
+        @"(?:^|[\s._-])(?:[xh][\s._-]?26[45]|hevc|av1|vp9|(?:720|1080|2160)[pi])[\s._-]*[-\[]$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     // Minimum confidence score to consider a release a valid match
     // Must have positive evidence (event number, team names, organization, etc.)
     // Starting at 0 means releases with no matching evidence won't pass
@@ -36,53 +48,78 @@ public class ReleaseMatchingService
         "ppv", "event", "full", "complete", "live"
     };
 
+    private static readonly Regex AthleticsFinalPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])final(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewContentPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])preview(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewReleaseGroupSuffixPattern = new(
+        @"(?:^|[\s._-])(?:[xh][._ -]?26[45]|hevc|av1|vp9)-[\p{L}\p{M}\p{N}][\p{L}\p{M}\p{N}._-]*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex PreviewRenewedTechnicalSuffixPattern = new(
+        @"(?=(?:^|[\s._-])(?:480|576|720|1080|2160)p[\s._-]+(?:web[\s._-]?dl|webrip|hdtv|bluray|bdrip|dvdrip)[\s._-]+(?:[xh][._ -]?26[45]|hevc|av1|vp9)-[\p{L}\p{M}\p{N}][\p{L}\p{M}\p{N}._-]*$)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex WrestlingPackageLabelPattern = new(
+        @"(?<![\p{L}\p{M}\p{N}])(?:zero[\s._-]*hour|buy[\s._-]*in|countdown|kick[\s._-]*off|pre[\s._-]*show|post[\s._-]*show)(?![\p{L}\p{M}\p{N}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     // Non-event content patterns to reject (press conferences, interviews, build-up
     // shows, etc.), plus shortened cuts of the event itself (condensed games,
     // All-22 coaches film). Neither may fill or upgrade a full-event want.
     // Pre-compiled so DetectNonEventContent doesn't re-parse them on every release.
     private static readonly Regex[] NonEventContentPatterns = new[]
     {
-        new Regex(@"\bpress[\s\.\-_]*conf", RegexOptions.Compiled | RegexOptions.IgnoreCase),           // press conference, press.conf, pressconf
-        new Regex(@"\binterview", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // interview, interviews
-        new Regex(@"\bbuild[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // build up, build-up, buildup
-        new Regex(@"\bpre[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // pre show, pre-show, preshow
-        new Regex(@"\bpost[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // post show, post-show, postshow
-        new Regex(@"\bpre[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase), // pre-qualifying-show
-        new Regex(@"\bpost[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase),// post-sprint-show
-        new Regex(@"\bpost[\s\.\-_]*fight", RegexOptions.Compiled | RegexOptions.IgnoreCase),            // post fight, post-fight, postfight
-        new Regex(@"\bpost[\s\.\-_]*race", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // post race, post-race, postrace
-        new Regex(@"\bpost[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase),            // post match, post-match, postmatch
-        new Regex(@"\bwarm[\s\.\-_]*up\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),             // warm up (F1 pre-show)
-        new Regex(@"\bweekend[\s\.\-_]*warm[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase), // weekend warm up (Sky F1)
-        new Regex(@"\bted'?s?[\s\.\-_]*\w*[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase), // Ted's Notebook
-        new Regex(@"\bted[\s\.\-_]*kravitz", RegexOptions.Compiled | RegexOptions.IgnoreCase),           // Ted Kravitz (Sky F1 presenter)
-        new Regex(@"\b\w+[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase),          // Any Notebook
-        new Regex(@"\bpaddock[\s\.\-_]*uncut", RegexOptions.Compiled | RegexOptions.IgnoreCase),         // Paddock Uncut
-        new Regex(@"\bchequered[\s\.\-_]*flag", RegexOptions.Compiled | RegexOptions.IgnoreCase),        // Chequered Flag
-        new Regex(@"\bfull[\s\.\-_]*weekend", RegexOptions.Compiled | RegexOptions.IgnoreCase),          // Full Weekend compilations
-        new Regex(@"\bweigh[\s\.\-_]*in", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // weigh in
-        new Regex(@"\bfaceoff", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // faceoff
-        new Regex(@"\bface[\s\.\-_]*off", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // face off
-        new Regex(@"\bembedded", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // UFC Embedded
-        new Regex(@"\bcountdown", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // countdown shows
-        new Regex(@"\bhighlights?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                  // highlights
-        new Regex(@"\breview\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // review
-        new Regex(@"\brecap\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // recap
-        new Regex(@"\banalysis\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                     // analysis
-        new Regex(@"\bbreakdown\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                    // breakdown
-        new Regex(@"\bpodcast\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // podcast
-        new Regex(@"\bdocumentary\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                  // documentary
-        new Regex(@"\bbehind[\s\.\-_]*the[\s\.\-_]*scenes", RegexOptions.Compiled | RegexOptions.IgnoreCase), // behind the scenes
-        new Regex(@"\bfeaturette\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                   // featurette
-        new Regex(@"\bpromo\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                        // promo
-        new Regex(@"\btrailer\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // trailer
-        new Regex(@"\blaunch\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),                       // launch
+        new Regex(@"\bpress[\s\.\-_]*conf", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),           // press conference, press.conf, pressconf
+        new Regex(@"\binterview", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // interview, interviews
+        new Regex(@"\bbuild[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // build up, build-up, buildup
+        new Regex(@"\bpre[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // pre show, pre-show, preshow
+        new Regex(@"\bpost[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // post show, post-show, postshow
+        new Regex(@"\bpre[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // pre-qualifying-show
+        new Regex(@"\bpost[\s\.\-_]*\w+[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),// post-sprint-show
+        new Regex(@"\bpost[\s\.\-_]*fight", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),            // post fight, post-fight, postfight
+        new Regex(@"\bpost[\s\.\-_]*race", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // post race, post-race, postrace
+        new Regex(@"\b(?:the[\s\.\-_]*)?f1[\s\.\-_]+show\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // The F1 Show
+        new Regex(@"\bpost[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),            // post match, post-match, postmatch
+        new Regex(@"\bpre[\s\.\-_]*match", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // pre match, pre-match, prematch
+        new Regex(@"\bhalf[\s\.\-_]*time[\s\.\-_]*show", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // halftime show
+        new Regex(@"\b(?:1st|first|2nd|second)[\s\.\-_]*half\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // partial match
+        new Regex(@"\bwarm[\s\.\-_]*up\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),             // warm up (F1 pre-show)
+        new Regex(@"\bweekend[\s\.\-_]*warm[\s\.\-_]*up", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // weekend warm up (Sky F1)
+        new Regex(@"\bted'?s?[\s\.\-_]*\w*[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // Ted's Notebook
+        new Regex(@"\bted[\s\.\-_]*kravitz", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),           // Ted Kravitz (Sky F1 presenter)
+        new Regex(@"\b\w+[\s\.\-_]*notebook", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),          // Any Notebook
+        new Regex(@"\bpaddock[\s\.\-_]*uncut", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),         // Paddock Uncut
+        new Regex(@"\bchequered[\s\.\-_]*flag", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),        // Chequered Flag
+        new Regex(@"\bfull[\s\.\-_]*weekend", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),          // Full Weekend compilations
+        new Regex(@"\bweigh[\s\.\-_]*in", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // weigh in
+        new Regex(@"\bfaceoff", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // faceoff
+        new Regex(@"\bface[\s\.\-_]*off", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // face off
+        new Regex(@"\bembedded", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // UFC Embedded
+        new Regex(@"\bcountdown", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // countdown shows
+        new Regex(@"\bhighlights?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                  // highlights
+        new Regex(@"\breview\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // review
+        new Regex(@"\brecap\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // recap
+        new Regex(@"\banalysis\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                     // analysis
+        new Regex(@"\bbreakdown\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                    // breakdown
+        new Regex(@"\bpodcast\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // podcast
+        new Regex(@"\bdocumentary\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                  // documentary
+        new Regex(@"\bbehind[\s\.\-_]*the[\s\.\-_]*scenes", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // behind the scenes
+        new Regex(@"\bfeaturette\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                   // featurette
+        new Regex(@"\bpromo\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                        // promo
+        new Regex(@"\btrailer\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // trailer
+        new Regex(@"\blaunch\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                       // launch
+        new Regex(@"\btest[\s\.\-_]*upload\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),       // tracker test upload
         // Shortened cuts of the actual event. These ARE the event's content, but a
         // 40-minute condensed edit must never satisfy - or worse, quality-upgrade
         // and delete - a full-game want just because its resolution is higher.
-        new Regex(@"\bcondensed", RegexOptions.Compiled | RegexOptions.IgnoreCase),                      // condensed, condensed game
-        new Regex(@"\ball[\s\.\-_]*22\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),              // All-22, All.22 coaches film
-        new Regex(@"\bcoach(?:'?s|es)?[\s\.\-_]*(?:film|tape|cam)", RegexOptions.Compiled | RegexOptions.IgnoreCase), // coaches film/tape/cam
+        new Regex(@"\bcondensed", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),                      // condensed, condensed game
+        new Regex(@"\ball[\s\.\-_]*22\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),              // All-22, All.22 coaches film
+        new Regex(@"\bcoach(?:'?s|es)?[\s\.\-_]*(?:film|tape|cam)", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // coaches film/tape/cam
     };
 
     // Pre-season test detection — fires inside per-event ValidateRelease loop.
@@ -103,6 +140,8 @@ public class ReleaseMatchingService
         new(@"\bRaces?\s*(\d{1,3})(?:\s*(?:and|&|\+|,)\s*(\d{1,3}))?\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _releaseRoundTokenPattern =
         new(@"\b(?:round|rd)\s*\.?\s*\d{1,2}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _teamScheduleRoundPattern =
+        new(@"\b(?:week|wk|round|matchday)[\s\.\-]*(\d{1,3})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex[] _eventNumberPatterns = new[]
     {
         new Regex(@"UFC[\s\.\-]+(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase),
@@ -145,6 +184,34 @@ public class ReleaseMatchingService
     private static readonly Regex _dayNumberRegex = new(
         @"\bday\s*(\d+)\b",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex ReleaseStagePattern = new(
+        @"\bstage\s*(\d{1,3})\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex RallyStagePattern = new(
+        @"\b(?:ss|stage)\s*(\d{1,3})\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex WomensCategoryPattern = new(
+        @"\b(?:women|womens|female|femmes?)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex GolfNumberedRoundPattern = new(
+        @"\bround\s*(?<round>[1-4])\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex GolfOrdinalRoundPattern = new(
+        @"\b(?<round>[1-4])\s+round\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex GolfNamedRoundPattern = new(
+        @"\b(?<round>first|second|third|fourth|final)\s+round\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex StandaloneYearPattern = new(
+        @"(?<!\d)(?<year>(?:19|20)\d{2})(?!\d)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     // Bounded cache for the dynamic `\b{Regex.Escape(name)}\b` lookups that
     // happen inside ContainsTeamName and AliasMatchesRelease. Team and league
@@ -229,7 +296,9 @@ public class ReleaseMatchingService
         bool enableMultiPartEpisodes = true,
         SportsParseResult? preParsed = null,
         int? earlyReleaseLimitDays = null,
-        IReadOnlyList<int>? roundRaceNumbers = null)
+        IReadOnlyList<int>? roundRaceNumbers = null,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        IReadOnlyCollection<Event>? datePeers = null)
     {
         var result = new ReleaseMatchResult
         {
@@ -249,16 +318,38 @@ public class ReleaseMatchingService
         // opts in (League.AllowHighlights) — short-format sports like sumo
         // ship each day as a multi-hour Live cut and a short Highlights cut,
         // and some users specifically want the highlights.
-        var nonEventContent = DetectNonEventContent(release.Title);
+        var nonEventContent = IsPreviewContent(release.Title) && !PreviewContentPattern.IsMatch(evt.Title)
+            ? "Preview"
+            : DetectNonEventContent(release.Title);
         if (nonEventContent != null)
         {
+            var detectedRequestedPart = enableMultiPartEpisodes && !string.IsNullOrWhiteSpace(requestedPart)
+                ? _partDetector.DetectPart(release.Title, evt.Sport ?? "Fighting", evt.Title, evt.League?.Name)
+                : null;
+            var isWrestlingPackageLabel = nonEventContent is "Pre-show" or "Countdown Show" or "Post-event Show";
+            var remainingNonEventContent = isWrestlingPackageLabel
+                ? DetectNonEventContent(WrestlingPackageLabelPattern.Replace(release.Title, " "))
+                : nonEventContent;
+            var selectedWrestlingPackage = isWrestlingPackageLabel &&
+                remainingNonEventContent == null &&
+                EventPartDetector.DetectWrestlingPromotion(evt.League?.Name) !=
+                    EventPartDetector.WrestlingPromotion.Other &&
+                detectedRequestedPart?.SegmentName.Equals(
+                    requestedPart, StringComparison.OrdinalIgnoreCase) == true &&
+                SearchNormalizationService.EvaluateCombatIdentity(
+                    release.Title,
+                    evt.Title ?? string.Empty,
+                    evt.League?.Name,
+                    evt.Sport,
+                    requestedPart,
+                    enableMultiPartEpisodes) == CombatIdentityMatch.Match;
             var highlightsAllowed =
                 string.Equals(nonEventContent, "Highlights", StringComparison.OrdinalIgnoreCase)
                 && (evt.League?.AllowHighlights ?? false);
 
-            if (highlightsAllowed)
+            if (highlightsAllowed || selectedWrestlingPackage)
             {
-                _logger.LogTrace("[Release Matching] Allowing highlights release for '{Event}' (league opts in): '{Release}'",
+                _logger.LogTrace("[Release Matching] Allowing selected package for '{Event}': '{Release}'",
                     evt.Title, release.Title);
             }
             else
@@ -387,7 +478,239 @@ public class ReleaseMatchingService
 
         // Determine if this is a team sport event using string fields (always available, unlike navigation properties)
         var isTeamSport = !string.IsNullOrEmpty(evt.HomeTeamName) && !string.IsNullOrEmpty(evt.AwayTeamName);
+        var isChineseCbaSeasonPack = release.IsPack && LeagueReleaseNamePolicy.IsChineseCbaSeasonPack(evt);
+        var hasChineseCbaSeasonPackIdentity = isChineseCbaSeasonPack &&
+            LeagueReleaseNamePolicy.HasChineseCbaSeasonPackIdentity(release.Title, evt);
+        if (isChineseCbaSeasonPack && !hasChineseCbaSeasonPackIdentity)
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Release league or season conflicts with the selected season pack");
+            return result;
+        }
+        if (CricketRugbyReleaseNamePolicy.HasIdentityConflict(release.Title, evt))
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Release competition or match identity conflicts with the event");
+            return result;
+        }
+        if (LeagueReleaseNamePolicy.HasIdentityConflict(release.Title, evt))
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Release competition or stage conflicts with the event");
+            return result;
+        }
+        if (LeagueReleaseNamePolicy.HasUnresolvedSupercarsRaceIdentity(release.Title, evt) &&
+            roundRaceNumbers is not { Count: > 0 })
+        {
+            result.Rejections.Add("Supercars race number is relative to its round and needs the round schedule");
+            return result;
+        }
+        if (LeagueReleaseNamePolicy.EvaluateSupercarsRoundRaceIdentity(
+                release.Title, evt, roundRaceNumbers) == false)
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Supercars race number does not match the event's race in this round");
+            return result;
+        }
+        if (CricketRugbyReleaseNamePolicy.HasStrongEventIdentity(release.Title, evt))
+        {
+            result.Confidence += 20;
+            result.MatchReasons.Add("Competition and participant identity match");
+        }
+        var hasLeagueReleaseIdentity = LeagueReleaseNamePolicy.HasStrongEventIdentity(release.Title, evt) ||
+            hasChineseCbaSeasonPackIdentity;
+        var hasExactTeamGameIdentity = LeagueReleaseNamePolicy.HasExactTeamGameIdentity(release.Title, evt);
+        if (hasLeagueReleaseIdentity)
+        {
+            result.Confidence += evt.League?.Name.Contains("World Snooker", StringComparison.OrdinalIgnoreCase) == true
+                ? 31
+                : LeagueReleaseNamePolicy.UsesCompleteCatalogIdentity(evt) ? 50 : 25;
+            result.MatchReasons.Add("Competition and event identity match");
+        }
         var isFighting = EventPartDetector.IsFightingSport(evt.Sport ?? "");
+        var combatIdentity = isFighting
+            ? SearchNormalizationService.EvaluateCombatIdentity(
+                release.Title,
+                evt.Title ?? string.Empty,
+                evt.League?.Name,
+                evt.Sport,
+                requestedPart,
+                enableMultiPartEpisodes)
+            : CombatIdentityMatch.Unknown;
+        var isTennis = string.Equals(evt.Sport, "Tennis", StringComparison.OrdinalIgnoreCase);
+        var isCycling = string.Equals(evt.Sport, "Cycling", StringComparison.OrdinalIgnoreCase);
+        var isGolf = string.Equals(evt.Sport, "Golf", StringComparison.OrdinalIgnoreCase);
+        var isNascarCup = evt.League?.Name.Contains("NASCAR Cup", StringComparison.OrdinalIgnoreCase) == true;
+        var isNascarNonCup = !isNascarCup &&
+            evt.League?.Name.Contains("NASCAR", StringComparison.OrdinalIgnoreCase) == true;
+        var isWrc = evt.League?.Name.Contains("WRC", StringComparison.OrdinalIgnoreCase) == true ||
+                    evt.League?.Name.Contains("World Rally", StringComparison.OrdinalIgnoreCase) == true;
+        var isWorldSuperbike = EventPartDetector.IsWorldSuperbikeLeague(evt.League?.Name);
+        var isLeMans24 = evt.League?.Name.Contains("WEC", StringComparison.OrdinalIgnoreCase) == true &&
+                         Regex.IsMatch(normalizedEvent, @"\b24\s+hours\s+of\s+le\s+mans\b", RegexOptions.IgnoreCase);
+        var nascarLocationDateIdentity = isNascarCup &&
+            SearchNormalizationService.HasExactDateAndLocationMatch(
+                release.Title,
+                evt.Venue,
+                evt.Location,
+                parseResult.EventDate,
+                (evt.BroadcastDate ?? evt.EventDate).Date);
+        var nascarNonCupLocationDateIdentity = isNascarNonCup &&
+            SearchNormalizationService.HasExactDateAndLocationMatch(
+                release.Title,
+                evt.Venue,
+                evt.Location,
+                parseResult.EventDate,
+                (evt.BroadcastDate ?? evt.EventDate).Date) &&
+            SearchNormalizationService.HasMatchingNascarSeries(release.Title, evt.League?.Name) &&
+            !SearchNormalizationService.HasConflictingNascarSession(
+                release.Title, evt.Title ?? string.Empty);
+        var nascarExactNonCupTitle = isNascarNonCup &&
+            ContainsWholeWord(normalizedRelease, normalizedEvent);
+        var nascarNamedIdentity = isNascarCup &&
+            (normalizedRelease.Contains(normalizedEvent, StringComparison.OrdinalIgnoreCase) ||
+             nascarLocationDateIdentity) || nascarExactNonCupTitle || nascarNonCupLocationDateIdentity;
+        var nascarReleaseRound = isNascarCup || isNascarNonCup ? ExtractRoundNumber(release.Title) : null;
+        var nascarEventRound = (isNascarCup || isNascarNonCup) &&
+            int.TryParse(evt.Round, out var parsedNascarEventRound)
+            ? parsedNascarEventRound
+            : (int?)null;
+        var nascarRoundIdentity = nascarReleaseRound.HasValue &&
+                                  nascarEventRound.HasValue &&
+                                  nascarReleaseRound == nascarEventRound;
+        var nascarSessionConflict = (isNascarCup || isNascarNonCup) &&
+            SearchNormalizationService.HasConflictingNascarSession(
+                release.Title, evt.Title ?? string.Empty);
+        var nascarSessionMatch = (isNascarCup || isNascarNonCup) &&
+            SearchNormalizationService.HasMatchingNascarSession(
+                release.Title, evt.Title ?? string.Empty);
+
+        if (SearchNormalizationService.HasConflictingNascarSeries(
+                release.Title, evt.Title ?? string.Empty, evt.League?.Name))
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("NASCAR release is from another series");
+            return result;
+        }
+
+        if ((isNascarCup || isNascarNonCup) && SearchNormalizationService.HasConflictingNascarRaceDistance(
+                release.Title, evt.Title ?? string.Empty))
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("NASCAR race distance does not match the event");
+            return result;
+        }
+
+        if ((isNascarCup || isNascarNonCup) &&
+            !nascarNamedIdentity && !nascarRoundIdentity && !nascarSessionConflict)
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("NASCAR release does not identify the selected race");
+            return result;
+        }
+
+        if (isWrc)
+        {
+            var eventStage = ExtractRallyStageNumber(normalizedEvent);
+            var releaseStage = ExtractRallyStageNumber(normalizedRelease);
+            if (eventStage.HasValue && releaseStage != eventStage)
+            {
+                result.Confidence = 0;
+                result.IsHardRejection = true;
+                result.Rejections.Add(releaseStage.HasValue
+                    ? $"Rally stage mismatch: release is Stage {releaseStage}, event is Stage {eventStage}"
+                    : $"Rally stage missing: event is Stage {eventStage}");
+                return result;
+            }
+
+            if (!eventStage.HasValue && releaseStage.HasValue)
+            {
+                result.Confidence = 0;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Rally stage release cannot satisfy a full rally event");
+                return result;
+            }
+
+            if (eventStage.HasValue &&
+                !SearchNormalizationService.HasRallyIdentityMatch(release.Title, evt.Title ?? string.Empty))
+            {
+                result.Confidence = 0;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Rally release does not identify the selected rally");
+                return result;
+            }
+
+            if (eventStage.HasValue)
+            {
+                result.Confidence += 30;
+                result.MatchReasons.Add($"Rally stage matches: Stage {eventStage}");
+            }
+        }
+
+        if (isLeMans24 && HasStrongIndividualTitleIdentity(normalizedRelease, normalizedEvent))
+        {
+            result.Confidence += 30;
+            result.MatchReasons.Add("Named endurance race matches");
+        }
+
+        if (nascarLocationDateIdentity || nascarNonCupLocationDateIdentity)
+        {
+            result.Confidence += 30;
+            result.MatchReasons.Add("NASCAR venue and date match");
+        }
+
+        if (nascarExactNonCupTitle &&
+            parseResult.EventDate?.Date == (evt.BroadcastDate ?? evt.EventDate).Date &&
+            SearchNormalizationService.HasMatchingNascarSeries(release.Title, evt.League?.Name))
+        {
+            result.Confidence += 20;
+            result.MatchReasons.Add("Named NASCAR race and series match");
+        }
+
+        if (isTeamSport && !PackImportBoundary.IsPackRelease(release.Title, release.IsPack,
+                release.SportarrLeagueId, release.SportarrEventId))
+        {
+            var releaseRoundMatch = _teamScheduleRoundPattern.Match(release.Title);
+            var hasExactPreseasonDate = SearchNormalizationService.HasExactDatedPreseasonIdentity(
+                release.Title, parseResult.EventDate, evt);
+            if (releaseRoundMatch.Success &&
+                int.TryParse(releaseRoundMatch.Groups[1].Value, out var releaseRound) &&
+                int.TryParse(evt.Round, out var eventRound) &&
+                releaseRound != eventRound &&
+                !(eventRound == 500 && hasExactPreseasonDate))
+            {
+                result.Confidence = 0;
+                result.IsHardRejection = true;
+                result.Rejections.Add($"Round mismatch: release is round {releaseRound}, event is round {eventRound}");
+                return result;
+            }
+
+            var releaseGames = ExtractTeamGameNumbers(release.Title, stripReleaseGroup: true, parseResult.EventDate);
+            if (releaseGames.Count > 0)
+            {
+                var eventGames = ExtractTeamGameNumbers(evt.Title, stripReleaseGroup: false);
+                var conflictingGame = eventGames.Count == 1 && !releaseGames.SetEquals(eventGames);
+                var unidentifiedGame = !parseResult.EventDate.HasValue &&
+                    !hasExactTeamGameIdentity &&
+                    !releaseGames.SetEquals(eventGames);
+                if (releaseGames.Count > 1 || conflictingGame || unidentifiedGame)
+                {
+                    result.Confidence = 0;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add(conflictingGame
+                        ? "Game number conflicts with the event title"
+                        : "Game identity is ambiguous: release needs a date or matching game number in the event title");
+                    return result;
+                }
+            }
+        }
 
         // Location variation matching is ONLY useful for non-team sports (F1, UFC, etc.)
         // where the event title contains location names (e.g., "Mexico Grand Prix" vs "Mexican Grand Prix")
@@ -487,7 +810,38 @@ public class ReleaseMatchingService
         // were missing in RssSyncService — causing team validation to be completely bypassed during RSS sync
         if (isTeamSport)
         {
-            var teamMatch = ValidateTeamNames(release.Title, evt.HomeTeamName!, evt.AwayTeamName!, evt.HomeTeam, evt.AwayTeam);
+            if (evt.League != null &&
+                FootballReleaseNamePolicy.NamesDifferentCompetition(release.Title, evt.League.Name))
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Different competition found in release");
+            }
+
+            if (evt.League != null &&
+                FootballReleaseNamePolicy.IsEnglishWomensSuperLeague(evt.League.Name) &&
+                !TitleNamesLeague(release.Title, evt.League) &&
+                !(ContainsCanonicalTeamOrUserAlias(normalizedRelease, evt.HomeTeamName!, evt.HomeTeam) &&
+                  ContainsCanonicalTeamOrUserAlias(normalizedRelease, evt.AwayTeamName!, evt.AwayTeam)))
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Women's league identity not found in release");
+            }
+
+            var (titleHomeName, titleAwayName) = ResolveTitleTeamAliases(evt);
+            var teamMatch = hasLeagueReleaseIdentity
+                ? 2
+                : ValidateTeamNames(
+                    release.Title,
+                    evt.HomeTeamName!,
+                    evt.AwayTeamName!,
+                    evt.HomeTeam,
+                    evt.AwayTeam,
+                    evt.League,
+                    knownLeagues,
+                    titleHomeName,
+                    titleAwayName);
             if (teamMatch >= 2)
             {
                 result.Confidence += 35;
@@ -560,6 +914,95 @@ public class ReleaseMatchingService
             }
         }
 
+        if (combatIdentity == CombatIdentityMatch.Mismatch && !hasLeagueReleaseIdentity)
+        {
+            result.Confidence -= 100;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Combat event identity conflicts with the selected event");
+        }
+        else if (combatIdentity == CombatIdentityMatch.Match)
+        {
+            result.Confidence += 40;
+            result.MatchReasons.Add("Combat event identity matches");
+        }
+
+        if (isTennis)
+        {
+            var tennisIdentity = SearchNormalizationService.EvaluateTennisIdentity(
+                release.Title, evt.Title ?? string.Empty);
+            if (tennisIdentity == TennisIdentityMatch.Match)
+            {
+                result.Confidence += 35;
+                result.MatchReasons.Add("Both participant names and tournament found");
+            }
+            else if (tennisIdentity == TennisIdentityMatch.TournamentMismatch)
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Tennis tournament does not match event");
+            }
+            else if (tennisIdentity == TennisIdentityMatch.ParticipantMismatch)
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Only one participant name found");
+            }
+        }
+
+        if (isCycling)
+        {
+            if (SearchNormalizationService.HasCyclingCategoryConflict(
+                    release.Title, evt.Title, evt.League?.Name, evt.Sport))
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add("Cycling category does not match event league");
+            }
+
+            var eventStage = EventQueryService.ExtractStageNumber(evt.Title);
+            var releaseStage = ExtractReleaseStageNumber(normalizedRelease);
+            if (eventStage.HasValue && releaseStage.HasValue)
+            {
+                var raceTitle = Regex.Replace(
+                    EventQueryService.StripStageFromTitle(evt.Title),
+                    @"(?<=[\p{Ll}])(?=[\p{Lu}])",
+                    " ");
+                var raceIdentityMatches = HasStrongIndividualTitleIdentity(
+                    normalizedRelease,
+                    NormalizeTitle(raceTitle));
+                if (eventStage == releaseStage && raceIdentityMatches)
+                {
+                    result.Confidence += 35;
+                    result.MatchReasons.Add($"Race title and stage match: Stage {eventStage}");
+                }
+                else if (eventStage != releaseStage)
+                {
+                    result.Confidence -= 100;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add($"Stage mismatch: release is Stage {releaseStage}, event is Stage {eventStage}");
+                }
+                else
+                {
+                    result.Confidence -= 100;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add("Cycling race does not match event");
+                }
+            }
+            else if (!eventStage.HasValue && HasStrongIndividualTitleIdentity(normalizedRelease, normalizedEvent))
+            {
+                result.Confidence += 40;
+                result.MatchReasons.Add("Race title matches");
+            }
+        }
+
+        if (SearchNormalizationService.HasParticipantCategoryConflict(release.Title, evt))
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Participant category does not match event");
+            return result;
+        }
+
         // VALIDATION 3: Date/Year proximity
         // First check full date if available, then fall back to year-only check
         _logger.LogTrace("[Release Matching] Date validation for '{Release}': EventDate={EventDate}, EventYear={EventYear}",
@@ -567,23 +1010,37 @@ public class ReleaseMatchingService
             parseResult.EventDate?.ToString("yyyy-MM-dd") ?? "null",
             parseResult.EventYear?.ToString() ?? "null");
 
-        if (parseResult.EventDate.HasValue)
+        if (!hasChineseCbaSeasonPackIdentity && parseResult.EventDate.HasValue)
         {
             // Compare DATE parts only (not DateTime with time-of-day components). Use the
             // broadcast-local date when available so an end-of-day Eastern broadcast stored as
             // e.g. 2026-01-01T01:00Z (UTC) is compared against a release titled "AEW.2025.12.31"
             // by its true broadcast date (2025-12-31), not the UTC-rolled-over Jan 1.
             var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+            var isAthleticsFinal = !release.IsPack &&
+                string.Equals(evt.Sport, "Athletics", StringComparison.OrdinalIgnoreCase) &&
+                AthleticsFinalPattern.IsMatch(evt.Title ?? "");
             var daysDiff = Math.Abs((eventDate - parseResult.EventDate.Value.Date).TotalDays);
+            var requiresExactCombatDate = SearchNormalizationService.RequiresExactCombatDate(
+                evt.Title ?? string.Empty, evt.League?.Name, evt.Sport);
             _logger.LogTrace("[Release Matching] Date comparison: release={ReleaseDate}, event={EventDate}, diff={Days} days",
                 parseResult.EventDate.Value.ToString("yyyy-MM-dd"), eventDate.ToString("yyyy-MM-dd"), daysDiff);
 
-            if (daysDiff == 0)
+            var allowsObservedDateDrift = LeagueReleaseNamePolicy.AllowsObservedDateDrift(
+                release.Title, evt, parseResult.EventDate.Value);
+            var matchesAnotherTeamEvent = isTeamSport && daysDiff > 0 &&
+                DateMatchesAnotherTeamEvent(evt, parseResult.EventDate.Value.Date, datePeers);
+            if (daysDiff == 0 ||
+                SearchNormalizationService.HasDayMonthDateToken(release.Title, eventDate) ||
+                allowsObservedDateDrift && !matchesAnotherTeamEvent)
             {
                 result.Confidence += 25;
-                result.MatchReasons.Add("Date matches exactly");
+                result.MatchReasons.Add(allowsObservedDateDrift && daysDiff > 0
+                    ? "Date matches observed league release window"
+                    : "Date matches exactly");
             }
-            else if (daysDiff <= 1 && (!isTeamSport || evt.BroadcastDate == null || !evt.BroadcastDateVerified))
+            else if (!requiresExactCombatDate &&
+                     daysDiff <= 1 && (!isTeamSport || evt.BroadcastDate == null || !evt.BroadcastDateVerified))
             {
                 // One day of grace absorbs the UTC-vs-venue rollover, but
                 // only while the event's broadcast-local date is unknown.
@@ -592,10 +1049,19 @@ public class ReleaseMatchingService
                 // neighboring GAME: an MLB series plays daily, so a one-day
                 // window hands over yesterday's matchup between the same
                 // two teams as today's.
-                result.Confidence += 25;
-                result.MatchReasons.Add("Date within 1 day (timezone rollover)");
+                if (matchesAnotherTeamEvent)
+                {
+                    result.Confidence -= 100;
+                    result.IsHardRejection = true;
+                    result.Rejections.Add("Date matches another game between these teams");
+                }
+                else
+                {
+                    result.Confidence += 25;
+                    result.MatchReasons.Add("Date within 1 day (timezone rollover)");
+                }
             }
-            else if (!isTeamSport && daysDiff <= 3)
+            else if (!requiresExactCombatDate && !isTeamSport && !isAthleticsFinal && daysDiff <= 3)
             {
                 // The 3-day grace only applies to non-team events (weekly
                 // shows, cards whose broadcast date drifts from the listed
@@ -618,7 +1084,7 @@ public class ReleaseMatchingService
                     parseResult.EventDate.Value.ToString("yyyy-MM-dd"), eventDate.ToString("yyyy-MM-dd"), daysDiff, release.Title);
             }
         }
-        else if (parseResult.EventYear.HasValue)
+        else if (!hasChineseCbaSeasonPackIdentity && parseResult.EventYear.HasValue)
         {
             // Year-only validation for releases like "Formula1.2015.Abu.Dhabi.Grand.Prix"
             // CRITICAL for F1/motorsport where releases have year but not full date.
@@ -629,7 +1095,9 @@ public class ReleaseMatchingService
             var releaseYearEnd = parseResult.SeasonYearEnd;
 
             // Check if event year falls within the season span (e.g., NFL 2025-2026 covers events in both 2025 and 2026)
-            var yearMatches = releaseYear == eventYear;
+            var yearMatches = releaseYear == eventYear ||
+                CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(release.Title, evt) ||
+                hasLeagueReleaseIdentity && LeagueReleaseNamePolicy.HasMatchingEHFSeasonEpisode(release.Title, evt);
             if (!yearMatches && releaseYearEnd.HasValue)
             {
                 // Season span detected (e.g., "2025-2026") - check if event year is within the span
@@ -658,6 +1126,22 @@ public class ReleaseMatchingService
                 result.Rejections.Add($"Year mismatch: release is {yearDisplay}, event is {eventYear}");
                 _logger.LogTrace("[Release Matching] Hard rejection: year mismatch ({ReleaseYear} vs {EventYear}): '{Release}'",
                     yearDisplay, eventYear, release.Title);
+            }
+        }
+        else if ((isTennis || isCycling || isGolf) &&
+                 TryExtractStandaloneYear(release.Title, out var explicitReleaseYear))
+        {
+            var eventYear = (evt.BroadcastDate ?? evt.EventDate).Year;
+            if (explicitReleaseYear == eventYear)
+            {
+                result.Confidence += 20;
+                result.MatchReasons.Add($"Year matches ({explicitReleaseYear})");
+            }
+            else
+            {
+                result.Confidence -= 100;
+                result.IsHardRejection = true;
+                result.Rejections.Add($"Year mismatch: release is {explicitReleaseYear}, event is {eventYear}");
             }
         }
         else
@@ -801,8 +1285,10 @@ public class ReleaseMatchingService
         if (isMotorsport)
         {
             // Detect session type from both event title and release filename
-            var eventSession = EventPartDetector.DetectMotorsportSessionType(evt.Title, evt.League?.Name ?? "");
-            var releaseSession = EventPartDetector.DetectMotorsportSessionFromFilename(release.Title);
+            var eventSession = EventPartDetector.DetectMotorsportSessionIdentity(
+                evt.Title ?? string.Empty, evt.League?.Name, releaseTitle: false);
+            var releaseSession = EventPartDetector.DetectMotorsportSessionIdentity(
+                release.Title, evt.League?.Name, releaseTitle: true);
 
             _logger.LogTrace("[Release Matching] Motorsport session validation: event='{EventSession}', release='{ReleaseSession}'",
                 eventSession ?? "unknown", releaseSession ?? "unknown");
@@ -810,13 +1296,22 @@ public class ReleaseMatchingService
             if (eventSession != null && releaseSession != null)
             {
                 // Normalize both session names for comparison
-                var normalizedEventSession = EventPartDetector.NormalizeMotorsportSession(eventSession);
-                var normalizedReleaseSession = EventPartDetector.NormalizeMotorsportSession(releaseSession);
+                var normalizedEventSession = isWorldSuperbike
+                    ? eventSession
+                    : EventPartDetector.NormalizeMotorsportSession(eventSession);
+                var normalizedReleaseSession = isWorldSuperbike
+                    ? releaseSession
+                    : EventPartDetector.NormalizeMotorsportSession(releaseSession);
 
-                if (normalizedEventSession == normalizedReleaseSession)
+                if (normalizedEventSession == normalizedReleaseSession && !nascarSessionConflict)
                 {
                     result.Confidence += 25;
                     result.MatchReasons.Add($"Session type matches: {normalizedEventSession}");
+                }
+                else if (nascarSessionMatch)
+                {
+                    result.Confidence += 25;
+                    result.MatchReasons.Add("NASCAR session identity matches");
                 }
                 else
                 {
@@ -835,7 +1330,13 @@ public class ReleaseMatchingService
                 // This could be acceptable for "Race" events where releases might just say "Grand Prix"
                 // but for practice/qualifying, the release should indicate the session
                 var normalizedEventSession = EventPartDetector.NormalizeMotorsportSession(eventSession);
-                if (normalizedEventSession == "Race")
+                if (nascarSessionConflict)
+                {
+                    result.Confidence -= 100;
+                    result.Rejections.Add("NASCAR release does not name the selected support session");
+                    result.IsHardRejection = true;
+                }
+                else if (normalizedEventSession == "Race")
                 {
                     // Race events can accept releases without explicit session indicator
                     result.Confidence += 5;
@@ -844,8 +1345,14 @@ public class ReleaseMatchingService
                 else
                 {
                     // For practice/qualifying, we need explicit session in release
-                    result.Confidence -= 30;
+                    result.Confidence -= evt.League?.Name.Contains("WEC", StringComparison.OrdinalIgnoreCase) == true
+                        ? 100
+                        : 30;
                     result.Rejections.Add($"Event is '{normalizedEventSession}' but release has no session indicator");
+                    if (evt.League?.Name.Contains("WEC", StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        result.IsHardRejection = true;
+                    }
                 }
             }
 
@@ -866,6 +1373,11 @@ public class ReleaseMatchingService
                 {
                     result.Confidence += 25;
                     result.MatchReasons.Add($"Round number matches: Round {releaseRound}");
+                }
+                else if (nascarNamedIdentity)
+                {
+                    result.Confidence += 25;
+                    result.MatchReasons.Add("Named NASCAR event matches despite metadata round drift");
                 }
                 else
                 {
@@ -956,6 +1468,11 @@ public class ReleaseMatchingService
         // "Day 2" or "Day Two" release should NOT match "Day 1" event (and vice versa)
         var releaseDayNumber = ExtractDayNumber(normalizedRelease);
         var eventDayNumber = ExtractDayNumber(normalizedEvent);
+        if (isGolf)
+        {
+            releaseDayNumber ??= ExtractGolfRoundNumber(normalizedRelease);
+            eventDayNumber ??= ExtractGolfRoundNumber(normalizedEvent);
+        }
         if (releaseDayNumber.HasValue && eventDayNumber.HasValue && releaseDayNumber != eventDayNumber)
         {
             result.Confidence -= 100;
@@ -964,11 +1481,28 @@ public class ReleaseMatchingService
             _logger.LogTrace("[Release Matching] Hard rejection: day mismatch (Day {ReleaseDay} vs Day {EventDay}): '{Release}'",
                 releaseDayNumber, eventDayNumber, release.Title);
         }
-        else if (releaseDayNumber.HasValue && !eventDayNumber.HasValue)
+        else if (releaseDayNumber.HasValue && !eventDayNumber.HasValue && !hasLeagueReleaseIdentity)
         {
             // Release specifies a day but event doesn't — penalize but don't hard-reject
             result.Confidence -= 20;
             result.Rejections.Add($"Release specifies Day {releaseDayNumber} but event has no day indicator");
+        }
+        else if (isGolf && releaseDayNumber.HasValue && releaseDayNumber == eventDayNumber)
+        {
+            result.Confidence += 25;
+            result.MatchReasons.Add($"Golf round matches: Round {eventDayNumber}");
+        }
+
+        if (isGolf && GolfTournamentIdentityMatches(normalizedRelease, normalizedEvent))
+        {
+            result.Confidence += 20;
+            result.MatchReasons.Add("Tournament title matches");
+        }
+        else if (isGolf && releaseDayNumber.HasValue && HasKnownGolfTournamentIdentity(normalizedEvent))
+        {
+            result.Confidence -= 100;
+            result.IsHardRejection = true;
+            result.Rejections.Add("Golf tournament does not match event");
         }
 
         // VALIDATION 6e: Motorsport pre-season testing vs race weekend mismatch
@@ -1070,9 +1604,11 @@ public class ReleaseMatchingService
                 "Both team names found",
                 "Both fighter surnames found",
                 "One fighter surname found",
+                "Combat event identity matches",
+                "Exact fighter matchup matches",
                 "League/organization matches",
             };
-            bool hasIdentityReason = result.MatchReasons.Any(r =>
+            bool hasIdentityReason = hasLeagueReleaseIdentity || result.MatchReasons.Any(r =>
                 identityReasons.Any(w => r.StartsWith(w, StringComparison.OrdinalIgnoreCase)));
 
             // Identity comes from the league's name/alias in the title or the
@@ -1115,6 +1651,74 @@ public class ReleaseMatchingService
         return result;
     }
 
+    internal static bool DateMatchesAnotherTeamEvent(
+        Event evt,
+        DateTime releaseDate,
+        IReadOnlyCollection<Event>? datePeers)
+    {
+        if (datePeers == null || datePeers.Count == 0)
+            return false;
+
+        return datePeers.Any(peer =>
+            !IsSameEvent(evt, peer)
+            && IsSameEventLeague(evt, peer)
+            && IsSameTeamPair(evt, peer)
+            && IsPlausibleEventDate(peer, releaseDate));
+    }
+
+    private static bool IsSameEvent(Event left, Event right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        if (left.Id != 0 && right.Id != 0)
+            return left.Id == right.Id;
+        return !string.IsNullOrWhiteSpace(left.ExternalId)
+            && !string.IsNullOrWhiteSpace(right.ExternalId)
+            && left.ExternalId.Equals(right.ExternalId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSameEventLeague(Event left, Event right)
+    {
+        if (left.LeagueId.HasValue && right.LeagueId.HasValue)
+            return left.LeagueId == right.LeagueId;
+        if (left.League != null && right.League != null)
+            return IsSameLeague(left.League, right.League);
+        return LeagueSportRules.AreEquivalentSports(left.Sport, right.Sport);
+    }
+
+    private static bool IsSameTeamPair(Event left, Event right)
+    {
+        if (left.HomeTeamId.HasValue && left.AwayTeamId.HasValue
+            && right.HomeTeamId.HasValue && right.AwayTeamId.HasValue)
+        {
+            return (left.HomeTeamId == right.HomeTeamId && left.AwayTeamId == right.AwayTeamId)
+                || (left.HomeTeamId == right.AwayTeamId && left.AwayTeamId == right.HomeTeamId);
+        }
+
+        var leftHome = NormalizeTitle(left.HomeTeamName ?? left.HomeTeam?.Name ?? "");
+        var leftAway = NormalizeTitle(left.AwayTeamName ?? left.AwayTeam?.Name ?? "");
+        var rightHome = NormalizeTitle(right.HomeTeamName ?? right.HomeTeam?.Name ?? "");
+        var rightAway = NormalizeTitle(right.AwayTeamName ?? right.AwayTeam?.Name ?? "");
+        if (string.IsNullOrWhiteSpace(leftHome) || string.IsNullOrWhiteSpace(leftAway)
+            || string.IsNullOrWhiteSpace(rightHome) || string.IsNullOrWhiteSpace(rightAway))
+        {
+            return false;
+        }
+
+        return (leftHome.Equals(rightHome, StringComparison.OrdinalIgnoreCase)
+                && leftAway.Equals(rightAway, StringComparison.OrdinalIgnoreCase))
+            || (leftHome.Equals(rightAway, StringComparison.OrdinalIgnoreCase)
+                && leftAway.Equals(rightHome, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsPlausibleEventDate(Event evt, DateTime releaseDate)
+    {
+        var eventDate = (evt.BroadcastDate ?? evt.EventDate.Date).Date;
+        var daysDiff = Math.Abs((eventDate - releaseDate).TotalDays);
+        return daysDiff == 0
+            || (daysDiff <= 1 && (!evt.BroadcastDate.HasValue || !evt.BroadcastDateVerified));
+    }
+
     /// <summary>
     /// Filter a list of releases to only include valid matches for the event.
     /// Returns releases sorted by match confidence.
@@ -1125,7 +1729,9 @@ public class ReleaseMatchingService
     /// <param name="enableMultiPartEpisodes">Whether multi-part episodes are enabled</param>
     public List<(ReleaseSearchResult Release, ReleaseMatchResult Match)> FilterValidReleases(
         List<ReleaseSearchResult> releases, Event evt, string? requestedPart = null, bool enableMultiPartEpisodes = true,
-        IReadOnlyDictionary<int, int?>? earlyReleaseLimitsByIndexer = null)
+        IReadOnlyDictionary<int, int?>? earlyReleaseLimitsByIndexer = null,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        IReadOnlyList<int>? roundRaceNumbers = null)
     {
         var validReleases = new List<(ReleaseSearchResult, ReleaseMatchResult)>();
 
@@ -1133,7 +1739,8 @@ public class ReleaseMatchingService
         {
             var limit = ResolveEarlyReleaseLimit(release, earlyReleaseLimitsByIndexer);
             var matchResult = ValidateRelease(release, evt, requestedPart, enableMultiPartEpisodes,
-                earlyReleaseLimitDays: limit);
+                earlyReleaseLimitDays: limit, roundRaceNumbers: roundRaceNumbers,
+                knownLeagues: knownLeagues);
 
             if (matchResult.IsMatch)
             {
@@ -1151,6 +1758,42 @@ public class ReleaseMatchingService
             .OrderByDescending(x => x.Item2.Confidence)
             .ThenByDescending(x => x.Item1.Score)
             .ToList();
+    }
+
+    private static HashSet<int> ExtractTeamGameNumbers(string title, bool stripReleaseGroup, DateTime? parsedDate = null)
+    {
+        if (stripReleaseGroup && ReleaseGroupParser.Parse(title) is { } group)
+        {
+            // A release group cannot identify a scheduled game.
+            var groupStart = title.LastIndexOf(group, StringComparison.OrdinalIgnoreCase);
+            if (groupStart >= 0 && TeamGameGroupBoundaryPattern.IsMatch(title[..groupStart]))
+                title = title[..groupStart];
+        }
+
+        var numbers = new HashSet<int>();
+        foreach (Match match in TeamGameNumberPattern.Matches(title))
+        {
+            var captures = match.Groups["number"].Captures;
+            var dateEnd = -1;
+            for (var index = 0; index < captures.Count; index++)
+            {
+                var capture = captures[index];
+                if (capture.Index < dateEnd) continue;
+                var number = int.Parse(capture.Value);
+                if (index > 0 && parsedDate.HasValue && capture.Length == 2 && number == parsedDate.Value.Day)
+                {
+                    // A parsed day-month date can follow the game number with a dash.
+                    var month = TeamGameDateMonthPattern.Match(title[(capture.Index + capture.Length)..]);
+                    if (month.Success && int.Parse(month.Groups["month"].Value) == parsedDate.Value.Month)
+                    {
+                        dateEnd = capture.Index + capture.Length + month.Length;
+                        continue;
+                    }
+                }
+                numbers.Add(number);
+            }
+        }
+        return numbers;
     }
 
     /// <summary>
@@ -1208,6 +1851,14 @@ public class ReleaseMatchingService
     /// gather a round's races before it asks for a match.</summary>
     public static int? RaceNumberInTitle(string? title) => ExtractRaceNumber(title);
 
+    public static List<int> RaceNumbersInTitles(IEnumerable<string?> titles) => titles
+        .Select(RaceNumberInTitle)
+        .Where(number => number.HasValue)
+        .Select(number => number!.Value)
+        .Distinct()
+        .OrderBy(number => number)
+        .ToList();
+
     private static int? ExtractRaceNumber(string? title)
     {
         if (string.IsNullOrEmpty(title)) return null;
@@ -1256,18 +1907,116 @@ public class ReleaseMatchingService
     /// Returns 0, 1, or 2.
     /// Uses string fields (always available) with optional Team navigation properties for ShortName access.
     /// </summary>
-    private int ValidateTeamNames(string releaseTitle, string homeTeamName, string awayTeamName, Team? homeTeam = null, Team? awayTeam = null)
+    private int ValidateTeamNames(
+        string releaseTitle,
+        string homeTeamName,
+        string awayTeamName,
+        Team? homeTeam = null,
+        Team? awayTeam = null,
+        League? league = null,
+        IReadOnlyCollection<League>? knownLeagues = null,
+        string? titleHomeName = null,
+        string? titleAwayName = null)
     {
         var normalizedRelease = NormalizeTitle(releaseTitle);
-        int matchCount = 0;
+        var homeMatches = ContainsTeamName(normalizedRelease, homeTeamName, homeTeam) ||
+            (!string.IsNullOrWhiteSpace(titleHomeName) && ContainsTeamName(normalizedRelease, titleHomeName, homeTeam));
+        var awayMatches = ContainsTeamName(normalizedRelease, awayTeamName, awayTeam) ||
+            (!string.IsNullOrWhiteSpace(titleAwayName) && ContainsTeamName(normalizedRelease, titleAwayName, awayTeam));
 
-        if (ContainsTeamName(normalizedRelease, homeTeamName, homeTeam))
-            matchCount++;
+        if (league != null && TitleNamesLeague(releaseTitle, league))
+        {
+            var baseHome = FootballReleaseNamePolicy.BaseParticipantName(titleHomeName ?? homeTeamName, league.Name);
+            var baseAway = FootballReleaseNamePolicy.BaseParticipantName(titleAwayName ?? awayTeamName, league.Name);
+            if (!homeMatches && !baseHome.Equals(titleHomeName ?? homeTeamName, StringComparison.OrdinalIgnoreCase))
+                homeMatches = ContainsTeamName(normalizedRelease, baseHome, homeTeam);
+            if (!awayMatches && !baseAway.Equals(titleAwayName ?? awayTeamName, StringComparison.OrdinalIgnoreCase))
+                awayMatches = ContainsTeamName(normalizedRelease, baseAway, awayTeam);
+        }
 
-        if (ContainsTeamName(normalizedRelease, awayTeamName, awayTeam))
-            matchCount++;
+        var normalizedHomeTeam = NormalizeTitle(homeTeamName);
+        var normalizedAwayTeam = NormalizeTitle(awayTeamName);
+        var homeVariantMatches = !homeMatches
+            && TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, normalizedHomeTeam);
+        var awayVariantMatches = !awayMatches
+            && TeamNameMatcher.ContainsRegularPluralVariant(normalizedRelease, normalizedAwayTeam);
+        if ((homeVariantMatches || awayVariantMatches) && AllowsRegularPluralTeamMatch(
+            releaseTitle,
+            normalizedRelease,
+            league,
+            knownLeagues,
+            normalizedHomeTeam,
+            normalizedAwayTeam))
+        {
+            homeMatches |= homeVariantMatches;
+            awayMatches |= awayVariantMatches;
+        }
 
-        return matchCount;
+        return (homeMatches ? 1 : 0) + (awayMatches ? 1 : 0);
+    }
+
+    internal static bool AllowsRegularPluralTeamMatch(
+        string releaseTitle,
+        string normalizedRelease,
+        League? eventLeague,
+        IReadOnlyCollection<League>? knownLeagues,
+        string normalizedHomeTeam,
+        string normalizedAwayTeam)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedHomeTeam) || string.IsNullOrWhiteSpace(normalizedAwayTeam))
+            return false;
+
+        // Missing library context cannot prove that a league token is absent.
+        if (eventLeague == null || knownLeagues == null || knownLeagues.Count == 0)
+            return false;
+
+        var titleNamesOtherLeague = knownLeagues.Any(league =>
+            !IsSameLeague(league, eventLeague) && TitleNamesLeague(releaseTitle, league));
+        if (titleNamesOtherLeague)
+            return false;
+
+        return TeamNameMatcher.AllowsRegularPluralVariant(
+            normalizedRelease,
+            TitleNamesLeague(releaseTitle, eventLeague),
+            normalizedHomeTeam,
+            normalizedAwayTeam);
+    }
+
+    private static bool IsSameLeague(League left, League right)
+    {
+        if (left.Id != 0 && right.Id != 0)
+            return left.Id == right.Id;
+
+        if (!string.IsNullOrWhiteSpace(left.ExternalId) && !string.IsNullOrWhiteSpace(right.ExternalId))
+            return left.ExternalId.Equals(right.ExternalId, StringComparison.OrdinalIgnoreCase);
+
+        return left.Name.Equals(right.Name, StringComparison.OrdinalIgnoreCase)
+            && LeagueSportRules.AreEquivalentSports(left.Sport, right.Sport);
+    }
+
+    private (string? HomeAlias, string? AwayAlias) ResolveTitleTeamAliases(Event evt)
+    {
+        if (string.IsNullOrWhiteSpace(evt.Title)) return (null, null);
+
+        var titleTeams = Regex.Split(evt.Title, @"\s+vs\.?\s+", RegexOptions.IgnoreCase)
+            .Select(name => name.Trim())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToArray();
+        if (titleTeams.Length != 2) return (null, null);
+
+        var first = NormalizeTitle(titleTeams[0]);
+        var second = NormalizeTitle(titleTeams[1]);
+        var alignedEvidence =
+            (ContainsTeamName(first, evt.HomeTeamName!, evt.HomeTeam) ? 1 : 0) +
+            (ContainsTeamName(second, evt.AwayTeamName!, evt.AwayTeam) ? 1 : 0);
+        var reversedEvidence =
+            (ContainsTeamName(first, evt.AwayTeamName!, evt.AwayTeam) ? 1 : 0) +
+            (ContainsTeamName(second, evt.HomeTeamName!, evt.HomeTeam) ? 1 : 0);
+
+        if (alignedEvidence == reversedEvidence) return (null, null);
+        return alignedEvidence > reversedEvidence
+            ? (titleTeams[0], titleTeams[1])
+            : (titleTeams[1], titleTeams[0]);
     }
 
     /// <summary>
@@ -1275,7 +2024,10 @@ public class ReleaseMatchingService
     /// Uses the team name string (always available) with optional Team nav property for ShortName.
     /// Checks against TeamNameVariationData for comprehensive abbreviation/nickname coverage.
     /// </summary>
-    private bool ContainsTeamName(string normalizedRelease, string teamName, Team? team = null)
+    private bool ContainsTeamName(
+        string normalizedRelease,
+        string teamName,
+        Team? team = null)
     {
         var normalizedName = NormalizeTitle(teamName);
 
@@ -1381,6 +2133,22 @@ public class ReleaseMatchingService
         }
 
         return false;
+    }
+
+    private static bool ContainsCanonicalTeamOrUserAlias(
+        string normalizedRelease,
+        string teamName,
+        Team? team)
+    {
+        if (ContainsWholeWord(normalizedRelease, NormalizeTitle(teamName)))
+            return true;
+
+        if (team == null || string.IsNullOrWhiteSpace(team.UserAliases))
+            return false;
+
+        return SplitAliases(team.UserAliases)
+            .Select(NormalizeTitle)
+            .Any(alias => ContainsWholeWord(normalizedRelease, alias));
     }
 
     /// <summary>
@@ -1613,6 +2381,9 @@ public class ReleaseMatchingService
                 yield return alias;
         }
 
+        foreach (var alias in FootballReleaseNamePolicy.LeagueAliases(league))
+            yield return alias;
+
         // "<Word> <number>" series conventionally abbreviate to first letter
         // + number (Formula 1 → F1). Generated so leagues whose upstream
         // record carries no alternate names still match the common form.
@@ -1720,15 +2491,35 @@ public class ReleaseMatchingService
         return text;
     }
 
+    private static bool IsPreviewContent(string releaseTitle)
+    {
+        // A group after a codec must not declare the program type.
+        // Keep earlier title tokens even when the reported group says Preview.
+        var groupSuffix = PreviewReleaseGroupSuffixPattern.Match(releaseTitle);
+        var contentEnd = groupSuffix.Success ? groupSuffix.Index : releaseTitle.Length;
+        if (groupSuffix.Success)
+        {
+            // A new technical segment separates title content from the final group.
+            // A codec token alone can still belong to the first group.
+            foreach (Match technicalSuffix in PreviewRenewedTechnicalSuffixPattern.Matches(releaseTitle))
+            {
+                if (technicalSuffix.Index > contentEnd)
+                    contentEnd = technicalSuffix.Index;
+            }
+        }
+        return PreviewContentPattern.IsMatch(releaseTitle[..contentEnd]);
+    }
+
     /// <summary>
     /// Detect if a release is non-event content (press conference, interview, etc.)
     /// Returns the type of non-event content detected, or null if it appears to be actual event content.
     /// </summary>
     private string? DetectNonEventContent(string releaseTitle)
     {
+        var searchableTitle = releaseTitle.Replace('_', ' ');
         foreach (var pattern in NonEventContentPatterns)
         {
-            var match = pattern.Match(releaseTitle);
+            var match = pattern.Match(searchableTitle);
             if (match.Success)
             {
                 // Return a human-readable description of what was detected
@@ -1745,6 +2536,8 @@ public class ReleaseMatchingService
                     return "Pre-show";
                 if (detected.Contains("post"))
                     return "Post-event Show";
+                if (detected.Contains("f1") && detected.Contains("show"))
+                    return "F1 Show";
                 if (detected.Contains("weigh") && detected.Contains("in"))
                     return "Weigh-in";
                 if (detected.Contains("face") && detected.Contains("off"))
@@ -1787,6 +2580,8 @@ public class ReleaseMatchingService
                     return "Full Weekend Compilation";
                 if (detected.Contains("launch"))
                     return "Car/Season Launch";
+                if (detected.Contains("test") && detected.Contains("upload"))
+                    return "Tracker test upload";
                 if (detected.Contains("condensed"))
                     return "Condensed cut (not the full event)";
                 if (detected.Contains("22"))
@@ -1946,6 +2741,10 @@ public class ReleaseMatchingService
             if (matches.Count == 0) continue;
 
             var sportLower = sport.ToLowerInvariant();
+            if (LeagueReleaseNamePolicy.AllowsCrossSportLabel(releaseTitle, evt, sport))
+            {
+                continue;
+            }
 
             // Does this identifier describe the event's own series? All four
             // tests below decide that for the pattern as a whole, so they are
@@ -2193,6 +2992,123 @@ public class ReleaseMatchingService
 
         return null;
     }
+
+    private static int? ExtractReleaseStageNumber(string title)
+    {
+        var match = ReleaseStagePattern.Match(title);
+        return match.Success && int.TryParse(match.Groups[1].Value, out var stage) ? stage : null;
+    }
+
+    private static int? ExtractRallyStageNumber(string title)
+    {
+        var match = RallyStagePattern.Match(title);
+        return match.Success && int.TryParse(match.Groups[1].Value, out var stage) ? stage : null;
+    }
+
+    private static bool TryExtractStandaloneYear(string title, out int year)
+    {
+        year = 0;
+        var match = StandaloneYearPattern.Match(title);
+        return match.Success && int.TryParse(match.Groups["year"].Value, out year);
+    }
+
+    private static bool HasStrongIndividualTitleIdentity(string releaseTitle, string eventTitle)
+    {
+        var eventWords = Regex.Matches(eventTitle, @"[\p{L}\p{M}\p{N}]+")
+            .Select(match => CanonicalIndividualWord(match.Value))
+            .Where(word => word.Length > 1 && !word.All(char.IsDigit) &&
+                !StopWords.Contains(word) && !GenericEventWords.Contains(word))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var releaseWords = Regex.Matches(releaseTitle, @"[\p{L}\p{M}\p{N}]+")
+            .Select(match => CanonicalIndividualWord(match.Value))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return eventWords.Length >= 2 && eventWords.All(releaseWords.Contains);
+    }
+
+    private static string CanonicalIndividualWord(string word) => word.ToLowerInvariant() switch
+    {
+        "womens" or "female" or "femme" or "femmes" => "women",
+        "mens" or "male" or "homme" or "hommes" => "men",
+        _ => word.ToLowerInvariant()
+    };
+
+    private static int? ExtractGolfRoundNumber(string title)
+    {
+        var numeric = GolfNumberedRoundPattern.Match(title);
+        if (numeric.Success && int.TryParse(numeric.Groups["round"].Value, out var round)) return round;
+
+        var ordinal = GolfOrdinalRoundPattern.Match(title);
+        if (ordinal.Success && int.TryParse(ordinal.Groups["round"].Value, out round)) return round;
+
+        var named = GolfNamedRoundPattern.Match(title);
+        if (!named.Success) return null;
+        return named.Groups["round"].Value.ToLowerInvariant() switch
+        {
+            "first" => 1,
+            "second" => 2,
+            "third" => 3,
+            "fourth" or "final" => 4,
+            _ => null
+        };
+    }
+
+    private static bool GolfTournamentIdentityMatches(string releaseTitle, string eventTitle)
+    {
+        if (Regex.IsMatch(eventTitle, @"\bmasters\s+tournament\b", RegexOptions.IgnoreCase))
+        {
+            return Regex.IsMatch(releaseTitle,
+                @"\b(?:the\s+)?augusta\s+masters\b|\bthe\s+masters\b|\bmasters\s+tournament\b",
+                RegexOptions.IgnoreCase);
+        }
+
+        if (Regex.IsMatch(eventTitle, @"\bkpmg\b.*\bwomens?\b.*\bpga\s+championship\b", RegexOptions.IgnoreCase))
+        {
+            return Regex.IsMatch(releaseTitle, @"\bkpmg\b.*\bwomens?\b.*\bpga\s+championship\b", RegexOptions.IgnoreCase);
+        }
+
+        if (Regex.IsMatch(eventTitle, @"\bu\s+s\s+womens?\s+open\b", RegexOptions.IgnoreCase))
+        {
+            return Regex.IsMatch(releaseTitle, @"\bu\s+s\s+womens?\s+open\b", RegexOptions.IgnoreCase);
+        }
+
+        if (Regex.IsMatch(eventTitle, @"\bamundi\b.*\bevian\b", RegexOptions.IgnoreCase))
+        {
+            return Regex.IsMatch(releaseTitle, @"\b(?:amundi\b.*)?\bevian\s+championship\b", RegexOptions.IgnoreCase);
+        }
+
+        if (Regex.IsMatch(eventTitle, @"\bthe\s+open\s+championship\b", RegexOptions.IgnoreCase))
+        {
+            return Regex.IsMatch(releaseTitle, @"\bthe\s+open(?:\s+championship)?\b", RegexOptions.IgnoreCase);
+        }
+
+        if (Regex.IsMatch(eventTitle, @"\bpga\s+championship\b", RegexOptions.IgnoreCase))
+        {
+            return GolfPgaDivision(eventTitle) == GolfPgaDivision(releaseTitle) &&
+                Regex.IsMatch(releaseTitle, @"\b(?:us\s*)?pga\s+championship\b", RegexOptions.IgnoreCase);
+        }
+
+        return false;
+    }
+
+    private static int GolfPgaDivision(string title)
+    {
+        if (WomensCategoryPattern.IsMatch(title) ||
+            Regex.IsMatch(title, @"\b(?:kpmg|lpga)\b", RegexOptions.IgnoreCase))
+        {
+            return 1;
+        }
+
+        return Regex.IsMatch(title,
+            @"\b(?:senior|seniors|pga\s+tour\s+champions)\b",
+            RegexOptions.IgnoreCase) ? 2 : 0;
+    }
+
+    private static bool HasKnownGolfTournamentIdentity(string eventTitle) =>
+        Regex.IsMatch(eventTitle,
+            @"\b(?:masters\s+tournament|kpmg|u\s+s\s+womens?\s+open|amundi|the\s+open\s+championship|pga\s+championship)\b",
+            RegexOptions.IgnoreCase);
 
     /// <summary>
     /// Extract day number from a title (e.g., "Day 1", "Day Two", "Day.2").

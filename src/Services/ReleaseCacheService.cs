@@ -1,5 +1,6 @@
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
+using Sportarr.Api.Helpers;
 using Microsoft.EntityFrameworkCore;
 using System.Text.RegularExpressions;
 
@@ -80,6 +81,14 @@ public class ReleaseCacheService
                     existing.Seeders = release.Seeders;
                     existing.Leechers = release.Leechers;
                     existing.ExpiresAt = DateTime.UtcNow.Add(DefaultCacheTtl);
+                    existing.SportPrefix = BasketballLeagueIdentity.Detect(existing.Title) ?? existing.SportPrefix;
+
+                    ParsedRelease? reparsed = null;
+                    if (existing.SportPrefix == null || existing.Month == null)
+                    {
+                        reparsed = ParseReleaseTitle(existing.Title);
+                        existing.SportPrefix ??= reparsed.SportPrefix;
+                    }
 
                     // Rows cached before the parser learned space-separated
                     // dates carry no month and day, and an indexer that keeps
@@ -89,7 +98,7 @@ public class ReleaseCacheService
                     // veto.
                     if (existing.Month == null)
                     {
-                        var reparsed = ParseReleaseTitle(existing.Title);
+                        reparsed ??= ParseReleaseTitle(existing.Title);
                         if (reparsed.Month.HasValue)
                         {
                             existing.Year = reparsed.Year;
@@ -189,6 +198,19 @@ public class ReleaseCacheService
         CancellationToken cancellationToken = default)
     {
         var results = new List<ReleaseSearchResult>();
+        var knownLeagues = await LeagueMatchContext.LoadAsync(_db, cancellationToken);
+        List<int>? roundRaceNumbers = null;
+        if (!string.IsNullOrEmpty(evt.Round) &&
+            evt.League?.Name.Contains("Supercars", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            var roundTitles = await _db.Events
+                .AsNoTracking()
+                .Where(candidate => candidate.LeagueId == evt.LeagueId &&
+                    candidate.Season == evt.Season && candidate.Round == evt.Round)
+                .Select(candidate => candidate.Title)
+                .ToListAsync(cancellationToken);
+            roundRaceNumbers = ReleaseMatchingService.RaceNumbersInTitles(roundTitles);
+        }
 
         // Build search terms from event
         var eventSearchTerms = BuildEventSearchTerms(evt);
@@ -209,7 +231,16 @@ public class ReleaseCacheService
         // STRICT: Year must match (don't allow null years through for known sports)
         if (brandingYear > 0)
         {
-            query = query.Where(r => r.Year == brandingYear);
+            if (sportPrefix == "BBL" &&
+                Regex.Match(evt.Season ?? string.Empty, @"^(?<start>20[0-9]{2})-(?<end>[0-9]{2}|20[0-9]{2})$") is { Success: true } season &&
+                int.TryParse(season.Groups["start"].Value, out var seasonStart))
+            {
+                query = query.Where(r => r.Year == brandingYear || r.Year == seasonStart);
+            }
+            else
+            {
+                query = query.Where(r => r.Year == brandingYear);
+            }
         }
 
         // STRICT: Sport prefix must match for known sports
@@ -218,7 +249,12 @@ public class ReleaseCacheService
         {
             // For known sports, REQUIRE the sport prefix to match exactly
             // Releases without a detected sport prefix won't match sports events
-            query = query.Where(r => r.SportPrefix == sportPrefix);
+            query = sportPrefix == "WNBA"
+                ? query.Where(r => r.SportPrefix == sportPrefix ||
+                    ((r.SportPrefix == "NBA" || r.SportPrefix == null) &&
+                     (r.Title.ToUpper().Contains("WNBA") ||
+                      (r.Title.ToUpper().Contains("WOMEN") && r.Title.ToUpper().Contains("BASKETBALL")))))
+                : query.Where(r => r.SportPrefix == sportPrefix);
         }
 
         // Load candidates and do full matching in memory
@@ -239,8 +275,10 @@ public class ReleaseCacheService
                 cached.Month,
                 cached.Day,
                 cached.RoundNumber,
-                cached.SportPrefix,
-                evt);
+                BasketballLeagueIdentity.Detect(cached.Title) ?? cached.SportPrefix,
+                evt,
+                knownLeagues,
+                roundRaceNumbers);
 
             if (matchScore >= ReleaseMatchScorer.MinimumMatchScore)
             {
@@ -386,7 +424,7 @@ public class ReleaseCacheService
         var parsed = new ParsedRelease();
 
         // Extract year (4 digits, 2020+)
-        var yearMatch = Regex.Match(title, @"\b((?:19[3-9]\d|20\d\d))\b");
+        var yearMatch = Regex.Match(title, @"(?<![0-9])((?:19[3-9]\d|20\d\d))(?![0-9])");
         if (yearMatch.Success)
             parsed.Year = int.Parse(yearMatch.Groups[1].Value);
 
@@ -397,7 +435,7 @@ public class ReleaseCacheService
 
         // Extract date. Dots, hyphens, and spaces all appear in the wild
         // (YYYY.MM.DD, YYYY-MM-DD, YYYY MM DD).
-        var dateMatch = Regex.Match(title, @"\b((?:19[3-9]\d|20\d\d))[.\-\s](\d{2})[.\-\s](\d{2})\b");
+        var dateMatch = Regex.Match(title, @"(?<![0-9])((?:19[3-9]\d|20\d\d))[.\-\s](\d{2})[.\-\s](\d{2})(?![0-9])");
         if (dateMatch.Success)
         {
             parsed.Year = int.Parse(dateMatch.Groups[1].Value);
@@ -470,8 +508,12 @@ public class ReleaseCacheService
         // Team sports
         if (normalized.Contains("NFL") && !normalized.Contains("UEFA"))
             return "NFL";
-        if (normalized.Contains("NBA"))
-            return "NBA";
+        if (CricketRugbyReleaseNamePolicy.ReleaseLeagueKey(title) is { } cricketRugbyLeague)
+            return cricketRugbyLeague;
+        if (LeagueReleaseNamePolicy.ReleaseLeagueKey(title) is { } priorityLeague)
+            return priorityLeague;
+        if (BasketballLeagueIdentity.Detect(title) is { } basketballLeague)
+            return basketballLeague;
         if (normalized.Contains("NHL"))
             return "NHL";
         if (normalized.Contains("MLB"))

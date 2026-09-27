@@ -1,322 +1,213 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
-import { useSettings } from '../useSettings';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
-// Mock fetch globally
-const mockFetch = vi.fn();
-(globalThis as unknown as { fetch: typeof fetch }).fetch = mockFetch;
+type SettingsHook = typeof import('../useSettings')['useSettings'];
+type Call = { path: string; method: string; headers: Headers; body: string | null };
+const apiKey = 'owned-settings-test-key';
+const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { 'Content-Type': 'application/json' },
+});
+let useSettings: SettingsHook;
+let calls: Call[];
+let violations: string[];
+let current: Record<string, unknown>;
+let getFailure: Error | undefined;
+let putFailure: Error | undefined;
+let getStatus: number;
+let holdGet: Promise<void> | undefined;
+let releaseGet: (() => void) | undefined;
+let inFlight: Set<Promise<Response>>;
+let ownedLoads: Array<() => boolean>;
+let savedSportarr: PropertyDescriptor | undefined;
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ useSettings } = await import('../useSettings'));
+  calls = [];
+  violations = [];
+  current = { id: 1, hostSettings: '{"port":1867}', uiSettings: '{}', lastModified: '2024-01-01T00:00:00Z' };
+  getFailure = undefined;
+  putFailure = undefined;
+  getStatus = 200;
+  holdGet = undefined;
+  releaseGet = undefined;
+  inFlight = new Set();
+  ownedLoads = [];
+  savedSportarr = Object.getOwnPropertyDescriptor(window, 'Sportarr');
+  Object.defineProperty(window, 'Sportarr', { value: { urlBase: '' }, configurable: true, writable: true });
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const task = (async () => {
+      const path = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? 'GET';
+      const headers = new Headers(init?.headers);
+      calls.push({ path, method, headers, body: typeof init?.body === 'string' ? init.body : null });
+      if (headers.get('Accept') !== 'application/json') violations.push('Missing JSON Accept header');
+      if (path === '/initialize.json' && method === 'GET') return jsonResponse({ apiKey });
+      if (path !== '/api/settings' || !['GET', 'PUT'].includes(method)) {
+        violations.push(`Unexpected request ${method} ${path}`);
+        throw new Error('Unexpected settings request');
+      }
+      if (headers.get('X-Api-Key') !== apiKey || init?.credentials !== 'include') {
+        violations.push('Settings request did not preserve authentication');
+      }
+      if (method === 'GET') {
+        if (holdGet) await holdGet;
+        if (getFailure) throw getFailure;
+        return jsonResponse(current, getStatus);
+      }
+      if (headers.get('Content-Type') !== 'application/json' || typeof init?.body !== 'string') {
+        violations.push('PUT did not carry JSON');
+        throw new Error('Expected settings JSON');
+      }
+      if (putFailure) throw putFailure;
+      current = JSON.parse(init.body);
+      return jsonResponse(current);
+    })();
+    inFlight.add(task);
+    void task.then(() => inFlight.delete(task), () => inFlight.delete(task));
+    return task;
+  }));
+});
+
+afterEach(async () => {
+  releaseGet?.();
+  try {
+    await act(async () => { await Promise.allSettled([...inFlight]); });
+    await waitFor(() => expect(ownedLoads.every(loading => !loading())).toBe(true));
+    expect(inFlight.size).toBe(0);
+    expect(violations).toEqual([]);
+  } finally {
+    cleanup();
+    vi.unstubAllGlobals();
+    if (savedSportarr) Object.defineProperty(window, 'Sportarr', savedSportarr);
+    else Reflect.deleteProperty(window, 'Sportarr');
+    vi.restoreAllMocks();
+  }
+});
+
+async function loaded(result: { current: [unknown, unknown, boolean] }) {
+  await waitFor(() => expect(result.current[2]).toBe(false));
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    'GET /initialize.json', 'GET /api/settings',
+  ]);
+}
+
+function putCall() {
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    'GET /initialize.json', 'GET /api/settings', 'GET /api/settings', 'PUT /api/settings',
+  ]);
+  return calls[3];
+}
 
 describe('useSettings', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('should initialize with default value', () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 1,
-        hostSettings: '{}',
-        lastModified: '2024-01-01T00:00:00Z',
-      }),
-    });
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
+  it('should initialize with default value', async () => {
+    current.hostSettings = '{"port":8080}';
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
     expect(result.current[0]).toEqual({ port: 1867 });
-    expect(result.current[2]).toBe(true); // loading
+    expect(result.current[2]).toBe(true);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 8080 });
   });
 
   it('should fetch settings on mount', async () => {
-    const mockHostSettings = {
-      bindAddress: '*',
-      port: 1867,
-      instanceName: 'Sportarr',
-    };
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 1,
-        hostSettings: JSON.stringify(mockHostSettings),
-        lastModified: '2024-01-01T00:00:00Z',
-      }),
-    });
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false); // loading finished
-    });
-
-    expect(mockFetch).toHaveBeenCalledWith('/api/settings');
-    expect(result.current[0]).toEqual(mockHostSettings);
+    current.hostSettings = '{"bindAddress":"*","port":1867,"instanceName":"Sportarr"}';
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 8080 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ bindAddress: '*', port: 1867, instanceName: 'Sportarr' });
   });
 
   it('should handle fetch error gracefully', async () => {
+    const error = new Error('Network error');
+    getFailure = error;
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
-
-    const defaultValue = { port: 1867 };
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', defaultValue)
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false); // loading finished
-    });
-
-    expect(result.current[0]).toEqual(defaultValue); // Should keep default value
-    expect(consoleSpy).toHaveBeenCalled();
-
-    consoleSpy.mockRestore();
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 1867 });
+    expect(consoleSpy).toHaveBeenCalledWith('Failed to fetch hostSettings:', error);
   });
 
   it('should save settings correctly', async () => {
-    const currentSettings = {
-      id: 1,
-      hostSettings: JSON.stringify({ port: 1867 }),
-      uiSettings: '{}',
-      lastModified: '2024-01-01T00:00:00Z',
-    };
-
-    const newHostSettings = {
-      port: 8080,
-      bindAddress: '0.0.0.0',
-    };
-
-    // Mock initial fetch
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => currentSettings,
-    });
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    // Mock fetch for save operation (fetch current settings)
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => currentSettings,
-    });
-
-    // Mock save response
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ ...currentSettings, hostSettings: JSON.stringify(newHostSettings) }),
-    });
-
-    // Call save function
-    await result.current[1](newHostSettings);
-
-    // Check that save was called with PUT method and correct data
-    // Note: The implementation fetches current settings, then saves the full object
-    const putCalls = mockFetch.mock.calls.filter(call =>
-      call[0] === '/api/settings' && call[1]?.method === 'PUT'
-    );
-    expect(putCalls.length).toBeGreaterThan(0);
-
-    const lastPutCall = putCalls[putCalls.length - 1];
-    expect(lastPutCall[1]).toMatchObject({
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    // The body contains the full settings object with hostSettings as a stringified JSON
-    // So we need to check for the escaped version
-    const bodyObj = JSON.parse(lastPutCall[1].body);
-    expect(bodyObj.hostSettings).toBe(JSON.stringify(newHostSettings));
-
-    // Check that local state was updated (need to wait for state update)
-    await waitFor(() => {
-      expect(result.current[0]).toEqual(newHostSettings);
-    });
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867, bindAddress: '*' }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    await act(async () => { await result.current[1]({ port: 8080, bindAddress: '0.0.0.0' }); });
+    const sent = JSON.parse(putCall().body!);
+    expect(sent.hostSettings).toBe('{"port":8080,"bindAddress":"0.0.0.0"}');
+    expect(sent.id).toBe(1);
+    expect(sent.uiSettings).toBe('{}');
+    expect(result.current[0]).toEqual({ port: 8080, bindAddress: '0.0.0.0' });
   });
 
   it('should handle save error', async () => {
+    const error = new Error('Save failed');
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    // Mock initial fetch
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 1,
-        hostSettings: JSON.stringify({ port: 1867 }),
-        lastModified: '2024-01-01T00:00:00Z',
-      }),
-    });
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    // Mock fetch for save (fails)
-    mockFetch.mockRejectedValueOnce(new Error('Save failed'));
-
-    // Attempt to save should throw
-    await expect(result.current[1]({ port: 8080 })).rejects.toThrow();
-
-    expect(consoleSpy).toHaveBeenCalled();
-
-    consoleSpy.mockRestore();
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    putFailure = error;
+    await act(async () => { await expect(result.current[1]({ port: 8080 })).rejects.toBe(error); });
+    expect(JSON.parse(putCall().body!).hostSettings).toBe('{"port":8080}');
+    expect(result.current[0]).toEqual({ port: 1867 });
+    expect(consoleSpy).toHaveBeenCalledWith('Failed to save hostSettings:', error);
   });
 
   it('should handle malformed JSON gracefully', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 1,
-        hostSettings: 'invalid json{',
-        lastModified: '2024-01-01T00:00:00Z',
-      }),
-    });
-
-    const defaultValue = { port: 1867 };
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', defaultValue)
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    // Should keep default value when JSON parsing fails
-    expect(result.current[0]).toEqual(defaultValue);
+    current.hostSettings = 'invalid json{';
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 1867 });
+    expect(consoleSpy).toHaveBeenCalledWith('Failed to fetch hostSettings:', expect.any(SyntaxError));
   });
 
   it('should handle 404 response', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 404,
-      json: async () => ({}),
-    });
-
-    const defaultValue = { port: 1867 };
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', defaultValue)
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    expect(result.current[0]).toEqual(defaultValue);
+    getStatus = 404;
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 1867 });
   });
 
   it('should update loading state correctly', async () => {
-    mockFetch.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(() => {
-            resolve({
-              ok: true,
-              json: async () => ({
-                id: 1,
-                hostSettings: '{"port":1867}',
-                lastModified: '2024-01-01T00:00:00Z',
-              }),
-            });
-          }, 100);
-        })
-    );
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
-    // Initially loading
-    expect(result.current[2]).toBe(true);
-
-    // After fetch completes
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
+    holdGet = new Promise<void>(resolve => { releaseGet = resolve; });
+    current.hostSettings = '{"port":8080}';
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    try {
+      await waitFor(() => expect(calls.some(call => call.path === '/api/settings')).toBe(true));
+      expect(result.current[2]).toBe(true);
+      expect(result.current[0]).toEqual({ port: 1867 });
+    } finally {
+      await act(async () => { releaseGet!(); await Promise.allSettled([...inFlight]); });
+    }
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 8080 });
   });
 
   it('should preserve other settings when saving', async () => {
-    const currentSettings = {
-      id: 1,
-      hostSettings: JSON.stringify({ port: 1867 }),
-      uiSettings: JSON.stringify({ theme: 'dark' }),
-      securitySettings: JSON.stringify({ apiKey: 'secret' }),
-      lastModified: '2024-01-01T00:00:00Z',
-    };
-
-    // Mock initial fetch
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => currentSettings,
-    });
-
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', { port: 1867 })
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    // Mock fetch for save
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => currentSettings,
-    });
-
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => currentSettings,
-    });
-
-    await result.current[1]({ port: 8080 });
-
-    // Check that other settings were preserved
-    const saveCall = mockFetch.mock.calls.find(
-      (call) => call[1]?.method === 'PUT'
-    );
-
-    expect(saveCall).toBeDefined();
-
-    const savedData = JSON.parse(saveCall![1].body);
-    expect(savedData.uiSettings).toBe(currentSettings.uiSettings);
-    expect(savedData.securitySettings).toBe(currentSettings.securitySettings);
+    current.uiSettings = '{"theme":"dark"}';
+    current.securitySettings = '{"apiKey":"owned-fixture-secret"}';
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    current.uiSettings = '{"theme":"light"}';
+    await act(async () => { await result.current[1]({ port: 8080 }); });
+    const sent = JSON.parse(putCall().body!);
+    expect(sent.hostSettings).toBe('{"port":8080}');
+    expect(sent.uiSettings).toBe('{"theme":"light"}');
+    expect(sent.securitySettings).toBe('{"apiKey":"owned-fixture-secret"}');
+    expect(result.current[0]).toEqual({ port: 8080 });
   });
 
   it('should handle empty settings key', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 1,
-        hostSettings: '',
-        lastModified: '2024-01-01T00:00:00Z',
-      }),
-    });
-
-    const defaultValue = { port: 1867 };
-    const { result } = renderHook(() =>
-      useSettings('hostSettings', defaultValue)
-    );
-
-    await waitFor(() => {
-      expect(result.current[2]).toBe(false);
-    });
-
-    expect(result.current[0]).toEqual(defaultValue);
+    current.hostSettings = '';
+    const { result } = renderHook(() => useSettings('hostSettings', { port: 1867 }));
+    ownedLoads.push(() => result.current[2]);
+    await loaded(result);
+    expect(result.current[0]).toEqual({ port: 1867 });
   });
 });

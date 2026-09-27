@@ -68,7 +68,8 @@ public class SabnzbdAddUrlModeTests
         handler.Post.Should().NotBeNull();
 
         var query = handler.Post!.RequestUri!.Query;
-        query.Should().Contain("mode=addurl").And.Contain("output=json").And.Contain("apikey=k3y");
+        query.Should().Contain("mode=addurl").And.Contain("output=json").And.Contain("apikey=k3y")
+            .And.Contain("category=sports");
         handler.PostBody.Should().Contain("name=http").And.Contain("cat=sports").And.Contain("nzbname=UFC.330.1080p.WEB");
 
         Keys(query).Intersect(Keys(handler.PostBody!)).Should().BeEmpty(
@@ -102,6 +103,6 @@ public class SabnzbdAddUrlModeTests
 
         var keys = Keys(handler.FallbackGet!.RequestUri!.Query);
         keys.Should().OnlyHaveUniqueItems("a duplicated ma_username or ma_password fails SABnzbd's credential check");
-        keys.Should().Contain(new[] { "mode", "name", "cat", "output", "nzbname", "ma_username", "ma_password" });
+        keys.Should().Contain(new[] { "mode", "name", "cat", "category", "output", "nzbname", "ma_username", "ma_password" });
     }
 }

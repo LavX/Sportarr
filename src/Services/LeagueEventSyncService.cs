@@ -1530,6 +1530,28 @@ public class LeagueEventSyncService
         }
     }
 
+    internal static (bool Changed, bool DateChanged) ApplyBroadcastDate(Event existingEvent, Event apiEvent)
+    {
+        if (!apiEvent.BroadcastDate.HasValue)
+            return (false, false);
+
+        var dateChanged = existingEvent.BroadcastDate != apiEvent.BroadcastDate;
+        if (dateChanged)
+        {
+            existingEvent.BroadcastDate = apiEvent.BroadcastDate;
+            existingEvent.BroadcastDateVerified = !apiEvent.BroadcastDateIsFallback;
+            return (true, true);
+        }
+
+        if (!apiEvent.BroadcastDateIsFallback && !existingEvent.BroadcastDateVerified)
+        {
+            existingEvent.BroadcastDateVerified = true;
+            return (true, false);
+        }
+
+        return (false, false);
+    }
+
     /// <summary>
     /// Process a single event from Sportarr API API
     /// </summary>
@@ -1698,29 +1720,33 @@ public class LeagueEventSyncService
             // when leagues.broadcast_timezone changes). Flag the season for
             // renumber + rename so existing files pick up the new branding
             // calendar date in their filename.
-            // An equal wire-served date still upgrades provenance: a legacy
-            // UTC backfill that happened to match must not keep the
-            // exact-day matching rule disarmed forever.
-            if (apiEvent.BroadcastDate.HasValue && !apiEvent.BroadcastDateIsFallback
-                && !existingEvent.BroadcastDateVerified
-                && existingEvent.BroadcastDate == apiEvent.BroadcastDate)
+            // An equal API date can still upgrade provenance.
+            // A legacy UTC fallback can match the API date.
+            var oldBroadcastDate = existingEvent.BroadcastDate;
+            var broadcastDateUpdate = ApplyBroadcastDate(existingEvent, apiEvent);
+            if (broadcastDateUpdate.Changed)
             {
-                existingEvent.BroadcastDateVerified = true;
-            }
-            if (apiEvent.BroadcastDate.HasValue && existingEvent.BroadcastDate != apiEvent.BroadcastDate)
-            {
-                _logger.LogInformation("[League Event Sync] Broadcast date changed for '{EventTitle}': {OldDate} → {NewDate}",
-                    apiEvent.Title,
-                    existingEvent.BroadcastDate?.ToString("yyyy-MM-dd") ?? "null",
-                    apiEvent.BroadcastDate.Value.ToString("yyyy-MM-dd"));
-                existingEvent.BroadcastDate = apiEvent.BroadcastDate;
-                existingEvent.BroadcastDateVerified = !apiEvent.BroadcastDateIsFallback;
-                dateChanged = true;
                 needsUpdate = true;
 
-                if (!string.IsNullOrEmpty(apiEvent.Season))
+                if (broadcastDateUpdate.DateChanged)
                 {
-                    _seasonsNeedingRenumber.Add((league.Id, apiEvent.Season));
+                    _logger.LogInformation("[League Event Sync] Broadcast date changed for '{EventTitle}': {OldDate} → {NewDate}",
+                        apiEvent.Title,
+                        oldBroadcastDate?.ToString("yyyy-MM-dd") ?? "null",
+                        existingEvent.BroadcastDate?.ToString("yyyy-MM-dd") ?? "null");
+                    dateChanged = true;
+
+                    if (!string.IsNullOrEmpty(apiEvent.Season))
+                    {
+                        _seasonsNeedingRenumber.Add((league.Id, apiEvent.Season));
+                    }
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "[League Event Sync] Verified broadcast date for '{EventTitle}': {Date}",
+                        apiEvent.Title,
+                        existingEvent.BroadcastDate?.ToString("yyyy-MM-dd") ?? "null");
                 }
             }
 

@@ -31,7 +31,7 @@ public class QueueRemovalValidationTests : IDisposable
         return new SportarrDbContext(options);
     }
 
-    private QueueRemovalService CreateService(SportarrDbContext db)
+    private QueueRemovalService CreateService(SportarrDbContext db, SearchQueueService? replacementQueue = null)
     {
         Directory.CreateDirectory(_tempDataPath);
         var configService = new ConfigService(
@@ -46,10 +46,10 @@ public class QueueRemovalValidationTests : IDisposable
             Mock.Of<ILogger<DownloadClientService>>(),
             new MemoryCache(new MemoryCacheOptions()),
             configService,
-            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>());
+            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>(), new DownloadOwnershipCoordinator());
 
-        var searchQueue = new SearchQueueService(
-            new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
+        var searchQueue = replacementQueue ?? new SearchQueueService(
+            new ServiceCollection().AddSingleton(db).BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
             Mock.Of<ILogger<SearchQueueService>>());
 
         return new QueueRemovalService(db, downloadClientService, searchQueue,
@@ -99,6 +99,92 @@ public class QueueRemovalValidationTests : IDisposable
         var result = await CreateService(db).RemoveAsync(42, "removeFromClient", "none");
 
         result.StatusCode.Should().Be(404);
+    }
+
+    [Fact]
+    public async Task Blocklist_and_search_preserves_the_removed_part()
+    {
+        using var db = CreateDb();
+        var evt = new Event { Id = 19, Title = "UFC 9999", Sport = "Fighting" };
+        db.Events.Add(evt);
+        db.DownloadQueue.Add(new DownloadQueueItem
+        {
+            Id = 1,
+            EventId = evt.Id,
+            Title = "UFC.9999.Prelims.720p.WEB-DL",
+            DownloadId = "part-download",
+            Status = DownloadStatus.Downloading,
+            Part = "Prelims",
+            Indexer = "Fixture",
+            Protocol = "Usenet"
+        });
+        await db.SaveChangesAsync();
+
+        var result = await CreateService(db).RemoveAsync(1, "ignoreDownload", "blocklistAndSearch");
+
+        result.StatusCode.Should().Be(204);
+        (await db.Blocklist.SingleAsync()).Part.Should().Be("Prelims");
+        (await db.Tasks.SingleAsync()).Body.Should().Be($"{evt.Id}|Prelims");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Unknown")]
+    [InlineData("")]
+    public async Task Unknown_source_is_stored_without_a_literal_indexer(string? indexer)
+    {
+        using var db = CreateDb();
+        db.Events.Add(new Event { Id = 1, Title = "Fixture event", Sport = "Fighting" });
+        var item = QueueItem(); item.EventId = 1; item.Indexer = indexer; db.DownloadQueue.Add(item);
+        await db.SaveChangesAsync();
+        await CreateService(db).RemoveAsync(1, "ignoreDownload", "blocklistOnly");
+        (await db.Blocklist.SingleAsync()).Indexer.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Replacement_is_not_visible_until_removal_is_saved()
+    {
+        var database = Guid.NewGuid().ToString();
+        var barrier = new RemovalBarrier();
+        var root = new Microsoft.EntityFrameworkCore.Storage.InMemoryDatabaseRoot();
+        var options = new DbContextOptionsBuilder<SportarrDbContext>()
+            .UseInMemoryDatabase(database, root).AddInterceptors(barrier).Options;
+        using var db = new SportarrDbContext(options);
+        using var searchDb = new SportarrDbContext(new DbContextOptionsBuilder<SportarrDbContext>()
+            .UseInMemoryDatabase(database, root).Options);
+        db.Events.Add(new Event { Id = 1, Title = "Fixture event", Sport = "Fighting" });
+        var item = QueueItem(); item.EventId = 1; db.DownloadQueue.Add(item);
+        await db.SaveChangesAsync();
+        var queue = new SearchQueueService(new ServiceCollection().AddSingleton(searchDb)
+            .BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(), Mock.Of<ILogger<SearchQueueService>>());
+        barrier.Armed = true;
+        var removal = CreateService(db, queue).RemoveAsync(1, "ignoreDownload", "blocklistAndSearch");
+        await barrier.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            (await searchDb.Tasks.CountAsync()).Should().Be(0);
+            (await searchDb.DownloadQueue.CountAsync()).Should().Be(1);
+            (await searchDb.Blocklist.CountAsync()).Should().Be(0);
+        }
+        finally { barrier.Release.TrySetResult(); await removal; }
+        (await searchDb.Tasks.CountAsync()).Should().Be(1);
+        (await searchDb.DownloadQueue.CountAsync()).Should().Be(0);
+        (await searchDb.Blocklist.CountAsync()).Should().Be(1);
+    }
+
+    private sealed class RemovalBarrier : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public bool Armed { get; set; }
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed) { Entered.TrySetResult(); await Release.Task.WaitAsync(cancellationToken); }
+            return result;
+        }
     }
 
     public void Dispose()

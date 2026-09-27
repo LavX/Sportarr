@@ -22,6 +22,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check main release Discord mention
+        run: bash .github/scripts/test-release-discord-payload.sh
+
       - name: Get version info
         id: version
         run: |

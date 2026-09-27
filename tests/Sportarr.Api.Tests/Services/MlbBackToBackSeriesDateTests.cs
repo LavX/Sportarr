@@ -107,6 +107,32 @@ public class MlbBackToBackSeriesDateTests
     }
 
     [Fact]
+    public void An_unverified_adjacent_game_is_rejected_when_the_named_game_exists()
+    {
+        var adjacentGame = Aug29Game();
+        adjacentGame.BroadcastDateVerified = false;
+        var namedGame = Aug29Game();
+        namedGame.Id = 435;
+        namedGame.Title = "Los Angeles Dodgers vs Detroit Tigers";
+        namedGame.HomeTeamId = adjacentGame.AwayTeamId;
+        namedGame.AwayTeamId = adjacentGame.HomeTeamId;
+        namedGame.HomeTeamName = adjacentGame.AwayTeamName;
+        namedGame.AwayTeamName = adjacentGame.HomeTeamName;
+        namedGame.EventDate = new DateTime(2026, 8, 28, 17, 10, 0, DateTimeKind.Utc);
+        namedGame.BroadcastDate = new DateTime(2026, 8, 28);
+        namedGame.BroadcastDateVerified = false;
+
+        var result = _svc.ValidateRelease(
+            Rel("MLB RS 2026 Los Angeles Dodgers vs Detroit Tigers 28 08 1080pEN60fps SNLA"),
+            adjacentGame,
+            datePeers: new[] { namedGame });
+
+        result.IsMatch.Should().BeFalse();
+        result.IsHardRejection.Should().BeTrue();
+        result.Rejections.Should().Contain("Date matches another game between these teams");
+    }
+
+    [Fact]
     public void The_scorer_vetoes_yesterdays_game_the_same_way()
     {
         var score = _scorer.CalculateMatchScore(

@@ -47,7 +47,7 @@ public class RateLimitHandler : DelegatingHandler
         }
 
         // Wait for rate limit before sending request
-        await _rateLimitService.WaitAndPulseAsync(host, indexerId, rateLimit);
+        await _rateLimitService.WaitAndPulseAsync(host, indexerId, rateLimit, cancellationToken);
 
         _logger.LogDebug("[RateLimitHandler] Sending request to {Host} (indexer: {IndexerId})", host, indexerId ?? "none");
 

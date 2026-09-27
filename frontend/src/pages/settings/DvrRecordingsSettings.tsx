@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
+import { Menu } from '@headlessui/react';
 import {
   PlayIcon,
   StopIcon,
@@ -14,6 +15,8 @@ import {
   PlusIcon,
   ArrowDownOnSquareIcon,
   Cog6ToothIcon,
+  EllipsisVerticalIcon,
+  WrenchScrewdriverIcon,
 } from '@heroicons/react/24/outline';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -22,6 +25,13 @@ import PageHeader from '../../components/PageHeader';
 import PageShell from '../../components/PageShell';
 import { useUISettings } from '../../hooks/useUISettings';
 import { formatDateInTimezone, formatTimeInTimezone, localInputToUtcIso } from '../../utils/timezone';
+import {
+  getRecordingAttentionCount,
+  getRecordingCompletedCount,
+  getVisibleSelectedIds,
+  recordingMatchesView,
+  type RecordingView,
+} from './dvrRecordingPresentation';
 
 
 // DVR Recording Types
@@ -69,7 +79,10 @@ interface DvrStats {
   scheduledCount: number;
   recordingCount: number;
   completedCount: number;
+  importedCount: number;
+  importingCount: number;
   failedCount: number;
+  cancelledCount: number;
   totalStorageUsed: number;
 }
 
@@ -133,10 +146,15 @@ export default function DvrRecordingsSettings() {
   const [error, setError] = useState<string | null>(null);
 
   // Filter state
-  const [statusFilter, setStatusFilter] = useState<RecordingStatus | 'All'>('All');
+  const [recordingView, setRecordingView] = useState<RecordingView>('upcoming');
 
   // Bulk selection state
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [manageRecordings, setManageRecordings] = useState(false);
+  const visibleRecordings = useMemo(
+    () => recordings.filter((recording) => recordingMatchesView(recording.status, recordingView)),
+    [recordings, recordingView],
+  );
 
   // Modal state
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -170,6 +188,10 @@ export default function DvrRecordingsSettings() {
     checkFfmpeg();
   }, []);
 
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [recordingView]);
+
   // Re-check while the answer is unknown, so a check that could not reach the
   // server settles on its own instead of leaving the page unsure and manual
   // recording unavailable for the rest of the session.
@@ -192,7 +214,7 @@ export default function DvrRecordingsSettings() {
     loadRecordings();
     const interval = setInterval(loadRecordings, 30000);
     return () => clearInterval(interval);
-  }, [statusFilter]);
+  }, []);
 
   const loadData = async () => {
     await Promise.all([loadRecordings(), loadStats(), loadChannels(), loadFailedCaptures()]);
@@ -224,11 +246,7 @@ export default function DvrRecordingsSettings() {
   const loadRecordings = async () => {
     try {
       setIsLoading(true);
-      const params: Record<string, string> = {};
-      if (statusFilter !== 'All') {
-        params.status = statusFilter;
-      }
-      const { data } = await apiClient.get<DvrRecording[]>('/dvr/recordings', { params });
+      const { data } = await apiClient.get<DvrRecording[]>('/dvr/recordings');
       setRecordings(data);
     } catch (err: any) {
       setError(err.message || 'Failed to load recordings');
@@ -361,8 +379,7 @@ export default function DvrRecordingsSettings() {
   const handleBulkDelete = async () => {
     // Only what is actually on screen. A selection made before the list
     // changed under it must not take rows the user cannot see with it.
-    const visibleIds = new Set(recordings.map(r => r.id));
-    const ids = Array.from(selectedIds).filter(id => visibleIds.has(id));
+    const ids = getVisibleSelectedIds(selectedIds, visibleRecordings);
     if (ids.length === 0) return;
 
     try {
@@ -412,7 +429,7 @@ export default function DvrRecordingsSettings() {
 
   const handleSelectAll = () => {
     // Only select recordings that can be deleted (Scheduled, Completed, Failed, Cancelled, Imported)
-    const deletableRecordings = recordings.filter(
+    const deletableRecordings = visibleRecordings.filter(
       r => r.status === 'Scheduled' || r.status === 'Completed' || r.status === 'Failed' || r.status === 'Cancelled' || r.status === 'Imported'
     );
     if (selectedIds.size === deletableRecordings.length && deletableRecordings.length > 0) {
@@ -428,7 +445,7 @@ export default function DvrRecordingsSettings() {
   };
 
   // Get deletable recordings count
-  const deletableRecordingsCount = recordings.filter(canSelectRecording).length;
+  const deletableRecordingsCount = visibleRecordings.filter(canSelectRecording).length;
 
   const handleImportRecording = async (id: number) => {
     try {
@@ -588,16 +605,43 @@ export default function DvrRecordingsSettings() {
   return (
     <PageShell className="pb-8">
       <PageHeader
-        title="DVR Recordings"
-        subtitle="Manage scheduled and completed DVR recordings"
+        title="Recordings"
+        subtitle="Upcoming, active, and completed event recordings"
         actions={
-          <Link
-            to="/iptv/dvr-settings"
-            className="inline-flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm font-medium text-gray-200 transition-colors hover:bg-gray-700"
-          >
-            <Cog6ToothIcon className="h-5 w-5 text-gray-400" />
-            DVR Settings
-          </Link>
+          <Menu as="div" className="relative">
+            <Menu.Button className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm font-medium text-gray-200 transition-colors hover:bg-gray-700">
+              <EllipsisVerticalIcon className="h-5 w-5" /> More
+            </Menu.Button>
+            <Menu.Items className="absolute right-0 z-30 mt-1 w-56 overflow-hidden rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl shadow-black/50 focus:outline-none">
+              <Menu.Item>{({ active }) => (
+                <button
+                  onClick={() => setShowScheduleModal(true)}
+                  disabled={ffmpegAvailable === false}
+                  className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 disabled:opacity-50 ${active ? 'bg-gray-800' : ''}`}
+                >
+                  <PlusIcon className="h-4 w-4" /> Manual recording
+                </button>
+              )}</Menu.Item>
+              <Menu.Item>{({ active }) => (
+                <button
+                  onClick={() => {
+                    setManageRecordings((current) => {
+                      if (current) setSelectedIds(new Set());
+                      return !current;
+                    });
+                  }}
+                  className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}
+                >
+                  <WrenchScrewdriverIcon className="h-4 w-4" /> {manageRecordings ? 'Finish managing' : 'Manage recordings'}
+                </button>
+              )}</Menu.Item>
+              <Menu.Item>{({ active }) => (
+                <Link to="/iptv/settings/recording" className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+                  <Cog6ToothIcon className="h-4 w-4" /> Recording settings
+                </Link>
+              )}</Menu.Item>
+            </Menu.Items>
+          </Menu>
         }
       />
 
@@ -605,9 +649,9 @@ export default function DvrRecordingsSettings() {
       {ffmpegAvailable === false && (
         <div className="mb-6 bg-yellow-950/30 border border-yellow-900/50 rounded-lg p-4 flex items-start">
           <ExclamationTriangleIcon className="w-6 h-6 text-yellow-400 mr-3 flex-shrink-0 mt-0.5" />
-          <div className="flex-1">
+          <div className="min-w-0 flex-1">
             <h3 className="text-lg font-semibold text-yellow-400 mb-1">FFmpeg Not Found</h3>
-            <p className="text-sm text-gray-300">
+            <p className="break-words text-sm text-gray-300">
               FFmpeg is required for DVR recordings. Please install FFmpeg and ensure it's available in your system PATH.
             </p>
           </div>
@@ -631,129 +675,42 @@ export default function DvrRecordingsSettings() {
         </div>
       )}
 
-        {/* Stats Cards - the countable ones double as status filters */}
-        {stats && (
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
-            <button
-              type="button"
-              onClick={() => setStatusFilter('All')}
-              className={`bg-gradient-to-br from-gray-900 to-black border rounded-lg p-4 text-left transition-colors hover:border-gray-600 ${statusFilter === 'All' ? 'border-gray-500' : 'border-gray-800'}`}
-            >
-              <div className="text-2xl font-bold text-white">{stats.totalRecordings}</div>
-              <div className="text-sm text-gray-400">Total Recordings</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('Scheduled')}
-              className={`bg-gradient-to-br from-gray-900 to-black border rounded-lg p-4 text-left transition-colors hover:border-blue-700 ${statusFilter === 'Scheduled' ? 'border-blue-600' : 'border-blue-900/30'}`}
-            >
-              <div className="text-2xl font-bold text-blue-400">{stats.scheduledCount}</div>
-              <div className="text-sm text-gray-400">Scheduled</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('Recording')}
-              className={`bg-gradient-to-br from-gray-900 to-black border rounded-lg p-4 text-left transition-colors hover:border-red-700 ${statusFilter === 'Recording' ? 'border-red-600' : 'border-red-900/30'}`}
-            >
-              <div className="text-2xl font-bold text-red-400">{stats.recordingCount}</div>
-              <div className="text-sm text-gray-400">Recording Now</div>
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('Completed')}
-              className={`bg-gradient-to-br from-gray-900 to-black border rounded-lg p-4 text-left transition-colors hover:border-green-700 ${statusFilter === 'Completed' ? 'border-green-600' : 'border-green-900/30'}`}
-            >
-              <div className="text-2xl font-bold text-green-400">{stats.completedCount}</div>
-              <div className="text-sm text-gray-400">Completed</div>
-            </button>
-            <div className="bg-gradient-to-br from-gray-900 to-black border border-gray-800 rounded-lg p-4">
-              <div className="text-2xl font-bold text-white">{formatFileSize(stats.totalStorageUsed)}</div>
-              <div className="text-sm text-gray-400">Storage Used</div>
-            </div>
-          </div>
-        )}
-
-        {/* Info Box */}
-        <div className="mb-8 rounded-lg border border-gray-800 bg-gray-900/70 p-6">
-          <div className="flex items-start">
-            <VideoCameraIcon className="w-6 h-6 text-gray-400 mr-3 flex-shrink-0 mt-0.5" />
-            <div>
-              <h3 className="text-lg font-semibold text-white mb-2">About DVR Recordings</h3>
-              <ul className="space-y-2 text-sm text-gray-300">
-                <li className="flex items-start">
-                  <span className="text-red-400 mr-2">*</span>
-                  <span>
-                    <strong>Automatic Recording:</strong> Events with IPTV channel mappings are recorded automatically
-                  </span>
-                </li>
-                <li className="flex items-start">
-                  <span className="text-red-400 mr-2">*</span>
-                  <span>
-                    <strong>Manual Recording:</strong> Schedule recordings for any channel and time
-                  </span>
-                </li>
-                <li className="flex items-start">
-                  <span className="text-red-400 mr-2">*</span>
-                  <span>
-                    <strong>Pre/Post Padding:</strong> Start recording early and end late to capture full events
-                  </span>
-                </li>
-                <li className="flex items-start">
-                  <span className="text-red-400 mr-2">*</span>
-                  <span>
-                    Recordings are saved using your chosen container format and encoding settings
-                  </span>
-                </li>
-              </ul>
-            </div>
-          </div>
-        </div>
-
-
         {/* Recordings List */}
-        <div className="mb-8 bg-gradient-to-br from-gray-900 to-black border border-red-900/30 rounded-lg p-6">
-          <div className="flex flex-wrap items-center justify-between gap-2 mb-6">
-            <div className="flex items-center space-x-4">
-              <h3 className="text-xl font-semibold text-white">Recordings</h3>
-              <select
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value as RecordingStatus | 'All')}
-                className="px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:border-red-600"
-              >
-                <option value="All">All Status</option>
-                <option value="Scheduled">Scheduled</option>
-                <option value="Recording">Recording</option>
-                <option value="Completed">Completed</option>
-                <option value="Imported">Imported</option>
-                <option value="Failed">Failed</option>
-                <option value="Cancelled">Cancelled</option>
-              </select>
+        <div className="mb-8 rounded-lg border border-red-900/30 bg-gradient-to-br from-gray-900 to-black p-4 sm:p-6">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-1 rounded-lg bg-gray-900 p-1">
+              {([
+                ['upcoming', `Upcoming${stats ? ` (${stats.scheduledCount})` : ''}`],
+                ['recording', `Recording${stats ? ` (${stats.recordingCount})` : ''}`],
+                ['completed', `Completed${stats ? ` (${getRecordingCompletedCount(stats)})` : ''}`],
+                ['attention', `Needs attention${stats && getRecordingAttentionCount(stats) > 0 ? ` (${getRecordingAttentionCount(stats)})` : ''}`],
+                ['all', 'All'],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setRecordingView(key)}
+                  className={`min-h-10 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                    recordingView === key ? 'bg-red-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
             <div className="flex items-center space-x-2">
+              {stats && <span className="mr-2 text-sm text-gray-500">{formatFileSize(stats.totalStorageUsed)} used</span>}
               <button
                 onClick={loadRecordings}
-                className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors"
+                className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-800 hover:text-white"
                 title="Refresh"
               >
                 <ArrowPathIcon className="w-5 h-5" />
-              </button>
-              <button
-                onClick={() => setShowScheduleModal(true)}
-                disabled={ffmpegAvailable === false}
-                className={`flex items-center px-4 py-2 rounded-lg transition-colors ${
-                  ffmpegAvailable !== false
-                    ? 'bg-red-600 hover:bg-red-700 text-white'
-                    : 'bg-gray-700 text-gray-500 cursor-not-allowed'
-                }`}
-              >
-                <PlusIcon className="w-4 h-4 mr-2" />
-                Manual Recording
               </button>
             </div>
           </div>
 
           {/* Bulk Selection Controls */}
-          {deletableRecordingsCount > 0 && (
+          {manageRecordings && deletableRecordingsCount > 0 && (
             <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-800">
               <div className="flex items-center space-x-4">
                 <label className="flex items-center space-x-2 cursor-pointer">
@@ -818,17 +775,17 @@ export default function DvrRecordingsSettings() {
           )}
 
           <div className="space-y-3">
-            {recordings.map((recording) => (
+            {visibleRecordings.map((recording) => (
               <div
                 key={recording.id}
                 className={`group bg-black/30 border rounded-lg p-4 transition-all ${
                   selectedIds.has(recording.id) ? 'border-red-600 bg-red-950/20' : 'border-gray-800 hover:border-red-900/50'
                 }`}
               >
-                <div className="flex items-start justify-between">
-                  <div className="flex items-start space-x-4 flex-1">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex min-w-0 flex-1 items-start space-x-4">
                     {/* Selection Checkbox */}
-                    {canSelectRecording(recording) && (
+                    {manageRecordings && canSelectRecording(recording) && (
                       <div className="mt-1">
                         <input
                           type="checkbox"
@@ -844,9 +801,9 @@ export default function DvrRecordingsSettings() {
                     </div>
 
                     {/* Recording Info */}
-                    <div className="flex-1">
-                      <div className="flex items-center space-x-3 mb-2">
-                        <h4 className="text-lg font-semibold text-white">{recording.eventTitle}</h4>
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-2 flex flex-wrap items-center gap-2">
+                        <h4 className="min-w-0 break-words text-lg font-semibold text-white">{recording.eventTitle}</h4>
                         <span className={`px-2 py-0.5 text-xs rounded ${getStatusColor(recording.status)}`}>
                           {recording.status}
                         </span>
@@ -1000,7 +957,7 @@ export default function DvrRecordingsSettings() {
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center space-x-2 ml-4">
+                  <div className="flex shrink-0 items-center justify-end space-x-2 self-end sm:ml-4 sm:self-start">
                     {recording.status === 'Scheduled' && (
                       <>
                         {/* A catchup recording downloads after the event, and
@@ -1080,13 +1037,13 @@ export default function DvrRecordingsSettings() {
             </div>
           )}
 
-          {!isLoading && recordings.length === 0 && (
+          {!isLoading && visibleRecordings.length === 0 && (
             <div className="text-center py-12">
               <VideoCameraIcon className="w-16 h-16 text-gray-700 mx-auto mb-4" />
               <p className="text-gray-500 mb-2">No recordings found</p>
               <p className="text-sm text-gray-400">
-                {statusFilter !== 'All'
-                  ? `No ${statusFilter.toLowerCase()} recordings`
+                {recordingView !== 'all'
+                  ? `No recordings in ${recordingView === 'attention' ? 'Needs attention' : recordingView}`
                   : 'Schedule a recording or add events with IPTV channel mappings'}
               </p>
             </div>

@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders, userEvent } from '../../test/test-utils';
 import AddEventModal from '../AddEventModal';
 import apiClient from '../../api/client';
+import { Toaster, toast } from 'sonner';
 
 // Mock the API client
 vi.mock('../../api/client');
@@ -20,7 +21,8 @@ vi.mock('../../api/hooks', () => ({
 
 describe('AddEventModal', () => {
   const mockEvent = {
-    tapologyId: 'test-123',
+    externalId: 'ev-test-123',
+    sport: 'Fighting',
     title: 'UFC 300',
     organization: 'UFC',
     eventDate: '2024-04-13',
@@ -41,8 +43,10 @@ describe('AddEventModal', () => {
   const mockOnSuccess = vi.fn();
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
+
+  afterEach(() => { toast.dismiss(); vi.restoreAllMocks(); });
 
   it('should render modal when isOpen is true', () => {
     renderWithProviders(
@@ -162,14 +166,20 @@ describe('AddEventModal', () => {
     );
 
     const addButton = screen.getByRole('button', { name: /add event/i });
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Quality Profile' }), '1');
+    expect(addButton).toBeEnabled();
     await user.click(addButton);
 
     await waitFor(() => {
       expect(apiClient.post).toHaveBeenCalledWith('/events', expect.objectContaining({
-        tapologyId: 'test-123',
+        externalId: 'ev-test-123',
         title: 'UFC 300',
-        organization: 'UFC',
+        sport: 'Fighting',
+        qualityProfileId: 1,
+        monitored: true,
+        searchOnAdd: true,
       }));
+      expect(apiClient.post).toHaveBeenCalledTimes(1);
       expect(mockOnSuccess).toHaveBeenCalledTimes(1);
       expect(mockOnClose).toHaveBeenCalledTimes(1);
     });
@@ -183,19 +193,30 @@ describe('AddEventModal', () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     renderWithProviders(
+      <>
       <AddEventModal
         isOpen={true}
         onClose={mockOnClose}
         event={mockEvent}
         onSuccess={mockOnSuccess}
       />
+      <Toaster />
+      </>
     );
 
     const addButton = screen.getByRole('button', { name: /add event/i });
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Quality Profile' }), '1');
+    expect(addButton).toBeEnabled();
     await user.click(addButton);
 
     await waitFor(() => {
-      expect(consoleSpy).toHaveBeenCalled();
+      expect(apiClient.post).toHaveBeenCalledTimes(1);
+      expect(consoleSpy).toHaveBeenCalledWith('Failed to add event:', mockError);
+      expect(screen.getByText('Failed to Add Event')).toBeInTheDocument();
+      expect(screen.getByText('Failed to add event')).toBeInTheDocument();
+      expect(addButton).toBeEnabled();
+      expect(mockOnSuccess).not.toHaveBeenCalled();
+      expect(mockOnClose).not.toHaveBeenCalled();
     });
 
     consoleSpy.mockRestore();
@@ -218,27 +239,29 @@ describe('AddEventModal', () => {
   it('should disable add button while adding', async () => {
     const user = userEvent.setup();
 
-    // Make API call hang
-    vi.mocked(apiClient.post).mockImplementation(
-      () => new Promise(() => {})
-    );
-
+    let resolvePost!: (value: { data: { id: number } }) => void;
+    const pending = new Promise<{ data: { id: number } }>(resolve => { resolvePost = resolve; });
+    vi.mocked(apiClient.post).mockImplementationOnce(() => pending);
     renderWithProviders(
-      <AddEventModal
-        isOpen={true}
-        onClose={mockOnClose}
-        event={mockEvent}
-        onSuccess={mockOnSuccess}
-      />
+      <AddEventModal isOpen={true} onClose={mockOnClose} event={mockEvent} onSuccess={mockOnSuccess} />
     );
-
     const addButton = screen.getByRole('button', { name: /add event/i });
-
-    await user.click(addButton);
-
-    await waitFor(() => {
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Quality Profile' }), '1');
+    expect(addButton).toBeEnabled();
+    try {
+      await user.click(addButton);
+      await waitFor(() => expect(apiClient.post).toHaveBeenCalledTimes(1));
       expect(addButton).toBeDisabled();
+      expect(mockOnSuccess).not.toHaveBeenCalled();
+      expect(mockOnClose).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => { resolvePost({ data: { id: 1 } }); await pending; });
+    }
+    await waitFor(() => {
+      expect(mockOnSuccess).toHaveBeenCalledTimes(1);
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
     });
+    expect(addButton).toBeEnabled();
   });
 
   it('should format date correctly', () => {

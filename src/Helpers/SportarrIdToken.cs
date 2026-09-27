@@ -85,6 +85,16 @@ public static partial class SportarrIdToken
         return stripped;
     }
 
+    public static IReadOnlyList<string> ExtractEventIds(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return Array.Empty<string>();
+        return new[] { BracedToken(), BrandedToken(), BareToken() }
+            .SelectMany(regex => regex.Matches(name).Cast<Match>())
+            .Where(match => match.Groups["prefix"].Value.Equals("ev", StringComparison.OrdinalIgnoreCase))
+            .Select(match => "ev-" + match.Groups["digits"].Value)
+            .Distinct(StringComparer.Ordinal).ToArray();
+    }
+
     private static string? Extract(string? name, string wantedPrefix)
     {
         if (string.IsNullOrWhiteSpace(name))

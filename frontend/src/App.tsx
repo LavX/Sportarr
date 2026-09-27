@@ -193,14 +193,18 @@ function App() {
             <Route path="wanted" element={<Navigate to="/activity" replace />} />
 
             {/* IPTV Section */}
-            <Route path="iptv" element={<Navigate to="/iptv/sources" replace />} />
-            <Route path="iptv/sources" element={<IptvSettings />} />
+            <Route path="iptv" element={<Navigate to="/iptv/guide" replace />} />
+            <Route path="iptv/sources" element={<Navigate to="/iptv/settings/providers" replace />} />
             <Route path="iptv/channels" element={<IptvChannelsSettings />} />
             <Route path="iptv/guide" element={<TvGuidePage />} />
             <Route path="iptv/watch/:channelId" element={<WatchChannelPage />} />
             <Route path="iptv/schedule" element={<Navigate to="/iptv/guide?scheduledOnly=true" replace />} />
             <Route path="iptv/recordings" element={<DvrRecordingsSettings />} />
-            <Route path="iptv/dvr-settings" element={<DvrSettingsPage />} />
+            <Route path="iptv/dvr-settings" element={<Navigate to="/iptv/settings/recording" replace />} />
+            <Route path="iptv/settings" element={<Navigate to="/iptv/settings/providers" replace />} />
+            <Route path="iptv/settings/providers" element={<IptvSettings />} />
+            <Route path="iptv/settings/recording" element={<DvrSettingsPage />} />
+            <Route path="iptv/settings/advanced" element={<IptvSettings />} />
             <Route path="iptv/coverage" element={<Navigate to="/iptv/channels?view=coverage" replace />} />
 
             {/* Settings - each page manages its own showAdvanced state */}

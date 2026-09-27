@@ -71,6 +71,7 @@ Use the same paths your download client sees so imports can hardlink instead of 
 | `PGID` | `100` | Group ID that owns files created by Sportarr |
 | `TZ` | `Etc/UTC` | Timezone for logs and scheduling |
 | `UMASK` | `022` | File creation mask |
+| `SPORTARR_STARTUP_SCRIPT` | unset | Absolute path to an optional mounted script that runs once as root before Sportarr starts |
 
 The container can also run fully non-root: start it with `--user 1000:1000` (or your IDs) and ensure `/config` is owned by that user. `PUID`/`PGID` are ignored in that mode.
 

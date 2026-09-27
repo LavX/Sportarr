@@ -18,6 +18,20 @@ public class PendingReleaseReaperService : BackgroundService
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<PendingReleaseReaperService> _logger;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(1);
+    private readonly List<OwnershipRecovery> _ownershipRecoveries = new();
+
+    private sealed record PendingState(int Id, PendingReleaseStatus Status, string Reason);
+    private sealed record OwnershipRecovery(DownloadQueueItem Owner, List<PendingState> Pending, IDisposable Lease, IDisposable Decision)
+    {
+        public IDisposable? Quarantine { get; set; }
+    }
+
+    private sealed class AcquisitionLease(IDisposable lease) : IDisposable
+    {
+        private IDisposable? _lease = lease;
+        public IDisposable Detach() => Interlocked.Exchange(ref _lease, null)!;
+        public void Dispose() => Interlocked.Exchange(ref _lease, null)?.Dispose();
+    }
 
     public PendingReleaseReaperService(
         IServiceProvider serviceProvider,
@@ -60,8 +74,12 @@ public class PendingReleaseReaperService : BackgroundService
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+        var coordinator = scope.ServiceProvider.GetRequiredService<DownloadOwnershipCoordinator>();
+        foreach (var recovery in _ownershipRecoveries.ToList())
+            await RecoverOwnershipAsync(db, coordinator, recovery);
         var downloadClientService = scope.ServiceProvider.GetRequiredService<DownloadClientService>();
         var notificationService = scope.ServiceProvider.GetRequiredService<NotificationService>();
+        var rssSyncService = scope.ServiceProvider.GetRequiredService<RssSyncService>();
         var configService = scope.ServiceProvider.GetRequiredService<ConfigService>();
         var config = await configService.GetConfigAsync();
         var qualityProfiles = await db.QualityProfiles.ToListAsync(cancellationToken);
@@ -101,63 +119,99 @@ public class PendingReleaseReaperService : BackgroundService
                 continue;
             }
 
-            // If the event already has a file or is no longer monitored, drop everything.
-            if (!evt.Monitored || evt.HasFile)
+            if (_ownershipRecoveries.Any(r => r.Owner.EventId == evt.Id)) continue;
+
+            using var eventDecision = new AcquisitionLease(await downloadClientService.EnterEventDecisionAsync(evt.Id, cancellationToken));
+            await db.Entry(evt).ReloadAsync(cancellationToken);
+            if (db.Entry(evt).State == EntityState.Detached) continue;
+
+            // Refresh the group after acquiring the event decision lock.
+            var candidates = await db.PendingReleases
+                .Where(p => p.EventId == group.Key.EventId
+                    && p.Part == group.Key.Part
+                    && p.Status == PendingReleaseStatus.Pending)
+                .ToListAsync(cancellationToken);
+            if (candidates.Count == 0) continue;
+
+            var latestFailure = await DownloadRetryState.LatestFailureAsync(
+                db, evt.Id, group.Key.Part, cancellationToken);
+            if (latestFailure != null)
             {
-                foreach (var p in group)
+                var retryBlockReason = Helpers.DownloadFailurePolicy.AutomaticRetryBlockReason(
+                    latestFailure, config);
+                if (retryBlockReason != null)
+                {
+                    foreach (var candidate in candidates)
+                    {
+                        candidate.Status = PendingReleaseStatus.Cancelled;
+                        candidate.Reason = retryBlockReason;
+                    }
+                    continue;
+                }
+
+                var retryDelays = AutomaticSearchService.ParseRetryBackoff(config.AutoSearchRetryBackoffMinutes);
+                var retryCount = latestFailure.RetryCount ?? 0;
+                var delayMinutes = retryCount < retryDelays.Length ? retryDelays[retryCount] : retryDelays[^1];
+                if (DateTime.UtcNow < (latestFailure.FailedAt ?? latestFailure.LastUpdate ?? latestFailure.Added).AddMinutes(delayMinutes))
+                    continue;
+            }
+
+            if (!evt.Monitored)
+            {
+                foreach (var p in candidates)
                 {
                     p.Status = PendingReleaseStatus.Cancelled;
-                    p.Reason = evt.HasFile ? "Event already has file" : "Event no longer monitored";
+                    p.Reason = "Event no longer monitored";
                 }
                 continue;
             }
 
-            var winner = group
-                .OrderByDescending(p => p.QualityScore)
+            var profile = RssSyncService.ResolveQualityProfile(evt, qualityProfiles);
+            var ranked = candidates
+                .OrderByDescending(p => Helpers.QualityProfileRanker.GetRank(profile, p.Quality))
+                .ThenByDescending(p => string.Equals(config.DownloadPropersAndRepacks, "doNotPrefer", StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : Helpers.ReleaseRevision.Parse(p.Title))
                 .ThenByDescending(p => p.CustomFormatScore)
                 .ThenByDescending(p => p.Score)
                 .ThenByDescending(p => p.MatchScore)
                 .ThenByDescending(p => p.Seeders ?? 0)
-                .First();
+                .ToList();
 
-            // The event flag only turns true once every monitored part has a
-            // file. A part that gained its own file during the hold is decided
-            // by that file, as RSS sync decides it: the hold stands only if it
-            // still outscores what the part has. Left to the event flag, a held
-            // prelims release was grabbed after a better prelims file had
-            // already imported, downloaded in full, and was refused at import
-            // as not an upgrade. Dropping on any file at all went too far the
-            // other way and cancelled the upgrades RSS sync had let through.
+            // A file for another part also sets HasFile.
+            // Use the part's file state for a named part.
             var groupPart = group.Key.Part;
+            var currentFiles = await db.EventFiles.AsNoTracking()
+                .Where(f => f.EventId == evt.Id && f.Exists).ToListAsync(cancellationToken);
             var partFile = string.IsNullOrEmpty(groupPart)
-                ? null
-                : evt.Files.FirstOrDefault(f => f.Exists && string.Equals(f.PartName, groupPart, StringComparison.OrdinalIgnoreCase));
-            if (partFile != null)
+                ? currentFiles.FirstOrDefault(f => f.PartName == null)
+                : currentFiles.FirstOrDefault(f => string.Equals(f.PartName, groupPart, StringComparison.OrdinalIgnoreCase));
+            if (string.IsNullOrEmpty(groupPart) && evt.HasFile && partFile == null)
             {
-                // The same decision RSS sync makes, from the same helper.
-                // Comparing scores alone here grabbed over a file whose
-                // quality nobody could read, ignored a profile that forbids
-                // upgrades, took a trivial custom-format bump as an upgrade,
-                // and dropped a proper at equal score.
-                // The same profile RSS sync would pick: the event's own, else the
-                // league's, else the default, else the first. A separate lookup
-                // here skipped the default and gave the gate a null profile for
-                // an event pointing at a profile that no longer exists, which
-                // switched off the upgrades-allowed and increment rules.
-                var profile = RssSyncService.ResolveQualityProfile(evt, qualityProfiles);
-
-                var refusal = Helpers.ExistingFileUpgradeGate.RefusalReason(
-                    partFile, winner.Title, winner.Quality, winner.CustomFormatScore, profile, config);
+                foreach (var p in candidates)
+                {
+                    p.Status = PendingReleaseStatus.Cancelled;
+                    p.Reason = "Event already has file";
+                }
+                continue;
+            }
+            var eligible = new List<PendingRelease>();
+            foreach (var candidate in ranked)
+            {
+                var refusal = partFile == null ? null : Helpers.ExistingFileUpgradeGate.RefusalReason(
+                    partFile, candidate.Title, candidate.Quality, candidate.CustomFormatScore, profile, config);
                 if (refusal != null)
                 {
-                    foreach (var p in group)
-                    {
-                        p.Status = PendingReleaseStatus.Cancelled;
-                        p.Reason = refusal;
-                    }
-                    continue;
+                    candidate.Status = PendingReleaseStatus.Cancelled;
+                    candidate.Reason = refusal;
                 }
+                else eligible.Add(candidate);
             }
+            if (eligible.Count == 0) continue;
+
+            var winner = eligible[0];
+            // A ready lower release must not beat a better candidate still held.
+            if (winner.ReleasableAt > DateTime.UtcNow) continue;
 
             // The whole group is settled before the grab runs, so the save
             // inside it commits these statuses with the queue row. Setting
@@ -165,7 +219,7 @@ public class PendingReleaseReaperService : BackgroundService
             // queued while the group still read as pending, and the next pass
             // grabbed the same event a second time. Nothing is saved unless
             // the grab succeeds, so the revert below is enough on failure.
-            var losers = group.Where(p => p.Id != winner.Id).ToList();
+            var losers = eligible.Where(p => p.Id != winner.Id).ToList();
             winner.Status = PendingReleaseStatus.Released;
             foreach (var loser in losers)
             {
@@ -173,13 +227,20 @@ public class PendingReleaseReaperService : BackgroundService
                 loser.Reason = $"Superseded by {winner.Title}";
             }
 
-            var outcome = await TryGrabPendingAsync(db, downloadClientService, notificationService, evt, winner, cancellationToken);
+            var outcome = await TryGrabPendingAsync(
+                db, downloadClientService, notificationService, evt, winner, profile, config,
+                latestFailure, eventDecision, cancellationToken);
 
             if (outcome == GrabOutcome.Grabbed)
             {
+                var cascadeParts = RssSyncService.GetCascadingPartSearchTargets(
+                    currentFiles, winner.Quality, winner.Part, profile, config);
+                rssSyncService.StartCascadingPartSearchesAfterGrab(
+                    evt, winner.Quality, winner.Part, cascadeParts);
                 _logger.LogInformation(
-                    "[Pending Release Reaper] Released best-of-window for '{Event}': {Winner} (score {Score})",
-                    evt.Title, winner.Title, winner.QualityScore + winner.CustomFormatScore);
+                    "[Pending Release Reaper] Released best-of-window for '{Event}': {Winner} (profile rank {Rank}, CF {Cf})",
+                    evt.Title, winner.Title,
+                    Helpers.QualityProfileRanker.GetRank(profile, winner.Quality), winner.CustomFormatScore);
             }
             else if (outcome == GrabOutcome.Superseded || outcome == GrabOutcome.Importing)
             {
@@ -191,13 +252,13 @@ public class PendingReleaseReaperService : BackgroundService
                 var reason = outcome == GrabOutcome.Importing
                     ? "Event already being imported"
                     : "Better or equal release already queued";
-                foreach (var p in group)
+                foreach (var p in eligible)
                 {
                     p.Status = PendingReleaseStatus.Cancelled;
                     p.Reason = reason;
                 }
                 _logger.LogInformation("[Pending Release Reaper] Dropped {Count} held release(s) for '{Event}': {Reason}",
-                    group.Count(), evt.Title, reason);
+                    eligible.Count, evt.Title, reason);
             }
             else
             {
@@ -218,12 +279,55 @@ public class PendingReleaseReaperService : BackgroundService
 
     private enum GrabOutcome { Grabbed, Failed, Superseded, Importing }
 
+    private async Task RecoverOwnershipAsync(SportarrDbContext db, DownloadOwnershipCoordinator coordinator, OwnershipRecovery recovery)
+    {
+        using var recoveryDecision = recovery.Quarantine == null ? null : coordinator.TryEnterExternalDecision();
+        if (recovery.Quarantine != null && recoveryDecision == null) return;
+
+        var downloadIdentity = recovery.Owner.DownloadId.ToUpperInvariant();
+        var existing = await db.DownloadQueue.Where(q =>
+            q.DownloadClientId == recovery.Owner.DownloadClientId && q.DownloadId.ToUpper() == downloadIdentity).ToListAsync();
+        if (existing.Any(q => q.EventId != recovery.Owner.EventId ||
+            !string.Equals(q.Part, recovery.Owner.Part, StringComparison.OrdinalIgnoreCase)))
+        {
+            // Keep this identity excluded before other downloads can proceed.
+            recovery.Quarantine ??= coordinator.QuarantineDownload(recovery.Owner.DownloadClientId!.Value, recovery.Owner.DownloadId);
+            recovery.Lease.Dispose();
+            _logger.LogError("[Pending Release Reaper] Quarantined accepted download {DownloadId} with conflicting queue ownership", recovery.Owner.DownloadId);
+            return;
+        }
+        if (existing.Count == 0)
+        {
+            recovery.Owner.Id = 0;
+            db.DownloadQueue.Add(recovery.Owner);
+        }
+
+        var ids = recovery.Pending.Select(p => p.Id).ToList();
+        var pending = await db.PendingReleases.Where(p => ids.Contains(p.Id)).ToListAsync();
+        foreach (var row in pending)
+        {
+            var state = recovery.Pending.First(p => p.Id == row.Id);
+            row.Status = state.Status;
+            row.Reason = state.Reason;
+        }
+        await db.SaveChangesAsync(CancellationToken.None);
+        _ownershipRecoveries.Remove(recovery);
+        recovery.Quarantine?.Dispose();
+        recovery.Lease.Dispose();
+        recovery.Decision.Dispose();
+        _logger.LogInformation("[Pending Release Reaper] Recovered queue ownership for accepted download {DownloadId}", recovery.Owner.DownloadId);
+    }
+
     private async Task<GrabOutcome> TryGrabPendingAsync(
         SportarrDbContext db,
         DownloadClientService downloadClientService,
         NotificationService notificationService,
         Event evt,
         PendingRelease pending,
+        QualityProfile? profile,
+        Config config,
+        DownloadQueueItem? latestFailure,
+        AcquisitionLease eventDecision,
         CancellationToken cancellationToken)
     {
         var supportedTypes = DownloadClientService.GetClientTypesForProtocol(pending.Protocol);
@@ -282,18 +386,22 @@ public class PendingReleaseReaperService : BackgroundService
             .Where(q => q.Status == DownloadStatus.Queued || q.Status == DownloadStatus.Downloading)
             .ToListAsync(cancellationToken);
 
-        var pendingScore = ReleaseEvaluator.CalculateQualityScoreFromName(pending.Quality) + pending.CustomFormatScore;
         foreach (var queued in losers)
         {
-            var queuedScore = ReleaseEvaluator.CalculateQualityScoreFromName(queued.Quality) + queued.CustomFormatScore;
-            if (queuedScore >= pendingScore)
+            var preference = Helpers.ReleasePreferenceComparer.Compare(
+                profile,
+                pending.Quality, pending.Title, pending.CustomFormatScore,
+                queued.Quality, queued.Title, queued.CustomFormatScore,
+                config.DownloadPropersAndRepacks);
+            if (preference <= 0)
             {
-                _logger.LogInformation("[Pending Release Reaper] '{Queued}' already queued for '{Event}' scores {QueuedScore} against {PendingScore}; '{Title}' is dropped",
-                    queued.Title, evt.Title, queuedScore, pendingScore, pending.Title);
+                _logger.LogInformation("[Pending Release Reaper] '{Queued}' already queued for '{Event}' has equal or higher preference; '{Title}' is dropped",
+                    queued.Title, evt.Title, pending.Title);
                 return GrabOutcome.Superseded;
             }
         }
 
+        using var acquisition = new AcquisitionLease(await downloadClientService.BeginAcquisitionAsync(cancellationToken));
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
             pending.DownloadUrl,
@@ -308,6 +416,51 @@ public class PendingReleaseReaperService : BackgroundService
             return GrabOutcome.Failed;
         }
 
+        cancellationToken = AcceptedDownloadPersistence.AfterAdd(downloadId, cancellationToken);
+
+        var queueOwner = new DownloadQueueItem
+        {
+            EventId = evt.Id,
+            Title = pending.Title,
+            DownloadId = downloadId,
+            DownloadClientId = downloadClient.Id,
+            GrabCategory = reaperGrabCategory,
+            Status = DownloadStatus.Queued,
+            Quality = pending.Quality,
+            Codec = pending.Codec,
+            Source = pending.Source,
+            Size = pending.Size,
+            Downloaded = 0,
+            Progress = 0,
+            Indexer = pending.Indexer,
+            IndexerId = indexerRecord?.Id,
+            Protocol = pending.Protocol,
+            TorrentInfoHash = pending.TorrentInfoHash,
+            RetryCount = latestFailure?.RetryCount ?? 0,
+            LastUpdate = DateTime.UtcNow,
+            QualityScore = pending.QualityScore,
+            CustomFormatScore = pending.CustomFormatScore,
+            Part = pending.Part,
+            IsPack = pending.IsPack ?? PackImportBoundary.IsPackRelease(pending.Title),
+            IsManualSearch = false
+        };
+        db.DownloadQueue.Add(queueOwner);
+
+        var ownerPersisted = await AcceptedDownloadPersistence.PersistOwnerAsync(token => db.SaveChangesAsync(token));
+        if (!ownerPersisted)
+        {
+            // A failed acknowledgement can follow a committed save. Keep the accepted job.
+            var pendingStates = db.ChangeTracker.Entries<PendingRelease>()
+                .Where(p => p.Entity.EventId == evt.Id && p.Entity.Part == pending.Part)
+                .Select(p => new PendingState(p.Entity.Id, p.Entity.Status, p.Entity.Reason)).ToList();
+            var ownerSnapshot = (DownloadQueueItem)db.Entry(queueOwner).CurrentValues.ToObject();
+            _ownershipRecoveries.Add(new OwnershipRecovery(ownerSnapshot, pendingStates, acquisition.Detach(), eventDecision.Detach()));
+            _logger.LogError(
+                "[Pending Release Reaper] Retained accepted download {DownloadId} for ownership recovery before further promotions",
+                downloadId);
+            throw new InvalidOperationException($"Accepted download {downloadId} requires queue ownership recovery");
+        }
+
         foreach (var loser in losers)
         {
             var loserClient = await db.DownloadClients
@@ -316,16 +469,22 @@ public class PendingReleaseReaperService : BackgroundService
             {
                 try
                 {
-                    await downloadClientService.RemoveDownloadAsync(loserClient, loser.DownloadId, deleteFiles: true);
+                    if (!await downloadClientService.RemoveDownloadAsync(loserClient, loser.DownloadId, deleteFiles: true))
+                    {
+                        _logger.LogWarning("[Pending Release Reaper] Retained queue ownership because client refused removal of {DownloadId}", loser.DownloadId);
+                        continue;
+                    }
                     _logger.LogInformation("[Pending Release Reaper] Cancelled queued download {DownloadId}; {Title} replaces it",
                         loser.DownloadId, pending.Title);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[Pending Release Reaper] Could not cancel download {DownloadId}; removing its queue row anyway",
+                    _logger.LogWarning(ex, "[Pending Release Reaper] Could not cancel download {DownloadId}; retained its queue row",
                         loser.DownloadId);
+                    continue;
                 }
             }
+            else continue;
             db.DownloadQueue.Remove(loser);
         }
 
@@ -349,37 +508,8 @@ public class PendingReleaseReaperService : BackgroundService
             _logger.LogWarning(ex, "[Pending Release Reaper] Error setting queue priority for {DownloadId}", downloadId);
         }
 
-        db.DownloadQueue.Add(new DownloadQueueItem
-        {
-            EventId = evt.Id,
-            Title = pending.Title,
-            DownloadId = downloadId,
-            DownloadClientId = downloadClient.Id,
-            GrabCategory = reaperGrabCategory,
-            Status = DownloadStatus.Queued,
-            Quality = pending.Quality,
-            Codec = pending.Codec,
-            Source = pending.Source,
-            Size = pending.Size,
-            Downloaded = 0,
-            Progress = 0,
-            Indexer = pending.Indexer,
-            IndexerId = indexerRecord?.Id,
-            Protocol = pending.Protocol,
-            TorrentInfoHash = pending.TorrentInfoHash,
-            RetryCount = 0,
-            LastUpdate = DateTime.UtcNow,
-            QualityScore = pending.QualityScore,
-            CustomFormatScore = pending.CustomFormatScore,
-            Part = pending.Part,
-            IsManualSearch = false
-        });
-
-        // Save before anything optional runs. The client already holds this
-        // download, and the caller saved once after the whole loop, so a
-        // failure there orphaned every download the loop had added. Nothing
-        // would import them and the client would keep them for ever.
-        await db.SaveChangesAsync(cancellationToken);
+        acquisition.Dispose();
+        eventDecision.Dispose();
 
         try
         {

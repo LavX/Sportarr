@@ -112,7 +112,9 @@ export default function AddEventModal({ isOpen, onClose, event, onSuccess }: Add
 
   const formatDate = (dateString: string) => {
     try {
-      const date = new Date(dateString);
+      // A date without a time is a calendar date, not midnight UTC. Parsing
+      // it as UTC moves it to the prior day in western time zones.
+      const date = new Date(dateString.includes('T') ? dateString : `${dateString}T00:00:00`);
       return date.toLocaleDateString('en-US', {
         weekday: 'long',
         year: 'numeric',

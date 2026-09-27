@@ -312,7 +312,7 @@ public class DvrEarlyFinishDecisionTests
             var api = new SportarrApiClient(http, NullLogger<SportarrApiClient>.Instance, configuration, config, cache);
             var recorder = new FFmpegRecorderService(NullLogger<FFmpegRecorderService>.Instance, config, null!);
             var service = new DvrRecordingService(NullLogger<DvrRecordingService>.Instance, db,
-                recorder, null!, config, null!, null!, null!, api, guard);
+                recorder, null!, config, null!, null!, null!, api, null!, guard);
             return new DecisionFixture(connection, db, config, recording, cache, http, handler, service, recorder, directory);
         }
 

@@ -8,6 +8,10 @@ namespace Sportarr.Api.Models;
 [XmlRoot("Config")]
 public class Config
 {
+    public const int DefaultEpgMaxDownloadSizeMb = 256;
+    public const int MinimumEpgMaxDownloadSizeMb = 1;
+    public const int MaximumEpgMaxDownloadSizeMb = 512;
+
     // Security
     public string ApiKey { get; set; } = Guid.NewGuid().ToString("N");
     public string AuthenticationMethod { get; set; } = "None"; // None, Basic, Forms
@@ -261,6 +265,7 @@ public class Config
     /// </summary>
     public string IptvTrustedNetworks { get; set; } = "";
     public int EpgRefreshHours { get; set; } = 48; // every 2 days
+    public int EpgMaxDownloadSizeMb { get; set; } = DefaultEpgMaxDownloadSizeMb;
 
     // Backlog Search Settings — scheduled missing/cutoff-unmet search.
     // RSS only catches recent releases. The backlog service walks past-aired monitored

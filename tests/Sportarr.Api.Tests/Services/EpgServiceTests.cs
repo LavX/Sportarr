@@ -6,7 +6,11 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Configuration;
 using Moq;
+using Sportarr.Api.Services.Interfaces;
+using System.Net;
+using System.Text;
 
 namespace Sportarr.Api.Tests.Services;
 
@@ -33,12 +37,35 @@ public class EpgServiceTests : IDisposable
 
     public void Dispose() => _connection.Dispose();
 
-    private static EpgService CreateService(SportarrDbContext db)
+    private static EpgService CreateService(
+        SportarrDbContext db,
+        INotificationService? notificationService = null,
+        string? xml = null)
     {
         var httpClientFactory = new Mock<IHttpClientFactory>();
-        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(new HttpClient());
-        var xmltvParser = new XmltvParserService(NullLogger<XmltvParserService>.Instance, httpClientFactory.Object);
-        return new EpgService(NullLogger<EpgService>.Instance, db, xmltvParser);
+        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(
+            xml == null
+                ? new HttpClient()
+                : new HttpClient(new XmlBodyHandler(xml)));
+        var xmltvParser = new XmltvParserService(
+            NullLogger<XmltvParserService>.Instance,
+            httpClientFactory.Object,
+            new ConfigService(new ConfigurationBuilder().Build(), NullLogger<ConfigService>.Instance));
+        notificationService ??= Mock.Of<INotificationService>();
+        return new EpgService(NullLogger<EpgService>.Instance, db, xmltvParser, notificationService);
+    }
+
+    private sealed class XmlBodyHandler(string xml) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(xml, Encoding.UTF8, "application/xml")
+            });
+        }
     }
 
     private SportarrDbContext CreateDb()
@@ -118,5 +145,112 @@ public class EpgServiceTests : IDisposable
         var service = CreateService(db);
 
         (await service.DeleteSourceAsync(999)).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task SyncSourceAsync_NotifiesOnceWithFinalCountsAfterAutoMapping()
+    {
+        await using var db = CreateDb();
+        var source = new EpgSource { Name = "Sports Guide", Url = "http://example.com/epg.xml" };
+        var iptvSource = new IptvSource { Name = "Sports Streams", Url = "http://example.com/playlist.m3u" };
+        db.AddRange(source, iptvSource);
+        await db.SaveChangesAsync();
+        db.IptvChannels.Add(new IptvChannel
+        {
+            SourceId = iptvSource.Id,
+            Name = "ESPN HD",
+            StreamUrl = "http://example.com/espn"
+        });
+        await db.SaveChangesAsync();
+
+        NotificationEventData? sentData = null;
+        var notifications = new Mock<INotificationService>();
+        notifications
+            .Setup(n => n.SendNotificationAsync(
+                NotificationTrigger.OnEpgSyncCompleted,
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<NotificationEventData>(),
+                null))
+            .Callback<NotificationTrigger, string, string, NotificationEventData?, List<int>?>(
+                (_, _, _, data, _) => sentData = data)
+            .ReturnsAsync(true);
+
+        const string xml = "<tv>" +
+            "<channel id=\"espn.us\"><display-name>ESPN</display-name></channel>" +
+            "<programme start=\"20990101000000 +0000\" stop=\"20990101010000 +0000\" channel=\"espn.us\"><title>Live Sports</title></programme>" +
+            "</tv>";
+        var service = CreateService(db, notifications.Object, xml);
+
+        var result = await service.SyncSourceAsync(source.Id);
+
+        result.Success.Should().BeTrue(result.Error);
+        result.ChannelCount.Should().Be(1);
+        result.ProgramCount.Should().Be(1);
+        result.MappedChannelCount.Should().Be(1);
+        sentData.Should().NotBeNull();
+        sentData!.EpgSourceId.Should().Be(source.Id);
+        sentData.EpgSourceName.Should().Be("Sports Guide");
+        sentData.ChannelCount.Should().Be(1);
+        sentData.ProgramCount.Should().Be(1);
+        sentData.AutoMappedChannelCount.Should().Be(1);
+        sentData.CompletedAt.Should().BeCloseTo(DateTime.UtcNow, TimeSpan.FromSeconds(5));
+        (await db.IptvChannels.SingleAsync()).TvgId.Should().Be("espn.us");
+        notifications.Verify(n => n.SendNotificationAsync(
+            NotificationTrigger.OnEpgSyncCompleted,
+            It.IsAny<string>(),
+            It.IsAny<string>(),
+            It.IsAny<NotificationEventData>(),
+            null), Times.Once);
+    }
+
+    [Fact]
+    public async Task SyncSourceAsync_StaysSuccessfulWhenCompletionNotificationFails()
+    {
+        await using var db = CreateDb();
+        var source = new EpgSource { Name = "Sports Guide", Url = "http://example.com/epg.xml" };
+        db.EpgSources.Add(source);
+        await db.SaveChangesAsync();
+
+        var notifications = new Mock<INotificationService>();
+        notifications
+            .Setup(n => n.SendNotificationAsync(
+                NotificationTrigger.OnEpgSyncCompleted,
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<NotificationEventData>(),
+                null))
+            .ThrowsAsync(new InvalidOperationException("notification unavailable"));
+
+        const string xml = "<tv><channel id=\"espn.us\"><display-name>ESPN</display-name></channel></tv>";
+        var service = CreateService(db, notifications.Object, xml);
+
+        var result = await service.SyncSourceAsync(source.Id);
+
+        result.Success.Should().BeTrue(result.Error);
+        result.ChannelCount.Should().Be(1);
+        notifications.VerifyAll();
+    }
+
+    [Fact]
+    public async Task SyncSourceAsync_DoesNotNotifyWhenParsingFails()
+    {
+        await using var db = CreateDb();
+        var source = new EpgSource { Name = "Broken Guide", Url = "http://example.com/epg.xml" };
+        db.EpgSources.Add(source);
+        await db.SaveChangesAsync();
+
+        var notifications = new Mock<INotificationService>();
+        var service = CreateService(db, notifications.Object, "<guide />");
+
+        var result = await service.SyncSourceAsync(source.Id);
+
+        result.Success.Should().BeFalse();
+        notifications.Verify(n => n.SendNotificationAsync(
+            NotificationTrigger.OnEpgSyncCompleted,
+            It.IsAny<string>(),
+            It.IsAny<string>(),
+            It.IsAny<NotificationEventData>(),
+            null), Times.Never);
     }
 }

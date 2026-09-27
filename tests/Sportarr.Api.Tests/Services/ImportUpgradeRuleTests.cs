@@ -1,4 +1,5 @@
 using FluentAssertions;
+using Sportarr.Api.Models;
 using Sportarr.Api.Services;
 using Xunit;
 
@@ -6,10 +7,8 @@ namespace Sportarr.Api.Tests.Services;
 
 /// <summary>
 /// One rule decides whether a file may take the place of the file an event
-/// already holds, whatever way the file arrived. A lower quality never
-/// replaces; the same quality replaces unless it is a revision downgrade
-/// while propers are preferred or its custom format score is lower; a
-/// higher quality always replaces.
+/// already holds, whatever way the file arrived. Profile rank comes first.
+/// Revision and custom format score decide between equal ranks.
 /// </summary>
 public class ImportUpgradeRuleTests
 {
@@ -34,7 +33,7 @@ public class ImportUpgradeRuleTests
     public void TheSameQualityReplaces()
     {
         ImportUpgradeRule.Evaluate("WEBDL-1080p", 10, "NFL - S2025E05 - Game - WEBDL-1080p", "WEBDL-1080p", 10, "NFL - S2025E05 - Game - WEBDL-1080p", Prefer)
-            .IsUpgrade.Should().BeTrue("Sonarr-style: an equal copy is accepted and takes over");
+            .IsUpgrade.Should().BeTrue("an equal copy is accepted and takes over");
     }
 
     [Fact]
@@ -101,4 +100,75 @@ public class ImportUpgradeRuleTests
         ImportUpgradeRule.Evaluate("WEBDL-1080p", 0, "Game.WEBDL-1080p", "WEBDL-1080p", 0, "Game.WEBDL-1080p.PROPER", Prefer)
             .IsUpgrade.Should().BeTrue();
     }
+
+    [Fact]
+    public void APreferredRevisionReplacesDespiteLowerFormatScore()
+    {
+        ImportUpgradeRule.Evaluate(
+                "WEBDL-1080p", 500, "Game.WEBDL-1080p",
+                "WEBDL-1080p", 0, "Game.WEBDL-1080p.PROPER",
+                Prefer)
+            .IsUpgrade.Should().BeTrue();
+    }
+
+    [Fact]
+    public void HigherProfileRankReplacesDespiteLowerFormatScore()
+    {
+        var profile = Profile(
+            Item("WEBDL-2160p", 19),
+            Item("HDTV-1080p", 6));
+
+        ImportUpgradeRule.Evaluate(
+                "HDTV-1080p", 2000, "old",
+                "WEBDL-2160p", 560, "new",
+                Prefer, profile)
+            .IsUpgrade.Should().BeTrue();
+    }
+
+    [Fact]
+    public void EqualProfileRankUsesFormatScore()
+    {
+        var profile = Profile(Group("Preferred", Item("HDTV-1080p", 6), Item("WEBDL-2160p", 19)));
+
+        ImportUpgradeRule.Evaluate(
+                "HDTV-1080p", 2000, "old",
+                "WEBDL-2160p", 560, "new",
+                Prefer, profile)
+            .IsUpgrade.Should().BeFalse();
+    }
+
+    [Fact]
+    public void LowerProfileRankNeverReplacesDespiteHigherFormatScore()
+    {
+        var profile = Profile(
+            Item("HDTV-1080p", 6),
+            Item("WEBDL-2160p", 19));
+
+        ImportUpgradeRule.Evaluate(
+                "HDTV-1080p", 0, "old",
+                "WEBDL-2160p", 5000, "new",
+                Prefer, profile)
+            .IsUpgrade.Should().BeFalse();
+    }
+
+    private static QualityProfile Profile(params QualityItem[] items) => new()
+    {
+        Name = "Test",
+        Items = items.ToList(),
+    };
+
+    private static QualityItem Item(string name, int quality) => new()
+    {
+        Name = name,
+        Quality = quality,
+        Allowed = true,
+    };
+
+    private static QualityItem Group(string name, params QualityItem[] items) => new()
+    {
+        Name = name,
+        Quality = 0,
+        Allowed = true,
+        Items = items.ToList(),
+    };
 }

@@ -13,14 +13,18 @@ namespace Sportarr.Api.Services;
 public class NewznabClient
 {
     private readonly HttpClient _httpClient;
+    private readonly IndexerQueryContext? _queryContext;
     private readonly ILogger<NewznabClient> _logger;
     private readonly QualityDetectionService? _qualityDetection;
+    internal Func<HttpRequestMessage, HttpCompletionOption, Task<HttpResponseMessage>>? SearchRequestSender { get; set; }
+    internal RawIndexerRetrievalCache? RetrievalCache { get; set; }
 
-    public NewznabClient(HttpClient httpClient, ILogger<NewznabClient> logger, QualityDetectionService? qualityDetection = null)
+    public NewznabClient(HttpClient httpClient, ILogger<NewznabClient> logger, QualityDetectionService? qualityDetection = null, IndexerQueryContext? queryContext = null)
     {
         _httpClient = httpClient;
         _logger = logger;
         _qualityDetection = qualityDetection;
+        _queryContext = queryContext;
     }
 
     /// <summary>
@@ -70,7 +74,7 @@ public class NewznabClient
 
     private async Task<TorznabCapabilities?> GetCachedCapabilitiesAsync(Indexer config)
     {
-        var cacheKey = $"{config.Id}|{config.Url}";
+        var cacheKey = IndexerSearchPaging.CapabilityKey(config, BuildUrl(config, "caps"));
         if (CapsCache.TryGetValue(cacheKey, out var cached))
         {
             var age = DateTime.UtcNow - cached.FetchedAt;
@@ -94,7 +98,13 @@ public class NewznabClient
             try
             {
                 var url = BuildUrl(config, "caps");
-                using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                using var request = _queryContext == null
+                    ? new HttpRequestMessage(HttpMethod.Get, url)
+                    : IndexerQueryRequest.Create(config, url, _queryContext);
+                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                if (_queryContext != null && response.StatusCode == HttpStatusCode.TooManyRequests)
+                    throw new IndexerRateLimitException($"Rate limited by {config.Name}",
+                        response.Headers.RetryAfter?.Delta ?? (response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow));
                 if (response.IsSuccessStatusCode)
                 {
                     var xml = await Sportarr.Api.Helpers.BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
@@ -102,6 +112,14 @@ public class NewznabClient
                     TorznabClient.ParseCapabilitiesXml(xml, parsed);
                     caps = parsed;
                 }
+            }
+            catch (IndexerQueryAdmissionException)
+            {
+                throw;
+            }
+            catch (IndexerRateLimitException) when (_queryContext != null)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -124,117 +142,55 @@ public class NewznabClient
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
     {
-        // Build parameters with category filtering
-        var parameters = new Dictionary<string, string>
-        {
-            { "q", query },
-            { "limit", maxResults.ToString() },
-            { "extended", "1" }
-        };
-
-        if (!string.IsNullOrEmpty(sportarrId))
-        {
-            var caps = await GetCachedCapabilitiesAsync(config);
-            if (caps?.SupportedSearchParams.Contains("sportarrid") == true)
-            {
-                parameters["sportarrid"] = sportarrId;
-                _logger.LogDebug("[Newznab] {Indexer} supports sportarrid - searching by id {Id}", config.Name, sportarrId);
-            }
-        }
-
-        // Add category filter - use configured categories or default sport categories.
-        // An interactive search opts out: the user asked for this event by hand, and
-        // trackers file sports under TV, movies, or anything else, so a category list
-        // silently hides a valid release instead of ranking it lower.
-        var categories = useCategoryFilter ? GetEffectiveCategories(config) : new List<string>();
-        if (categories.Any())
-        {
-            parameters["cat"] = string.Join(",", categories);
-        }
-
-        _logger.LogInformation("[Newznab] Searching {Indexer} for: {Query}", config.Name, query);
-        _logger.LogDebug("[Newznab] Categories: {Categories}", categories.Any() ? string.Join(",", categories) : "(none)");
-
-        // Walk the indexer's pages.
-        //
-        // Only the first page was ever requested. An indexer that caps a page
-        // below the asked-for limit therefore hid every release past that cap,
-        // and no search could ever reach them. Extra pages are requested only
-        // when the indexer says it holds more than it just sent, so an
-        // ordinary search still costs exactly one request.
-        var results = new List<ReleaseSearchResult>();
-        var seenGuids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var offset = 0;
-
-        for (var page = 0; page < MaxSearchPages; page++)
-        {
-            if (offset > 0)
-            {
-                parameters["offset"] = offset.ToString();
-            }
-
-            var url = BuildUrl(config, "search", parameters);
-            _logger.LogDebug("[Newznab] Search URL: {Url}", SecretRedactor.Url(url));
-
-            var (pageResults, reportedTotal) = await FetchAndParseAsync(config, url, "Search");
-            if (pageResults.Count == 0) break;
-
-            var addedThisPage = 0;
-            foreach (var r in pageResults)
-            {
-                // An offset the indexer ignores would otherwise re-add the
-                // same releases until the page cap is hit.
-                var key = !string.IsNullOrEmpty(r.Guid) ? r.Guid : r.DownloadUrl ?? r.Title;
-                if (!string.IsNullOrEmpty(key) && !seenGuids.Add(key)) continue;
-                results.Add(r);
-                addedThisPage++;
-            }
-
-            // A page of nothing but repeats proves the offset is being
-            // ignored. The dedup kept the list clean but the loop still
-            // paid for every remaining page of the same answers.
-            if (addedThisPage == 0) break;
-
-            offset += pageResults.Count;
-            if (results.Count >= maxResults) break;
-            if (reportedTotal == null || offset >= reportedTotal.Value) break;
-        }
-
-        if (results.Count > maxResults)
-        {
-            results = results.Take(maxResults).ToList();
-        }
-
-        ApplyMultiLanguages(results, config);
-
-        _logger.LogInformation("[Newznab] Found {Count} results from {Indexer}", results.Count, config.Name);
-
-        return results;
+        var outcome = await SearchDetailedAsync(config, query, maxResults, sportarrId, useCategoryFilter);
+        if (outcome.Failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(outcome.Failure).Throw();
+        return outcome.Releases;
     }
 
-    /// <summary>
-    /// Hard ceiling on how many pages one search walks. A misreported total
-    /// must not turn a single search into an unbounded request loop.
-    /// </summary>
-    private const int MaxSearchPages = 5;
-
-    /// <summary>
-    /// Issue one request and parse it, applying the shared rate-limit headers
-    /// and the shared 429 / non-success handling.
-    /// </summary>
-    private async Task<(List<ReleaseSearchResult> Results, int? Total)> FetchAndParseAsync(
-        Indexer config, string url, string what)
+    public async Task<IndexerSearchOutcome> SearchDetailedAsync(Indexer config, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
     {
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("X-Indexer-Id", config.Id.ToString());
-
-        // Use custom rate limit if configured, otherwise default (2 seconds)
-        if (config.RequestDelayMs > 0)
+        TorznabCapabilities? caps = null;
+        var key = IndexerSearchPaging.CapabilityKey(config, BuildUrl(config, "caps"));
+        if (CapsCache.TryGetValue(key, out var cached) && cached.Caps != null && DateTime.UtcNow - cached.FetchedAt < CapsCacheTtl)
+            caps = cached.Caps;
+        try
         {
-            request.Headers.Add("X-Rate-Limit-Ms", config.RequestDelayMs.ToString());
+            if (!string.IsNullOrEmpty(sportarrId)) caps = await GetCachedCapabilitiesAsync(config);
         }
+        catch (Exception failure)
+        {
+            return IndexerSearchOutcome.Failed(failure);
+        }
+        var parameters = new Dictionary<string, string> { ["q"] = query, ["extended"] = "1" };
+        if (!string.IsNullOrEmpty(sportarrId) && caps?.SupportedSearchParams.Contains("sportarrid") == true)
+            parameters["sportarrid"] = sportarrId;
+        var categories = useCategoryFilter ? GetEffectiveCategories(config) : new List<string>();
+        if (categories.Any()) parameters["cat"] = string.Join(",", categories);
+        var ambiguousPaging = IndexerSearchPaging.HasAmbiguousPaging(config);
+        var retrievalUrl = BuildUrl(config, "search", parameters);
+        Task<IndexerSearchOutcome> FetchAsync() => IndexerSearchPaging.FetchAsync(maxResults, caps, ambiguousPaging,
+            async (offset, limit) =>
+            {
+                parameters["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                if (offset > 0) parameters["offset"] = offset.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return await FetchSearchPageAsync(config, BuildUrl(config, "search", parameters));
+            }, xml => ParseSearchResults(xml, config.Name).Results);
+        using var retrievalRequest = IndexerQueryRequest.Create(config, retrievalUrl, _queryContext);
+        var outcome = RetrievalCache == null ? await FetchAsync() : await RetrievalCache.GetOrFetchAsync(
+            _httpClient, config, retrievalRequest, maxResults, caps, ambiguousPaging, FetchAsync);
+        if (outcome.FromCache)
+            foreach (var release in outcome.Releases) release.Score = CalculateScore(release);
+        ApplyMultiLanguages(outcome.Releases, config);
+        return outcome;
+    }
 
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+    private async Task<string> FetchSearchPageAsync(Indexer config, string url)
+    {
+        using var request = IndexerQueryRequest.Create(config, url, _queryContext);
+
+        using var response = SearchRequestSender == null
+            ? await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead)
+            : await SearchRequestSender(request, HttpCompletionOption.ResponseHeadersRead);
 
         // Handle HTTP 429 Too Many Requests
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -257,14 +213,13 @@ public class NewznabClient
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogWarning("[Newznab] {What} failed for {Indexer}: {Status}", what, config.Name, response.StatusCode);
-            throw new IndexerRequestException($"{what} failed for {config.Name}: {response.StatusCode}", response.StatusCode);
+            _logger.LogWarning("[Newznab] Search failed for {Indexer}: {Status}", config.Name, response.StatusCode);
+            throw new IndexerRequestException($"Search failed for {config.Name}: {response.StatusCode}", response.StatusCode);
         }
 
         var xml = await Sportarr.Api.Helpers.BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
-        return ParseSearchResults(xml, config.Name);
+        return xml;
     }
-
     /// <summary>
     /// Fetch RSS feed — recent releases without a search query.
     /// Returns the most recent releases from the indexer for passive discovery
@@ -293,17 +248,12 @@ public class NewznabClient
 
         _logger.LogDebug("[Newznab] Fetching RSS feed from {Indexer}", config.Name);
 
-        // Create request with rate limit headers for RateLimitHandler
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("X-Indexer-Id", config.Id.ToString());
+        // Create request with rate limit headers for IndexerQueryQuotaHandler
+        using var request = IndexerQueryRequest.Create(config, url, _queryContext);
 
-        // Use custom rate limit if configured, otherwise default (2 seconds)
-        if (config.RequestDelayMs > 0)
-        {
-            request.Headers.Add("X-Rate-Limit-Ms", config.RequestDelayMs.ToString());
-        }
-
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        using var response = SearchRequestSender == null
+            ? await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead)
+            : await SearchRequestSender(request, HttpCompletionOption.ResponseHeadersRead);
 
         // Handle HTTP 429 Too Many Requests
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -484,7 +434,7 @@ public class NewznabClient
                     Seeders = null,
                     Leechers = null,
                     Language = LanguageDetector.DetectLanguage(title),
-                    ReleaseGroup = ExtractReleaseGroup(title)
+                    ReleaseGroup = ReleaseGroupParser.Parse(title)
                 };
 
                 // Prowlarr/Jackett stamp each item with its true origin
@@ -555,18 +505,6 @@ public class NewznabClient
         }
 
         return (results, reportedTotal);
-    }
-
-    private static readonly System.Text.RegularExpressions.Regex ReleaseGroupRegex =
-        new(@"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$", System.Text.RegularExpressions.RegexOptions.Compiled);
-
-    private static string? ExtractReleaseGroup(string title)
-    {
-        var match = ReleaseGroupRegex.Match(title);
-        if (!match.Success) return null;
-        var group = match.Groups[1].Value;
-        var excluded = new[] { "DL", "WEB", "HD", "SD", "UHD" };
-        return excluded.Contains(group.ToUpper()) ? null : group;
     }
 
     private string? GetNewznabAttr(XElement item, string attrName)

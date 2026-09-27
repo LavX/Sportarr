@@ -107,12 +107,10 @@ public static class SonarrWantedEndpoint
 
         // GET /api/v3/wanted/cutoff - downloaded episodes whose file quality
         // sits below the profile cutoff. Prometheus exporters chart this as
-        // the upgrade backlog. Uses the same scoring the automatic search
-        // upgrade gate applies (CalculateQualityScoreFromName vs the cutoff
-        // item's name score), so the count matches what Sportarr would
-        // actually try to upgrade. Files with an unparseable quality score 0
-        // and are excluded for the same reason automatic search refuses to
-        // upgrade them.
+        // the upgrade backlog. Uses the same profile rank the automatic
+        // search upgrade gate applies, so the count matches what Sportarr
+        // would actually try to upgrade. Files with an unparseable quality
+        // have rank 0. The automatic search also refuses to upgrade them.
         app.MapGet("/api/v3/wanted/cutoff", async (
             SportarrDbContext db,
             ILogger<Program> logger,
@@ -129,9 +127,9 @@ public static class SonarrWantedEndpoint
                 pageNumber, effectivePageSize);
 
             var profiles = await db.QualityProfiles.ToListAsync();
-            var cutoffScores = profiles
+            var cutoffRanks = profiles
                 .Where(p => p.UpgradesAllowed && p.CutoffQuality.HasValue)
-                .ToDictionary(p => p.Id, p => GetCutoffQualityScore(p, p.CutoffQuality!.Value));
+                .ToDictionary(p => p.Id, p => Helpers.QualityProfileRanker.GetCutoffRank(p, p.CutoffQuality!.Value));
 
             var candidates = await db.Events
                 .AsNoTracking()
@@ -147,13 +145,13 @@ public static class SonarrWantedEndpoint
             var unmet = candidates
                 .Where(x =>
                 {
-                    var profileId = x.Event.League?.QualityProfileId;
-                    if (profileId == null || !cutoffScores.TryGetValue(profileId.Value, out var cutoffScore) || cutoffScore <= 0)
+                    var profile = RssSyncService.ResolveQualityProfile(x.Event, profiles);
+                    if (profile == null || !cutoffRanks.TryGetValue(profile.Id, out var cutoffRank) || cutoffRank <= 0)
                         return false;
                     var best = x.Qualities.Count == 0
                         ? 0
-                        : x.Qualities.Max(q => ReleaseEvaluator.CalculateQualityScoreFromName(q));
-                    return best > 0 && best < cutoffScore;
+                        : x.Qualities.Max(q => Helpers.QualityProfileRanker.GetRank(profile, q));
+                    return best > 0 && best < cutoffRank;
                 })
                 .Select(x => x.Event);
 
@@ -192,25 +190,4 @@ public static class SonarrWantedEndpoint
         return app;
     }
 
-    /// <summary>
-    /// Mirror of AutomaticSearchService.GetCutoffQualityScore: resolves the
-    /// profile's cutoff quality index to a comparable score via the cutoff
-    /// item's display name, checking group members too.
-    /// </summary>
-    private static int GetCutoffQualityScore(QualityProfile profile, int qualityIndex)
-    {
-        var qualityItem = profile.Items.FirstOrDefault(i => i.Quality == qualityIndex);
-        if (qualityItem == null)
-        {
-            foreach (var item in profile.Items)
-            {
-                if (item.IsGroup && item.Items != null)
-                {
-                    qualityItem = item.Items.FirstOrDefault(i => i.Quality == qualityIndex);
-                    if (qualityItem != null) break;
-                }
-            }
-        }
-        return ReleaseEvaluator.CalculateQualityScoreFromName(qualityItem?.Name);
-    }
 }

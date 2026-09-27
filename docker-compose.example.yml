@@ -20,11 +20,14 @@ services:
     volumes:
       - ./config:/config
       - /path/to/your/sports:/data
+      # Optional root startup script:
+      # - ./startup.sh:/custom/startup.sh:ro
     environment:
       - PUID=99
       - PGID=100
       - UMASK=022
       - TZ=America/New_York
+      # - SPORTARR_STARTUP_SCRIPT=/custom/startup.sh
       - Sportarr__Database__Provider=postgres
       - Sportarr__Database__Host=postgres
       - Sportarr__Database__Port=5432

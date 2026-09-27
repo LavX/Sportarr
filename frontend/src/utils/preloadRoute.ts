@@ -21,12 +21,16 @@ const ROUTE_IMPORTS: Record<string, () => Promise<unknown>> = {
 
   // The parent entries redirect to their first child, so warm what the user
   // actually lands on.
-  '/iptv': () => import('../pages/settings/IptvSettings'),
+  '/iptv': () => import('../pages/iptv/TvGuidePage'),
   '/iptv/sources': () => import('../pages/settings/IptvSettings'),
   '/iptv/channels': () => import('../pages/settings/IptvChannelsSettings'),
   '/iptv/guide': () => import('../pages/iptv/TvGuidePage'),
   '/iptv/recordings': () => import('../pages/settings/DvrRecordingsSettings'),
   '/iptv/dvr-settings': () => import('../pages/settings/DvrSettingsPage'),
+  '/iptv/settings': () => import('../pages/settings/IptvSettings'),
+  '/iptv/settings/providers': () => import('../pages/settings/IptvSettings'),
+  '/iptv/settings/recording': () => import('../pages/settings/DvrSettingsPage'),
+  '/iptv/settings/advanced': () => import('../pages/settings/IptvSettings'),
 
   '/settings': () => import('../pages/settings/MediaManagementSettings'),
   '/settings/mediamanagement': () => import('../pages/settings/MediaManagementSettings'),

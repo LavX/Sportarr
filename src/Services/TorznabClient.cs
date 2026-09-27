@@ -89,15 +89,24 @@ public static class NewznabCategories
 public class TorznabClient
 {
     private readonly HttpClient _httpClient;
+    private readonly IndexerQueryContext? _queryContext;
     private readonly ILogger<TorznabClient> _logger;
     private readonly QualityDetectionService? _qualityDetection;
+    internal Func<HttpRequestMessage, HttpCompletionOption, Task<HttpResponseMessage>>? SearchRequestSender { get; set; }
+    internal RawIndexerRetrievalCache? RetrievalCache { get; set; }
 
-    public TorznabClient(HttpClient httpClient, ILogger<TorznabClient> logger, QualityDetectionService? qualityDetection = null)
+    public TorznabClient(HttpClient httpClient, ILogger<TorznabClient> logger, QualityDetectionService? qualityDetection = null, IndexerQueryContext? queryContext = null)
     {
         _httpClient = httpClient;
         _logger = logger;
         _qualityDetection = qualityDetection;
+        _queryContext = queryContext;
     }
+
+    private Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, HttpCompletionOption completionOption) =>
+        SearchRequestSender == null
+            ? _httpClient.SendAsync(request, completionOption)
+            : SearchRequestSender(request, completionOption);
 
     /// <summary>
     /// Test connection to Torznab indexer
@@ -109,11 +118,12 @@ public class TorznabClient
         {
             var url = BuildUrl(config, "caps");
             _logger.LogInformation("[Torznab] Testing connection to {Indexer} at {Url}", config.Name, Sportarr.Api.Helpers.SecretRedactor.Url(url));
-            using var response = await _httpClient.GetAsync(url);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
             if (response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadAsStringAsync();
+                var body = await BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
                 // Parse tolerantly: some Prowlarr-managed indexers answer t=caps with
                 // an HTML error page instead of XML, which used to throw an XmlException
                 // and fail the whole test even though RSS/search work fine.
@@ -154,11 +164,12 @@ public class TorznabClient
                 parameters["cat"] = string.Join(",", categories);
             }
             var url = BuildUrl(config, "search", parameters);
-            using var response = await _httpClient.GetAsync(url);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
             if (response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadAsStringAsync();
+                var body = await BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
                 // A Torznab search/RSS response is an RSS 2.0 document (root <rss>).
                 // An <error> root (bad apikey, etc.) or non-XML must still fail.
                 if (TryGetXmlRoot(body, out var rootName) && (rootName == "rss" || rootName == "feed"))
@@ -204,10 +215,12 @@ public class TorznabClient
     }
 
     // Caps cache, static because IndexerSearchService constructs a fresh
-    // client per search. Keyed on id + url so editing the indexer
-    // refetches. Failures are cached too (as null) so an indexer with a
-    // broken caps endpoint isn't re-probed on every single search.
+    // client per search. The key represents the provider request, so rows
+    // with the same endpoint and credentials share one discovery request.
+    // Failures are cached too so a broken caps endpoint is not probed on
+    // every search.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (TorznabCapabilities? Caps, DateTime FetchedAt)> CapsCache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> CapsFetchLocks = new();
     private static readonly TimeSpan CapsCacheTtl = TimeSpan.FromHours(12);
     private static readonly TimeSpan CapsFailureRetry = TimeSpan.FromMinutes(15);
 
@@ -218,7 +231,7 @@ public class TorznabClient
     /// </summary>
     private async Task<TorznabCapabilities?> GetCachedCapabilitiesAsync(Indexer config)
     {
-        var cacheKey = $"{config.Id}|{config.Url}";
+        var cacheKey = IndexerSearchPaging.CapabilityKey(config, BuildUrl(config, "caps"));
         if (CapsCache.TryGetValue(cacheKey, out var cached))
         {
             var age = DateTime.UtcNow - cached.FetchedAt;
@@ -226,9 +239,25 @@ public class TorznabClient
                 return cached.Caps;
         }
 
-        var caps = await GetCapabilitiesAsync(config);
-        CapsCache[cacheKey] = (caps, DateTime.UtcNow);
-        return caps;
+        var gate = CapsFetchLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync();
+        try
+        {
+            if (CapsCache.TryGetValue(cacheKey, out var fresh))
+            {
+                var freshAge = DateTime.UtcNow - fresh.FetchedAt;
+                if (freshAge < (fresh.Caps != null ? CapsCacheTtl : CapsFailureRetry))
+                    return fresh.Caps;
+            }
+
+            var caps = await GetCapabilitiesCoreAsync(config, _queryContext);
+            CapsCache[cacheKey] = (caps, DateTime.UtcNow);
+            return caps;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     /// <summary>
@@ -241,51 +270,53 @@ public class TorznabClient
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchAsync(Indexer config, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
     {
-        // Build parameters with category filtering
-        var parameters = new Dictionary<string, string>
-        {
-            { "q", query },
-            { "limit", maxResults.ToString() },
-            { "extended", "1" }
-        };
+        var outcome = await SearchDetailedAsync(config, query, maxResults, sportarrId, useCategoryFilter);
+        if (outcome.Failure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(outcome.Failure).Throw();
+        return outcome.Releases;
+    }
 
-        if (!string.IsNullOrEmpty(sportarrId))
+    public async Task<IndexerSearchOutcome> SearchDetailedAsync(Indexer config, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
+    {
+        TorznabCapabilities? caps = null;
+        var key = IndexerSearchPaging.CapabilityKey(config, BuildUrl(config, "caps"));
+        if (CapsCache.TryGetValue(key, out var cached) && cached.Caps != null && DateTime.UtcNow - cached.FetchedAt < CapsCacheTtl)
+            caps = cached.Caps;
+        try
         {
-            var caps = await GetCachedCapabilitiesAsync(config);
-            if (caps?.SupportedSearchParams.Contains("sportarrid") == true)
-            {
-                parameters["sportarrid"] = sportarrId;
-                _logger.LogDebug("[Torznab] {Indexer} supports sportarrid - searching by id {Id}", config.Name, sportarrId);
-            }
+            if (!string.IsNullOrEmpty(sportarrId)) caps = await GetCachedCapabilitiesAsync(config);
         }
-
-        // Add category filter - use configured categories or default sport categories.
-        // An interactive search opts out: the user asked for this event by hand, and
-        // trackers file sports under TV, movies, or anything else, so a category list
-        // silently hides a valid release instead of ranking it lower.
+        catch (Exception failure)
+        {
+            return IndexerSearchOutcome.Failed(failure);
+        }
+        var parameters = new Dictionary<string, string> { ["q"] = query, ["extended"] = "1" };
+        if (!string.IsNullOrEmpty(sportarrId) && caps?.SupportedSearchParams.Contains("sportarrid") == true)
+            parameters["sportarrid"] = sportarrId;
         var categories = useCategoryFilter ? GetEffectiveCategories(config) : new List<string>();
-        if (categories.Any())
-        {
-            parameters["cat"] = string.Join(",", categories);
-        }
+        if (categories.Any()) parameters["cat"] = string.Join(",", categories);
+        var ambiguousPaging = IndexerSearchPaging.HasAmbiguousPaging(config);
+        var retrievalUrl = BuildUrl(config, "search", parameters);
+        Task<IndexerSearchOutcome> FetchAsync() => IndexerSearchPaging.FetchAsync(maxResults, caps, ambiguousPaging,
+            async (offset, limit) =>
+            {
+                parameters["limit"] = limit.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                if (offset > 0) parameters["offset"] = offset.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return await FetchSearchPageAsync(config, BuildUrl(config, "search", parameters));
+            }, xml => ParseSearchResults(xml, config.Name));
+        using var retrievalRequest = IndexerQueryRequest.Create(config, retrievalUrl, _queryContext);
+        var outcome = RetrievalCache == null ? await FetchAsync() : await RetrievalCache.GetOrFetchAsync(
+            _httpClient, config, retrievalRequest, maxResults, caps, ambiguousPaging, FetchAsync);
+        if (outcome.FromCache)
+            foreach (var release in outcome.Releases) release.Score = CalculateScore(release);
+        ApplyMultiLanguages(outcome.Releases, config);
+        return outcome;
+    }
 
-        var url = BuildUrl(config, "search", parameters);
+    private async Task<string> FetchSearchPageAsync(Indexer config, string url)
+    {
+        using var request = IndexerQueryRequest.Create(config, url, _queryContext);
 
-        _logger.LogInformation("[Torznab] Searching {Indexer} for: {Query}", config.Name, query);
-        _logger.LogDebug("[Torznab] Search URL: {Url}", string.IsNullOrEmpty(config.ApiKey) ? url : url.Replace(config.ApiKey, "***"));
-        _logger.LogDebug("[Torznab] Categories: {Categories}", categories.Any() ? string.Join(",", categories) : "(none)");
-
-        // Create request with rate limit headers for RateLimitHandler
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("X-Indexer-Id", config.Id.ToString());
-
-        // Use custom rate limit if configured, otherwise default (2 seconds)
-        if (config.RequestDelayMs > 0)
-        {
-            request.Headers.Add("X-Rate-Limit-Ms", config.RequestDelayMs.ToString());
-        }
-
-        using var response = await _httpClient.SendAsync(request);
+        using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
         // Handle HTTP 429 Too Many Requests
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -312,15 +343,9 @@ public class TorznabClient
             throw new IndexerRequestException($"Search failed for {config.Name}: {response.StatusCode}", response.StatusCode);
         }
 
-        var xml = await response.Content.ReadAsStringAsync();
-        var results = ParseSearchResults(xml, config.Name);
-        ApplyMultiLanguages(results, config);
-
-        _logger.LogInformation("[Torznab] Found {Count} results from {Indexer}", results.Count, config.Name);
-
-        return results;
+        var xml = await BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
+        return xml;
     }
-
     /// <summary>
     /// Fetch RSS feed — recent releases without a search query.
     /// Returns the most recent releases from the indexer for passive discovery
@@ -349,17 +374,10 @@ public class TorznabClient
 
         _logger.LogDebug("[Torznab] Fetching RSS feed from {Indexer}", config.Name);
 
-        // Create request with rate limit headers for RateLimitHandler
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("X-Indexer-Id", config.Id.ToString());
+        // Create request with rate limit headers for IndexerQueryQuotaHandler
+        using var request = IndexerQueryRequest.Create(config, url, _queryContext);
 
-        // Use custom rate limit if configured, otherwise default (2 seconds)
-        if (config.RequestDelayMs > 0)
-        {
-            request.Headers.Add("X-Rate-Limit-Ms", config.RequestDelayMs.ToString());
-        }
-
-        using var response = await _httpClient.SendAsync(request);
+        using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
         // Handle HTTP 429 Too Many Requests
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -386,7 +404,7 @@ public class TorznabClient
             throw new IndexerRequestException($"RSS fetch failed for {config.Name}: {response.StatusCode}", response.StatusCode);
         }
 
-        var xml = await response.Content.ReadAsStringAsync();
+        var xml = await BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
         var results = ParseSearchResults(xml, config.Name);
         ApplyMultiLanguages(results, config);
 
@@ -398,20 +416,37 @@ public class TorznabClient
     /// <summary>
     /// Get capabilities of the indexer
     /// </summary>
-    public async Task<TorznabCapabilities?> GetCapabilitiesAsync(Indexer config)
+    public Task<TorznabCapabilities?> GetCapabilitiesAsync(Indexer config) =>
+        GetCapabilitiesCoreAsync(config, null);
+
+    private async Task<TorznabCapabilities?> GetCapabilitiesCoreAsync(Indexer config, IndexerQueryContext? queryContext)
     {
         try
         {
             var url = BuildUrl(config, "caps");
-            using var response = await _httpClient.GetAsync(url);
+            using var request = queryContext == null
+                ? new HttpRequestMessage(HttpMethod.Get, url)
+                : IndexerQueryRequest.Create(config, url, queryContext);
+            using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (queryContext != null && response.StatusCode == HttpStatusCode.TooManyRequests)
+                throw new IndexerRateLimitException($"Rate limited by {config.Name}",
+                    response.Headers.RetryAfter?.Delta ?? (response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow));
 
             if (!response.IsSuccessStatusCode)
             {
                 return null;
             }
 
-            var xml = await response.Content.ReadAsStringAsync();
+            var xml = await BoundedHttpContent.ReadAsStringAsync(response.Content, "The indexer response");
             return ParseCapabilities(xml);
+        }
+        catch (IndexerQueryAdmissionException)
+        {
+            throw;
+        }
+        catch (IndexerRateLimitException) when (queryContext != null)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -544,7 +579,7 @@ public class TorznabClient
                     Seeders = ParseInt(GetTorznabAttr(item, "seeders")),
                     Leechers = ParseInt(GetTorznabAttr(item, "peers")),
                     Language = LanguageDetector.DetectLanguage(title),
-                    ReleaseGroup = ExtractReleaseGroup(title)
+                    ReleaseGroup = ReleaseGroupParser.Parse(title)
                 };
 
                 // Prowlarr/Jackett stamp each item with its true origin
@@ -646,6 +681,12 @@ public class TorznabClient
     {
         var doc = XDocument.Parse(xml);
 
+        var limits = doc.Descendants("limits").FirstOrDefault();
+        capabilities.MaxPageSize = IndexerSearchPaging.PositiveLimit(limits?.Attribute("max")?.Value);
+        capabilities.DefaultPageSize = IndexerSearchPaging.PositiveLimit(limits?.Attribute("default")?.Value);
+        if (capabilities.MaxPageSize.HasValue && capabilities.DefaultPageSize > capabilities.MaxPageSize)
+            capabilities.DefaultPageSize = capabilities.MaxPageSize;
+
         // Parse searching capabilities
         var searching = doc.Descendants("searching").FirstOrDefault();
         if (searching != null)
@@ -697,24 +738,12 @@ public class TorznabClient
         }
     }
 
-    private static readonly System.Text.RegularExpressions.Regex ReleaseGroupRegex =
-        new(@"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$", System.Text.RegularExpressions.RegexOptions.Compiled);
-
-    private static string? ExtractReleaseGroup(string title)
-    {
-        var match = ReleaseGroupRegex.Match(title);
-        if (!match.Success) return null;
-        var group = match.Groups[1].Value;
-        var excluded = new[] { "DL", "WEB", "HD", "SD", "UHD" };
-        return excluded.Contains(group.ToUpper()) ? null : group;
-    }
-
     private string? GetTorznabAttr(XElement item, string attrName)
     {
-        // Attr NAME matching is case-insensitive; the namespace stays
-        // exact per the torznab spec.
         var torznabNs = XNamespace.Get("http://torznab.com/schemas/2015/feed");
-        return item.Descendants(torznabNs + "attr")
+        var newznabNs = XNamespace.Get("http://www.newznab.com/DTD/2010/feeds/attributes/");
+        return item.Descendants()
+            .Where(element => element.Name == torznabNs + "attr" || element.Name == newznabNs + "attr")
             .FirstOrDefault(a => string.Equals(a.Attribute("name")?.Value, attrName, StringComparison.OrdinalIgnoreCase))
             ?.Attribute("value")?.Value;
     }
@@ -848,6 +877,8 @@ public class TorznabClient
 /// </summary>
 public class TorznabCapabilities
 {
+    public int? MaxPageSize { get; set; }
+    public int? DefaultPageSize { get; set; }
     public bool SearchAvailable { get; set; }
     public bool TvSearchAvailable { get; set; }
     public bool MovieSearchAvailable { get; set; }

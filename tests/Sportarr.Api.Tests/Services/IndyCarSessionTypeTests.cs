@@ -103,12 +103,9 @@ public class IndyCarSessionTypeTests
     }
 
     [Fact]
-    public void A_league_with_no_definitions_is_unaffected_by_the_indycar_default()
+    public void Another_league_does_not_use_the_indycar_default()
     {
-        // The default answer belongs to IndyCar alone. A series with no
-        // definitions must still report nothing, or every one of its events
-        // would start calling itself a race.
-        EventPartDetector.DetectMotorsportSessionType("Daytona 500", "NASCAR Cup Series")
+        EventPartDetector.DetectMotorsportSessionType("Monte Carlo Rally", "World Rally Championship")
             .Should().BeNull();
     }
 

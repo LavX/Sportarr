@@ -19,6 +19,23 @@ namespace Sportarr.Api.Helpers;
 /// </summary>
 public static class TorrentHashHelper
 {
+    public static string? ResolveTrackedInfoHash(
+        string? protocol,
+        string? indexerInfoHash,
+        string? downloadId)
+    {
+        if (!string.IsNullOrWhiteSpace(indexerInfoHash))
+            return indexerInfoHash;
+
+        if (!string.Equals(protocol, "Torrent", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(downloadId) ||
+            (downloadId.Length != 40 && downloadId.Length != 64) ||
+            !downloadId.All(Uri.IsHexDigit))
+            return null;
+
+        return downloadId;
+    }
+
     public static bool IsMagnet(string? url) =>
         !string.IsNullOrEmpty(url) && url.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase);
 

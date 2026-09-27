@@ -1,0 +1,459 @@
+[
+  {
+    "id": "R01",
+    "name": "Event interactive search and selected grab",
+    "actions": [
+      "POST /api/event/{id}/search",
+      "POST /api/release/grab"
+    ],
+    "variants": [
+      "page and modal entry points",
+      "ordinary search",
+      "explicit part",
+      "custom query",
+      "force refresh",
+      "chunked body"
+    ],
+    "required": true
+  },
+  {
+    "id": "R02",
+    "name": "Direct release search and grab",
+    "actions": [
+      "POST /api/release/search",
+      "POST /api/release/grab"
+    ],
+    "variants": [
+      "explicit event",
+      "API path"
+    ],
+    "required": true
+  },
+  {
+    "id": "R03",
+    "name": "Interactive pack search and grab",
+    "actions": [
+      "POST /api/event/{id}/search-pack",
+      "POST /api/release/grab"
+    ],
+    "variants": [
+      "single payload",
+      "covered events",
+      "partial pack"
+    ],
+    "required": true
+  },
+  {
+    "id": "R04",
+    "name": "Interactive season search and grab",
+    "actions": [
+      "POST /api/leagues/{id}/seasons/{season}/search",
+      "POST /api/release/grab"
+    ],
+    "variants": [
+      "SeasonSearchModal",
+      "matchedEventIds",
+      "isSeasonPack"
+    ],
+    "required": true
+  },
+  {
+    "id": "R05",
+    "name": "One-event automatic selection requested by the user",
+    "actions": [
+      "POST /api/event/{id}/automatic-search",
+      "EventSearch task"
+    ],
+    "variants": [
+      "no part",
+      "one part",
+      "inherited monitored parts"
+    ],
+    "required": true
+  },
+  {
+    "id": "R06",
+    "name": "Whole-league automatic selection",
+    "actions": [
+      "POST /api/league/{id}/automatic-search"
+    ],
+    "variants": [
+      "completed",
+      "future",
+      "postponed",
+      "already satisfied",
+      "unmonitored"
+    ],
+    "required": true
+  },
+  {
+    "id": "R07",
+    "name": "Season automatic selection",
+    "actions": [
+      "POST /api/leagues/{id}/seasons/{season}/automatic-search"
+    ],
+    "variants": [
+      "queueing",
+      "monitored part fan-out"
+    ],
+    "required": true
+  },
+  {
+    "id": "R08",
+    "name": "All-monitored automatic selection",
+    "actions": [
+      "POST /api/automatic-search/all"
+    ],
+    "variants": [
+      "multiple leagues",
+      "competing profiles",
+      "single league"
+    ],
+    "required": true
+  },
+  {
+    "id": "R09",
+    "name": "Wanted individual search",
+    "actions": [
+      "POST /api/search/queue",
+      "Wanted action"
+    ],
+    "variants": [
+      "task completion",
+      "file import"
+    ],
+    "required": true
+  },
+  {
+    "id": "R10",
+    "name": "Wanted missing Search All",
+    "actions": [
+      "POST /api/wanted/missing/search-all"
+    ],
+    "variants": [
+      "repeat click",
+      "overlap with R08",
+      "overlap with R09"
+    ],
+    "required": true
+  },
+  {
+    "id": "R11",
+    "name": "Wanted cutoff-unmet Search All",
+    "actions": [
+      "POST /api/wanted/cutoff-unmet/search-all"
+    ],
+    "variants": [
+      "valid upgrade",
+      "upgrade disabled",
+      "already at cutoff"
+    ],
+    "required": true
+  },
+  {
+    "id": "R12",
+    "name": "Scheduled backlog",
+    "actions": [
+      "BacklogSearchService loop"
+    ],
+    "variants": [
+      "missing work",
+      "cutoff work",
+      "age and grace rules",
+      "status rules",
+      "next attempt",
+      "restart"
+    ],
+    "required": true
+  },
+  {
+    "id": "R13",
+    "name": "Event search-on-add",
+    "actions": [
+      "POST /api/events with SearchOnAdd"
+    ],
+    "variants": [
+      "enabled",
+      "disabled"
+    ],
+    "required": true
+  },
+  {
+    "id": "R14",
+    "name": "Follow, import-list, and league search eligibility",
+    "actions": [
+      "FollowedTeamsAndTeamsEndpoints",
+      "import-list sync",
+      "league search flags",
+      "configured scheduler"
+    ],
+    "variants": [
+      "creation",
+      "monitoring",
+      "eventual acquisition"
+    ],
+    "required": true
+  },
+  {
+    "id": "R15",
+    "name": "Background RSS",
+    "actions": [
+      "RssSyncService loop"
+    ],
+    "variants": [
+      "first poll",
+      "overlapping poll",
+      "source page cap",
+      "app downtime",
+      "interrupted poll",
+      "restart"
+    ],
+    "required": true
+  },
+  {
+    "id": "R16",
+    "name": "Run RSS now",
+    "actions": [
+      "POST /api/task/scheduled/rss-sync/trigger",
+      "POST /api/task with RssSync"
+    ],
+    "variants": [
+      "Tasks page",
+      "actual requests",
+      "file import"
+    ],
+    "required": true
+  },
+  {
+    "id": "R17",
+    "name": "Explicit EventSearch task",
+    "actions": [
+      "POST /api/task with EventSearch"
+    ],
+    "variants": [
+      "task body",
+      "progress",
+      "cancellation",
+      "manual policy",
+      "automatic policy"
+    ],
+    "required": true
+  },
+  {
+    "id": "R18",
+    "name": "Native release push",
+    "actions": [
+      "POST /api/release/push"
+    ],
+    "variants": [
+      "accepted",
+      "rejected",
+      "delayed",
+      "duplicate",
+      "push and RSS overlap",
+      "push and search overlap"
+    ],
+    "required": true
+  },
+  {
+    "id": "R19",
+    "name": "Compatible release push",
+    "actions": [
+      "POST /api/v3/release/push",
+      "isolated external pusher"
+    ],
+    "variants": [
+      "response contract",
+      "completed import"
+    ],
+    "required": true
+  },
+  {
+    "id": "R20",
+    "name": "Delayed release selection",
+    "actions": [
+      "PendingReleaseReaperService after RSS",
+      "PendingReleaseReaperService after push"
+    ],
+    "variants": [
+      "best candidate at expiry",
+      "restart recovery",
+      "cancel after satisfaction"
+    ],
+    "required": true
+  },
+  {
+    "id": "R21",
+    "name": "Fighting-part cascade",
+    "actions": [
+      "RssSyncService cascade after part grab"
+    ],
+    "variants": [
+      "missing monitored parts",
+      "shared observations",
+      "no repeated source work"
+    ],
+    "required": true
+  },
+  {
+    "id": "R22",
+    "name": "History regrab",
+    "actions": [
+      "POST /api/grab-history/{id}/regrab",
+      "POST /api/grab-history/regrab-missing"
+    ],
+    "variants": [
+      "missing files",
+      "stale URL",
+      "active download",
+      "present payload"
+    ],
+    "required": true
+  },
+  {
+    "id": "R23",
+    "name": "Remove queue item and find replacement",
+    "actions": [
+      "DELETE /api/queue/{id} with blocklistAndSearch",
+      "QueueRemovalService"
+    ],
+    "variants": [
+      "native queue deletion",
+      "compatible queue deletion",
+      "different replacement"
+    ],
+    "required": true
+  },
+  {
+    "id": "R24",
+    "name": "Remove event files and find replacement",
+    "actions": [
+      "DELETE /api/events/{eventId}/files/{fileId} with blocklistAndSearch",
+      "DELETE /api/events/{id}/files with blocklistAndSearch"
+    ],
+    "variants": [
+      "single part",
+      "all files",
+      "deletion failure"
+    ],
+    "required": true
+  },
+  {
+    "id": "R25",
+    "name": "History removal and replacement",
+    "actions": [
+      "DELETE /api/history/{id} with blocklistAndSearch"
+    ],
+    "variants": [
+      "blocklist identity",
+      "same intended need"
+    ],
+    "required": true
+  },
+  {
+    "id": "R26",
+    "name": "Pending import rejection, removal, and replacement",
+    "actions": [
+      "POST /api/pending-imports/{id}/reject with search",
+      "POST /api/pending-imports/{id}/remove-from-client with search"
+    ],
+    "variants": [
+      "selected event",
+      "selected part",
+      "unmonitored event"
+    ],
+    "required": true
+  },
+  {
+    "id": "R27",
+    "name": "Failed-download recovery",
+    "actions": [
+      "EnhancedDownloadMonitorService",
+      "next search cycle",
+      "next RSS cycle"
+    ],
+    "variants": [
+      "automatic retry",
+      "interactive retry",
+      "source removal",
+      "retry cap",
+      "import-only failure"
+    ],
+    "required": true
+  },
+  {
+    "id": "R28",
+    "name": "Queue import and import retry",
+    "actions": [
+      "POST /api/queue/{id}/import",
+      "POST /api/queue/{id}/retry"
+    ],
+    "variants": [
+      "completed job",
+      "no second download"
+    ],
+    "required": true
+  },
+  {
+    "id": "R29",
+    "name": "Pending import acceptance and pack assignment",
+    "actions": [
+      "POST /api/pending-imports/{id}/accept",
+      "POST /api/pending-imports/{id}/import-pack",
+      "POST /api/pack-import/scan",
+      "POST /api/pack-import/import"
+    ],
+    "variants": [
+      "correct assignment",
+      "ambiguous assignment",
+      "partial success"
+    ],
+    "required": true
+  },
+  {
+    "id": "R30",
+    "name": "External-client discovery and library import",
+    "actions": [
+      "external completion discovery",
+      "POST /api/library/import",
+      "LibraryImport task",
+      "league scan",
+      "disk watcher"
+    ],
+    "variants": [
+      "external test payload"
+    ],
+    "required": true
+  },
+  {
+    "id": "R31",
+    "name": "Compatible manual import",
+    "actions": [
+      "GET /api/v3/manualimport",
+      "POST /api/v3/command with ManualImport"
+    ],
+    "variants": [
+      "suggestions",
+      "actual import",
+      "unknown command excluded"
+    ],
+    "required": true
+  },
+  {
+    "id": "R32",
+    "name": "DVR and catchup import regression",
+    "actions": [
+      "manual recording",
+      "event recording scheduling",
+      "automatic scheduling",
+      "completed recording import",
+      "catchup selection"
+    ],
+    "variants": [
+      "private generated stream",
+      "private generated archive",
+      "excluded from indexer metrics"
+    ],
+    "required": true
+  }
+]

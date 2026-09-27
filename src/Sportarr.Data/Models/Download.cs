@@ -224,6 +224,7 @@ public class DownloadQueueItem
     public DateTime Added { get; set; } = DateTime.UtcNow;
     public DateTime? CompletedAt { get; set; }
     public DateTime? ImportedAt { get; set; }
+    public DateTime? FailedAt { get; set; }
 
     // Enhanced download monitoring fields
     public int? RetryCount { get; set; } = 0;
@@ -506,6 +507,10 @@ public class ReleaseSearchResult
     public string Protocol { get; set; } = "Unknown"; // "Usenet" or "Torrent"
     public long Size { get; set; }
     public string? Quality { get; set; }
+
+    // Keep source quality separate from profile evaluation.
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? SourceQuality { get; set; }
     public string? Source { get; set; } // WEB-DL, BluRay, HDTV, etc.
     public string? Codec { get; set; } // H.264, HEVC, AV1, etc.
     public string? Language { get; set; } // Detected language from title (English, German, French, etc.)
@@ -1035,7 +1040,9 @@ public enum EventFileHistoryType
     /// <summary>The user deleted the file manually.</summary>
     Deleted = 0,
     /// <summary>The file was removed because a better release was imported over it.</summary>
-    DeletedForUpgrade = 1
+    DeletedForUpgrade = 1,
+    /// <summary>The user replaced the file despite its lower preference rank.</summary>
+    ReplacedManually = 2
 }
 
 /// <summary>
@@ -1282,7 +1289,7 @@ public class PendingImportResponse
     public string? Protocol { get; set; }
     public string? TorrentInfoHash { get; set; }
 
-    public static PendingImportResponse FromPendingImport(PendingImport import) => new()
+    public static PendingImportResponse FromPendingImport(PendingImport import, bool enableMultiPartEpisodes) => new()
     {
         Id = import.Id,
         DownloadClientId = import.DownloadClientId,
@@ -1303,7 +1310,8 @@ public class PendingImportResponse
         Status = import.Status,
         ErrorMessage = import.ErrorMessage,
         SuggestedEventId = import.SuggestedEventId,
-        SuggestedEvent = import.SuggestedEvent is null ? null : EventResponse.FromEvent(import.SuggestedEvent),
+        SuggestedEvent = import.SuggestedEvent is null
+            ? null : EventResponse.FromEvent(import.SuggestedEvent, enableMultiPartEpisodes, filesLoaded: false),
         SuggestedPart = import.SuggestedPart,
         SuggestionConfidence = import.SuggestionConfidence,
         Detected = import.Detected,

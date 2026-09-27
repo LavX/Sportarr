@@ -39,6 +39,9 @@ public class MotorsportSessionRoundTripTests
         { "Formula E", "Jeddah E Prix Free Practice 1", "FormulaE.2026.Jeddah.E.Prix.Free.Practice.1.1080p.WEB-GRP" },
         { "Formula E", "Jeddah E Prix Qualifying", "FormulaE.2026.Jeddah.E.Prix.Qualifying.1080p.WEB-GRP" },
 
+        { "NASCAR Cup Series", "DAYTONA 500 Qualifying", "NASCAR.Cup.Series.2026.Daytona.500.Qualifying.1080p.WEB-GRP" },
+        { "NASCAR Xfinity Series", "DAYTONA 300 Final Practice", "NASCAR.Xfinity.Series.2026.Daytona.300.Final.Practice.1080p.WEB-GRP" },
+
         { "V8 Supercars", "Repco Bathurst 1000 Practice 3", "Supercars.2026.Bathurst.1000.Practice.3.1080p.WEB-GRP" },
         { "V8 Supercars", "Repco Bathurst 1000 Practice 6", "Supercars.2026.Bathurst.1000.Practice.6.1080p.WEB-GRP" },
         { "V8 Supercars", "Repco Bathurst 1000 Boost Mobile Top 10 Shootout", "Supercars.2026.Bathurst.1000.Top.10.Shootout.1080p.WEB-GRP" },
@@ -78,24 +81,17 @@ public class MotorsportSessionRoundTripTests
     [InlineData("WEC", "24 Hours of Le Mans")]
     [InlineData("WEC", "Qatar 1812 KM")]
     [InlineData("Formula E", "Jeddah E Prix")]
+    [InlineData("NASCAR Cup Series", "Coke Zero Sugar 400")]
+    [InlineData("NASCAR Truck Series", "Baptist Health 200")]
     public void A_series_that_does_not_name_its_race_still_reads_one(string league, string title)
     {
         EventPartDetector.DetectMotorsportSessionType(title, league).Should().Be("Race");
     }
 
     [Theory]
-    [InlineData("NASCAR Cup Series", "DAYTONA 500")]
-    [InlineData("NASCAR Truck Series", "Baptist Health 200")]
-    public void A_series_with_no_definitions_reads_no_session(string league, string title)
-    {
-        // NASCAR publishes only races, so it has no session definitions and
-        // must not pick up another series' default.
-        EventPartDetector.DetectMotorsportSessionType(title, league).Should().BeNull();
-    }
-
-    [Theory]
     [InlineData("WEC")]
     [InlineData("Formula E")]
+    [InlineData("NASCAR Cup Series")]
     [InlineData("V8 Supercars")]
     [InlineData("WorldSSP")]
     public void Each_restored_series_offers_session_types(string league)
@@ -108,6 +104,7 @@ public class MotorsportSessionRoundTripTests
     [InlineData("IndyCar Series")]
     [InlineData("WEC")]
     [InlineData("Formula E")]
+    [InlineData("NASCAR Cup Series")]
     [InlineData("V8 Supercars")]
     [InlineData("WorldSSP")]
     public void Every_series_offers_the_race_itself(string league)
@@ -118,9 +115,4 @@ public class MotorsportSessionRoundTripTests
         EventPartDetector.GetMotorsportSessionTypes(league).Should().Contain("Race");
     }
 
-    [Fact]
-    public void NASCAR_offers_none_because_it_publishes_only_races()
-    {
-        EventPartDetector.GetMotorsportSessionTypes("NASCAR Cup Series").Should().BeEmpty();
-    }
 }

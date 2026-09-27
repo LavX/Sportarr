@@ -38,6 +38,7 @@ public class PendingRelease
     public int Score { get; set; }
     public int MatchScore { get; set; }
     public string? Part { get; set; }
+    public bool? IsPack { get; set; }
     public int? Seeders { get; set; }
     public int? Leechers { get; set; }
     public DateTime PublishDate { get; set; }

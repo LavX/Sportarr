@@ -440,14 +440,10 @@ public class FileWatcherService : BackgroundService
             // in the manual import queue with an Import button while the
             // recorder still holds it. The DVR imports its own recording
             // when it finishes, so the watcher leaves an active one alone.
-            var isActiveRecording = await db.DvrRecordings.AnyAsync(r =>
-                r.OutputPath == filePath &&
-                (r.Status == DvrRecordingStatus.Recording ||
-                 r.Status == DvrRecordingStatus.Scheduled));
-            if (isActiveRecording)
+            if (await IsDvrOwnedFileAsync(db, filePath))
             {
                 _logger.LogDebug(
-                    "[File Watcher] Skipping file still being recorded by the DVR: {Path}", filePath);
+                    "[File Watcher] Skipping file owned by the DVR: {Path}", filePath);
                 return;
             }
 
@@ -460,6 +456,22 @@ public class FileWatcherService : BackgroundService
             // still gets a pending record below, just never an auto-import.
             var stable = await WaitForStableFileAsync(filePath, TimeSpan.FromMinutes(10));
             if (!File.Exists(filePath)) return;
+
+            // The recorder can claim or finish this file while the stability
+            // wait is running. Check again before matching or importing it.
+            var trackedWhileWaiting = await db.Events.AnyAsync(e => e.FilePath == filePath) ||
+                                      await db.EventFiles.AnyAsync(ef => ef.FilePath == filePath);
+            if (trackedWhileWaiting)
+            {
+                return;
+            }
+
+            if (await IsDvrOwnedFileAsync(db, filePath))
+            {
+                _logger.LogDebug(
+                    "[File Watcher] Skipping file claimed by the DVR while waiting: {Path}", filePath);
+                return;
+            }
 
             var fileInfo = new FileInfo(filePath);
 
@@ -657,6 +669,41 @@ public class FileWatcherService : BackgroundService
         }
     }
 
+    internal static bool IsSameDvrCapture(string recordingPath, string candidatePath)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var recordingDirectory = Path.TrimEndingDirectorySeparator(
+            Path.GetDirectoryName(recordingPath) ?? string.Empty);
+        var candidateDirectory = Path.TrimEndingDirectorySeparator(
+            Path.GetDirectoryName(candidatePath) ?? string.Empty);
+        if (!string.Equals(recordingDirectory, candidateDirectory, comparison))
+        {
+            return false;
+        }
+
+        var recordingStem = Path.GetFileNameWithoutExtension(recordingPath).TrimStart('.');
+        var candidateStem = Path.GetFileNameWithoutExtension(candidatePath).TrimStart('.');
+        return string.Equals(recordingStem, candidateStem, comparison);
+    }
+
+    internal static async Task<bool> IsDvrOwnedFileAsync(
+        SportarrDbContext db,
+        string candidatePath)
+    {
+        var dvrPaths = await db.DvrRecordings
+            .AsNoTracking()
+            .Where(r => r.OutputPath != null &&
+                (r.Status == DvrRecordingStatus.Recording ||
+                 r.Status == DvrRecordingStatus.Scheduled ||
+                 r.Status == DvrRecordingStatus.Completed ||
+                 r.Status == DvrRecordingStatus.Importing))
+            .Select(r => r.OutputPath!)
+            .ToListAsync();
+        return dvrPaths.Any(path => IsSameDvrCapture(path, candidatePath));
+    }
+
     /// <summary>
     /// True once the file's size has stayed unchanged across two
     /// consecutive probes; false if the cap elapses first (or the file
@@ -770,6 +817,33 @@ public class FileWatcherService : BackgroundService
             evt.Title);
     }
 
+    private async Task UpdateEventAfterDeletedFileAsync(
+        SportarrDbContext db, Event evt, string deletedPath, bool enableMultiPartEpisodes)
+    {
+        var remaining = evt.Files
+            .Where(file => file.Exists && file.FilePath != deletedPath)
+            .OrderByDescending(file => file.Size)
+            .ThenBy(file => file.Id)
+            .ToList();
+        evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(
+            evt.Sport, evt.Title, evt.League?.Name, evt.MonitoredParts,
+            evt.League?.MonitoredParts, remaining.Select(file => file.PartNumber).ToArray(),
+            enableMultiPartEpisodes);
+
+        var pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (remaining.Count == 0 || string.Equals(evt.FilePath, deletedPath, pathComparison))
+        {
+            var selected = remaining.FirstOrDefault();
+            evt.FilePath = selected?.FilePath;
+            evt.FileSize = selected?.Size;
+            evt.Quality = selected?.Quality;
+        }
+
+        if (remaining.Count == 0)
+            await MaybeUnmonitorDeletedAsync(db, evt);
+    }
+
     private async Task HandleDeletedFileAsync(string filePath)
     {
         try
@@ -787,6 +861,7 @@ public class FileWatcherService : BackgroundService
                 _logger.LogDebug("[File Watcher] Ignoring our own deletion during import: {Path}", filePath);
                 return;
             }
+            var config = await scope.ServiceProvider.GetRequiredService<ConfigService>().GetConfigAsync();
 
             // Check EventFiles table
             var eventFile = await db.EventFiles.FirstOrDefaultAsync(ef => ef.FilePath == filePath);
@@ -795,36 +870,25 @@ public class FileWatcherService : BackgroundService
                 eventFile.Exists = false;
                 eventFile.LastVerified = DateTime.UtcNow;
 
-                // Check if the event has any other existing files
-                var hasOtherFiles = await db.EventFiles
-                    .AnyAsync(ef => ef.EventId == eventFile.EventId && ef.Id != eventFile.Id && ef.Exists);
-
-                if (!hasOtherFiles)
-                {
-                    var evt = await db.Events.FindAsync(eventFile.EventId);
-                    if (evt != null)
-                    {
-                        evt.HasFile = false;
-                        evt.FilePath = null;
-                        evt.FileSize = null;
-                        evt.Quality = null;
-                        await MaybeUnmonitorDeletedAsync(db, evt);
-                    }
-                }
+                var evt = await db.Events
+                    .Include(e => e.League)
+                    .Include(e => e.Files)
+                    .FirstOrDefaultAsync(e => e.Id == eventFile.EventId);
+                if (evt != null)
+                    await UpdateEventAfterDeletedFileAsync(db, evt, filePath, config.EnableMultiPartEpisodes);
 
                 await db.SaveChangesAsync();
                 _logger.LogWarning("[File Watcher] File deleted: {Path}", filePath);
             }
 
             // Check Events table direct file path
-            var directEvent = await db.Events.FirstOrDefaultAsync(e => e.FilePath == filePath);
+            var directEvent = await db.Events
+                .Include(e => e.League)
+                .Include(e => e.Files)
+                .FirstOrDefaultAsync(e => e.FilePath == filePath);
             if (directEvent != null)
             {
-                directEvent.HasFile = false;
-                directEvent.FilePath = null;
-                directEvent.FileSize = null;
-                directEvent.Quality = null;
-                await MaybeUnmonitorDeletedAsync(db, directEvent);
+                await UpdateEventAfterDeletedFileAsync(db, directEvent, filePath, config.EnableMultiPartEpisodes);
                 await db.SaveChangesAsync();
                 _logger.LogWarning("[File Watcher] File deleted (direct event): {Path}", filePath);
             }

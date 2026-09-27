@@ -59,6 +59,8 @@ public class AppSettings
     public int IptvPlaylistRefreshHours { get; set; } = 168;
     [System.ComponentModel.DataAnnotations.Schema.NotMapped]
     public int EpgRefreshHours { get; set; } = 48;
+    [System.ComponentModel.DataAnnotations.Schema.NotMapped]
+    public int EpgMaxDownloadSizeMb { get; set; } = Config.DefaultEpgMaxDownloadSizeMb;
 
     // RSS fetch tuning (Config.MaxRssReleasesPerIndexer/RssReleaseAgeLimit).
     // NotMapped, config.xml-backed.

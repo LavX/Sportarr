@@ -1,4 +1,5 @@
 using Sportarr.Api.Data;
+using Sportarr.Api.Helpers;
 using Sportarr.Api.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -71,7 +72,8 @@ public class DelayProfileService
     public bool ShouldDelayRelease(
         ReleaseSearchResult release,
         DelayProfile profile,
-        List<ReleaseSearchResult> allReleases)
+        List<ReleaseSearchResult> allReleases,
+        QualityProfile? qualityProfile = null)
     {
         // Calculate delay based on protocol
         var delayMinutes = release.Protocol == "Usenet"
@@ -85,7 +87,7 @@ public class DelayProfileService
         }
 
         // Check bypass conditions
-        if (profile.BypassIfHighestQuality && IsHighestQualityRelease(release, allReleases))
+        if (profile.BypassIfHighestQuality && IsHighestQualityRelease(release, allReleases, qualityProfile))
         {
             _logger.LogDebug("[Delay Profile] Bypassing delay - highest quality release");
             return false;
@@ -137,9 +139,10 @@ public class DelayProfileService
     /// </summary>
     public List<ReleaseSearchResult> FilterDelayedReleases(
         List<ReleaseSearchResult> releases,
-        DelayProfile profile)
+        DelayProfile profile,
+        QualityProfile? qualityProfile = null)
     {
-        var filtered = releases.Where(r => !ShouldDelayRelease(r, profile, releases)).ToList();
+        var filtered = releases.Where(r => !ShouldDelayRelease(r, profile, releases, qualityProfile)).ToList();
 
         var delayedCount = releases.Count - filtered.Count;
         if (delayedCount > 0)
@@ -157,7 +160,8 @@ public class DelayProfileService
     public ReleaseSearchResult? SelectBestReleaseWithDelayProfile(
         List<ReleaseSearchResult> releases,
         DelayProfile profile,
-        QualityProfile qualityProfile)
+        QualityProfile qualityProfile,
+        string? propersSetting = null)
     {
         if (!releases.Any())
         {
@@ -165,7 +169,7 @@ public class DelayProfileService
         }
 
         // Filter out delayed releases first
-        var availableReleases = FilterDelayedReleases(releases, profile);
+        var availableReleases = FilterDelayedReleases(releases, profile, qualityProfile);
 
         if (!availableReleases.Any())
         {
@@ -197,7 +201,8 @@ public class DelayProfileService
         // delay profile then threw it away.
         var qualityFiltered = availableReleases.Where(r =>
         {
-            if (string.IsNullOrEmpty(r.Quality))
+            if (string.IsNullOrEmpty(r.Quality) ||
+                r.Quality.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
             {
                 return true; // Include unknown quality (will get lowest rank)
             }
@@ -222,18 +227,22 @@ public class DelayProfileService
         }
 
         _logger.LogInformation("[Delay Profile] Prioritizing {Count} releases " +
-            "(Quality > CF Score > Protocol > Seeders/Age > Size)",
+            "(Quality Profile > Revision > CF Score > Protocol > Seeders/Age > Size)",
             qualityFiltered.Count);
 
         // Prioritization order (implemented as multi-level sort):
-        // 1. Quality rank (higher = better) - using QualityParser for proper group matching
-        // 2. Custom Format Score (higher = better)
-        // 3. Protocol preference (preferred protocol first)
-        // 4. For torrents: Seeders (log scale, more = better)
+        // 1. Quality profile rank (higher = better)
+        // 2. Revision when propers are preferred
+        // 3. Custom Format Score (higher = better)
+        // 4. Protocol preference (preferred protocol first)
+        // 5. For torrents: Seeders (log scale, more = better)
         //    For usenet: Age (newer = better)
-        // 5. Size (smaller = better, as tiebreaker)
+        // 6. Size (smaller = better, as tiebreaker)
         var prioritized = qualityFiltered
-            .OrderByDescending(r => ReleaseEvaluator.CalculateQualityScoreFromName(r.Quality))
+            .OrderByDescending(r => QualityProfileRanker.GetRank(qualityProfile, r.Quality))
+            .ThenByDescending(r => string.Equals(propersSetting, "doNotPrefer", StringComparison.OrdinalIgnoreCase)
+                ? 0
+                : ReleaseRevision.Parse(r.Title))
             .ThenByDescending(r => r.CustomFormatScore)
             .ThenByDescending(r => r.Protocol == profile.PreferredProtocol ? 1 : 0)
             .ThenByDescending(r => r.Protocol == "Torrent"
@@ -249,9 +258,9 @@ public class DelayProfileService
         var bestParsedQuality = QualityParser.ParseQuality(best.Title);
 
         _logger.LogInformation("[Delay Profile] Selected: {Title} from {Indexer} " +
-            "(Quality: {Quality}, Parsed: {Parsed}, QualityScore: {QScore}, CF Score: {CFScore}, Protocol: {Protocol}, Size: {Size}MB)",
+            "(Quality: {Quality}, Parsed: {Parsed}, ProfileRank: {ProfileRank}, CF Score: {CFScore}, Protocol: {Protocol}, Size: {Size}MB)",
             best.Title, best.Indexer, best.Quality, bestParsedQuality.Quality.Name,
-            ReleaseEvaluator.CalculateQualityScoreFromName(best.Quality),
+            QualityProfileRanker.GetRank(qualityProfile, best.Quality),
             best.CustomFormatScore, best.Protocol, best.Size / 1024 / 1024);
 
         // Log top 3 for debugging
@@ -261,9 +270,9 @@ public class DelayProfileService
             foreach (var r in prioritized.Take(3))
             {
                 var parsedQ = QualityParser.ParseQuality(r.Title);
-                _logger.LogDebug("  - {Title}: Quality={Quality}, Parsed={Parsed}(score {Score}), CF={CF}, Protocol={Protocol}",
+                _logger.LogDebug("  - {Title}: Quality={Quality}, Parsed={Parsed}(profile rank {Rank}), CF={CF}, Protocol={Protocol}",
                     r.Title, r.Quality, parsedQ.Quality.Name,
-                    ReleaseEvaluator.CalculateQualityScoreFromName(r.Quality),
+                    QualityProfileRanker.GetRank(qualityProfile, r.Quality),
                     r.CustomFormatScore, r.Protocol);
             }
         }
@@ -272,51 +281,31 @@ public class DelayProfileService
     }
 
     /// <summary>
-    private bool IsHighestQualityRelease(ReleaseSearchResult release, List<ReleaseSearchResult> allReleases)
+    private bool IsHighestQualityRelease(
+        ReleaseSearchResult release,
+        List<ReleaseSearchResult> allReleases,
+        QualityProfile? qualityProfile)
     {
-        // Extract resolution from quality string for comparison
-        var releaseResolution = ExtractResolutionRank(release.Quality);
+        var releaseRank = QualityProfileRanker.GetRank(qualityProfile, release.Quality);
 
         // An unreadable quality ranks zero, and zero used to compare equal to
         // the best of a field where nothing else was readable either, so a
         // release nobody could grade bypassed the delay it was supposed to
         // wait out. Only a release whose quality is actually known can claim
         // to be the best one.
-        if (releaseResolution == 0)
+        if (releaseRank == 0)
         {
             return false;
         }
 
         // Judge it against the releases that can be graded. An ungradeable
         // result should neither raise nor lower the bar.
-        var maxResolution = allReleases
-            .Select(r => ExtractResolutionRank(r.Quality))
+        var maxRank = allReleases
+            .Select(r => QualityProfileRanker.GetRank(qualityProfile, r.Quality))
             .Where(rank => rank > 0)
             .DefaultIfEmpty(0)
             .Max();
 
-        return releaseResolution >= maxResolution;
-    }
-
-    /// <summary>
-    /// Extract resolution rank from quality string (handles various formats)
-    /// </summary>
-    private static int ExtractResolutionRank(string? quality)
-    {
-        if (string.IsNullOrEmpty(quality))
-            return 0;
-
-        var lowerQuality = quality.ToLower();
-
-        if (lowerQuality.Contains("2160p") || lowerQuality.Contains("4k") || lowerQuality.Contains("uhd"))
-            return 4;
-        if (lowerQuality.Contains("1080p") || lowerQuality.Contains("fhd"))
-            return 3;
-        if (lowerQuality.Contains("720p") || lowerQuality.Contains("hd"))
-            return 2;
-        if (lowerQuality.Contains("480p") || lowerQuality.Contains("sd"))
-            return 1;
-
-        return 0;
+        return releaseRank >= maxRank;
     }
 }

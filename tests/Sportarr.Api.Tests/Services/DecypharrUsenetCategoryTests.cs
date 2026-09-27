@@ -20,23 +20,25 @@ public class DecypharrUsenetCategoryTests
     private sealed class CapturingHandler : HttpMessageHandler
     {
         public HttpRequestMessage? Post;
+        public string? PostBody;
 
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             if (request.Method == HttpMethod.Get)
             {
                 var nzb = "<?xml version=\"1.0\"?><nzb><file subject=\"x\">" + new string('x', 200) + "</file></nzb>";
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                return new HttpResponseMessage(HttpStatusCode.OK)
                 {
                     Content = new StringContent(nzb)
-                });
+                };
             }
 
             Post = request;
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            PostBody = await request.Content!.ReadAsStringAsync(ct);
+            return new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent("{\"status\":true,\"nzo_ids\":[\"SABnzbd_nzo_123\"]}")
-            });
+            };
         }
     }
 
@@ -47,14 +49,20 @@ public class DecypharrUsenetCategoryTests
         var client = new SabnzbdClient(new HttpClient(handler), Mock.Of<ILogger<SabnzbdClient>>());
         var config = new DownloadClient { Name = "Decypharr", Type = DownloadClientType.DecypharrUsenet, Host = "decypharr", Port = 8282 };
 
-        var nzoId = await client.AddNzbForDecypharrAsync(config, "http://indexer/get/abc.nzb", "sportarr");
+        var nzoId = await client.AddNzbForDecypharrAsync(
+            config,
+            "http://indexer/get/abc.nzb",
+            "sportarr",
+            "EPL.26-27.Matchday.1.Arsenal.vs.Coventry");
 
         nzoId.Should().Be("SABnzbd_nzo_123");
         handler.Post.Should().NotBeNull();
         handler.Post!.RequestUri!.Query.Should().Contain("category=sportarr",
             "Decypharr reads the parameter name category, from the query string first");
-        handler.Post.RequestUri.Query.Should().Contain("cat=sportarr",
-            "real SABnzbd calls the same thing cat, so both names travel");
+        handler.Post.RequestUri.Query.Should().Contain("cat=sportarr");
         handler.Post.RequestUri.Query.Should().Contain("mode=addfile");
+        handler.PostBody.Should().NotContain("name=cat\r\n");
+        handler.PostBody.Should().NotContain("name=category\r\n");
+        handler.PostBody.Should().Contain("filename=EPL.26-27.Matchday.1.Arsenal.vs.Coventry.nzb");
     }
 }

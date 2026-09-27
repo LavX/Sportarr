@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
+using Sportarr.Api.Services.Interfaces;
 
 namespace Sportarr.Api.Services;
 
@@ -13,15 +14,18 @@ public class EpgService
     private readonly ILogger<EpgService> _logger;
     private readonly SportarrDbContext _db;
     private readonly XmltvParserService _xmltvParser;
+    private readonly INotificationService _notificationService;
 
     public EpgService(
         ILogger<EpgService> logger,
         SportarrDbContext db,
-        XmltvParserService xmltvParser)
+        XmltvParserService xmltvParser,
+        INotificationService notificationService)
     {
         _logger = logger;
         _db = db;
         _xmltvParser = xmltvParser;
+        _notificationService = notificationService;
     }
 
     // ============================================================================
@@ -179,6 +183,8 @@ public class EpgService
             return new EpgSyncResult { Success = false, Error = spool.Error };
         }
 
+        var guideCommitted = false;
+
         try
         {
             // Replace the old guide inside a transaction. ExecuteDelete runs
@@ -263,6 +269,7 @@ public class EpgService
             syncedSource.ProgramCount = programCount;
             await _db.SaveChangesAsync(cancellationToken);
             await syncTransaction.CommitAsync(cancellationToken);
+            guideCommitted = true;
 
             _logger.LogInformation("[EPG] Synced {ChannelCount} channels and {ProgramCount} programs for source {Id}",
                 channelCount, programCount, sourceId);
@@ -270,6 +277,28 @@ public class EpgService
             // Auto-map IPTV channels to EPG channels
             var mappedCount = await AutoMapChannelsAsync(sourceId);
             _logger.LogInformation("[EPG] Auto-mapped {MappedCount} IPTV channels to EPG channels", mappedCount);
+
+            var completedAt = DateTime.UtcNow;
+            try
+            {
+                await _notificationService.SendNotificationAsync(
+                    NotificationTrigger.OnEpgSyncCompleted,
+                    "EPG sync completed",
+                    $"{source.Name} synced {channelCount} channels and {programCount} programs. Auto-mapped {mappedCount} channels.",
+                    new NotificationEventData
+                    {
+                        EpgSourceId = sourceId,
+                        EpgSourceName = source.Name,
+                        ChannelCount = channelCount,
+                        ProgramCount = programCount,
+                        AutoMappedChannelCount = mappedCount,
+                        CompletedAt = completedAt
+                    });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[EPG] Could not send the sync completion notification for source {Id}", sourceId);
+            }
 
             return new EpgSyncResult
             {
@@ -283,12 +312,16 @@ public class EpgService
         {
             _logger.LogError(ex, "[EPG] Failed to sync EPG source: {Id}", sourceId);
 
-            // The transaction never committed, so the database still holds
-            // the old guide and the old stamps. Forget everything tracked and
-            // record the failure on a fresh read, so the sources page shows
-            // the error over data that is genuinely still there.
+            // Forget tracked state before recording the failure. If the guide
+            // committed before auto-mapping failed, keep the new guide and
+            // record that the remaining sync work did not finish.
             _db.ChangeTracker.Clear();
             await RecordSyncErrorAsync(sourceId, ex.Message);
+
+            if (guideCommitted)
+            {
+                _logger.LogWarning("[EPG] Guide data committed before source {Id} failed to finish", sourceId);
+            }
 
             return new EpgSyncResult
             {

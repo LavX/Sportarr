@@ -18,6 +18,7 @@ import {
   GlobeAltIcon,
   ChevronDownIcon,
   WrenchScrewdriverIcon,
+  EllipsisVerticalIcon,
 } from '@heroicons/react/24/outline';
 import { StarIcon as StarIconSolid } from '@heroicons/react/24/solid';
 import { Menu } from '@headlessui/react';
@@ -26,6 +27,7 @@ import { toast } from 'sonner';
 import apiClient from '../../api/client';
 import PageHeader from '../../components/PageHeader';
 import PageShell from '../../components/PageShell';
+import { getChannelAttentionReason, getVisibleSelectedIds } from './iptvChannelPresentation';
 
 // Types
 interface IptvChannel {
@@ -121,10 +123,12 @@ export default function IptvChannelsSettings() {
   const [totalChannels, setTotalChannels] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
   const [hasMore, setHasMore] = useState(true);
+  const [attentionCount, setAttentionCount] = useState(0);
+  const channelLoadRequestRef = useRef(0);
 
   // Filters - default to sports only since this is a sports app
   const [searchQuery, setSearchQuery] = useState('');
-  const [filterSportsOnly, setFilterSportsOnly] = useState(true);
+  const [filterSportsOnly, setFilterSportsOnly] = useState(false);
   const [filterEnabledOnly, setFilterEnabledOnly] = useState(false);
   const [filterHasEpgOnly, setFilterHasEpgOnly] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('all');
@@ -134,6 +138,9 @@ export default function IptvChannelsSettings() {
   const [showCountryDropdown, setShowCountryDropdown] = useState(false);
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
   const [showGroupDropdown, setShowGroupDropdown] = useState(false);
+  const [quickView, setQuickView] = useState<'all' | 'attention' | 'favorites'>('all');
+  const [showFilters, setShowFilters] = useState(false);
+  const [manageChannels, setManageChannels] = useState(false);
 
   // Available filter options loaded from API (all channels, not just loaded ones)
   const [availableCountries, setAvailableCountries] = useState<string[]>([]);
@@ -176,9 +183,27 @@ export default function IptvChannelsSettings() {
   // Reload when filters change
   useEffect(() => {
     loadChannels(0, true);
-  }, [filterSportsOnly, filterEnabledOnly, filterFavoritesOnly, filterHasEpgOnly, selectedGroups, selectedCountries]);
+  }, [filterSportsOnly, filterEnabledOnly, filterFavoritesOnly, filterHasEpgOnly, selectedGroups, selectedCountries, quickView]);
+
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [quickView, filterSportsOnly, filterEnabledOnly, filterFavoritesOnly, filterHasEpgOnly, showHidden, filterStatus, searchQuery, selectedGroups, selectedCountries]);
+
+  useEffect(() => {
+    void loadAttentionCount();
+  }, [channels]);
+
+  const loadAttentionCount = async () => {
+    try {
+      const { data } = await apiClient.get<{ count: number }>('/iptv/channels/attention-count');
+      setAttentionCount(data.count);
+    } catch (err: any) {
+      console.error('Failed to load channel attention count:', err);
+    }
+  };
 
   const loadChannels = async (page: number = 0, reset: boolean = false) => {
+    const requestId = ++channelLoadRequestRef.current;
     try {
       setIsLoading(true);
       const offset = page * PAGE_SIZE;
@@ -186,15 +211,18 @@ export default function IptvChannelsSettings() {
         params: {
           sportsOnly: filterSportsOnly ? true : undefined,
           enabledOnly: filterEnabledOnly ? true : undefined,
-          favoritesOnly: filterFavoritesOnly ? true : undefined,
+          favoritesOnly: quickView === 'favorites' || filterFavoritesOnly ? true : undefined,
+          attentionOnly: quickView === 'attention' ? true : undefined,
           hasEpgOnly: filterHasEpgOnly ? true : undefined,
           search: searchQuery || undefined,
           groups: selectedGroups.size > 0 ? Array.from(selectedGroups).join(',') : undefined,
           countries: selectedCountries.size > 0 ? Array.from(selectedCountries).join(',') : undefined,
-          limit: PAGE_SIZE,
-          offset,
+          limit: quickView === 'all' ? PAGE_SIZE : undefined,
+          offset: quickView === 'all' ? offset : 0,
         },
       });
+
+      if (requestId !== channelLoadRequestRef.current) return;
 
       if (reset) {
         setChannels(Array.isArray(data) ? data : []);
@@ -203,16 +231,19 @@ export default function IptvChannelsSettings() {
       }
 
       setCurrentPage(page);
-      setHasMore(data.length === PAGE_SIZE);
+      setHasMore(quickView === 'all' && data.length === PAGE_SIZE);
       if (page === 0) {
         setTotalChannels(data.length); // Will be updated as we load more
       } else {
         setTotalChannels(prev => reset ? data.length : prev + data.length);
       }
     } catch (err: any) {
+      if (requestId !== channelLoadRequestRef.current) return;
       setError(err.message || 'Failed to load channels');
     } finally {
-      setIsLoading(false);
+      if (requestId === channelLoadRequestRef.current) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -247,6 +278,8 @@ export default function IptvChannelsSettings() {
     return channels.filter((channel) => {
       // Hide hidden channels unless showHidden is enabled
       if (!showHidden && channel.isHidden) return false;
+      if (quickView === 'attention' && !getChannelAttentionReason(channel)) return false;
+      if (quickView === 'favorites' && !channel.isFavorite) return false;
       if (filterSportsOnly && !channel.isSportsChannel) return false;
       if (filterEnabledOnly && !channel.isEnabled) return false;
       if (filterFavoritesOnly && !channel.isFavorite) return false;
@@ -270,7 +303,7 @@ export default function IptvChannelsSettings() {
       }
       return true;
     });
-  }, [channels, filterSportsOnly, filterEnabledOnly, filterFavoritesOnly, showHidden, filterStatus, searchQuery, selectedCountries, selectedGroups]);
+  }, [channels, filterSportsOnly, filterEnabledOnly, filterFavoritesOnly, showHidden, filterStatus, searchQuery, selectedCountries, selectedGroups, quickView]);
 
   // Selection handlers
   const handleToggleSelect = (id: number) => {
@@ -349,7 +382,8 @@ export default function IptvChannelsSettings() {
   // Bulk operations
   const handleBulkEnable = async (enabled: boolean) => {
     try {
-      const channelIds = Array.from(selectedIds);
+      const channelIds = getVisibleSelectedIds(selectedIds, filteredChannels);
+      if (channelIds.length === 0) return;
       await apiClient.post('/iptv/channels/bulk/enable', { channelIds, enabled });
       // Update channels immediately in state
       setChannels((prev) =>
@@ -367,7 +401,8 @@ export default function IptvChannelsSettings() {
   const handleBulkTest = async () => {
     try {
       setBulkTesting(true);
-      const channelIds = Array.from(selectedIds);
+      const channelIds = getVisibleSelectedIds(selectedIds, filteredChannels);
+      if (channelIds.length === 0) return;
       const { data } = await apiClient.post<{
         success: boolean;
         results: { channelId: number; success: boolean; error?: string }[];
@@ -438,7 +473,7 @@ export default function IptvChannelsSettings() {
         });
       } else {
         toast.info('No new channels to map', {
-          description: 'All channels are already mapped, or no matching EPG channels were found. If you have not yet, sync an EPG source first from the TV Guide page.',
+          description: 'All channels are already mapped, or no matching guide channels were found. Add or sync guide data from IPTV Options if needed.',
         });
       }
     } catch (err: any) {
@@ -616,7 +651,8 @@ export default function IptvChannelsSettings() {
 
   const handleBulkFavorite = async (isFavorite: boolean) => {
     try {
-      const channelIds = Array.from(selectedIds);
+      const channelIds = getVisibleSelectedIds(selectedIds, filteredChannels);
+      if (channelIds.length === 0) return;
       await apiClient.post('/iptv/channels/bulk/favorite', { channelIds, isFavorite });
       setChannels((prev) =>
         prev.map((c) => (channelIds.includes(c.id) ? { ...c, isFavorite } : c))
@@ -642,7 +678,8 @@ export default function IptvChannelsSettings() {
 
   const handleBulkHidden = async (isHidden: boolean) => {
     try {
-      const channelIds = Array.from(selectedIds);
+      const channelIds = getVisibleSelectedIds(selectedIds, filteredChannels);
+      if (channelIds.length === 0) return;
       await apiClient.post('/iptv/channels/bulk/hidden', { channelIds, isHidden });
       setChannels((prev) =>
         prev.map((c) => (channelIds.includes(c.id) ? { ...c, isHidden } : c))
@@ -776,14 +813,77 @@ export default function IptvChannelsSettings() {
     }
   };
 
+  const renderChannelActions = (channel: IptvChannel) => (
+    <div className="flex items-center justify-end gap-1">
+      <button
+        onClick={() => setPlayerChannel(channel)}
+        className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-red-600 text-white transition-colors hover:bg-red-700"
+        title="Play stream"
+      >
+        <PlayIcon className="h-5 w-5" />
+      </button>
+      <Menu as="div" className="relative">
+        <Menu.Button
+          className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-800 hover:text-white"
+          aria-label={`More actions for ${channel.name}`}
+        >
+          <EllipsisVerticalIcon className="h-5 w-5" />
+        </Menu.Button>
+        <Menu.Items
+          anchor={{ to: 'bottom end', gap: 4, padding: 8 }}
+          className="z-50 w-52 overflow-hidden rounded-lg border border-gray-700 bg-gray-900 py-1 shadow-xl shadow-black/50 focus:outline-none"
+        >
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => handleToggleFavorite(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+              {channel.isFavorite ? <StarIconSolid className="h-4 w-4 text-yellow-400" /> : <StarIconOutline className="h-4 w-4" />}
+              {channel.isFavorite ? 'Remove favorite' : 'Add favorite'}
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => channel.tvgId ? handleUnmapEpg(channel) : openEpgPicker(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+              <SignalIcon className="h-4 w-4" /> {channel.tvgId ? 'Clear guide mapping' : 'Map guide data'}
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => openMappingModal(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+              <LinkIcon className="h-4 w-4" /> Map leagues
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => handleTestChannel(channel.id)} disabled={testingChannelIds.has(channel.id)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 disabled:opacity-50 ${active ? 'bg-gray-800' : ''}`}>
+              <BoltIcon className="h-4 w-4" /> Test connection
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => handleToggleSports(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+              <SignalIcon className="h-4 w-4" /> {channel.isSportsChannel ? 'Remove sports label' : 'Mark as sports'}
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => handleToggleHidden(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-gray-200 ${active ? 'bg-gray-800' : ''}`}>
+              {channel.isHidden ? <EyeIcon className="h-4 w-4" /> : <EyeSlashIcon className="h-4 w-4" />}
+              {channel.isHidden ? 'Show channel' : 'Hide channel'}
+            </button>
+          )}</Menu.Item>
+          <Menu.Item>{({ active }) => (
+            <button onClick={() => handleToggleChannel(channel)} className={`flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm ${channel.isEnabled ? 'text-red-400' : 'text-green-400'} ${active ? 'bg-gray-800' : ''}`}>
+              {channel.isEnabled ? <XCircleIcon className="h-4 w-4" /> : <CheckCircleIcon className="h-4 w-4" />}
+              {channel.isEnabled ? 'Disable channel' : 'Enable channel'}
+            </button>
+          )}</Menu.Item>
+        </Menu.Items>
+      </Menu>
+    </div>
+  );
+
   return (
     <PageShell className="pb-8">
       <PageHeader
         title="IPTV Channels"
         subtitle="Manage channels across all IPTV sources and map them to leagues"
         actions={view === 'channels' ? (
-          /* Per-step tools live behind Advanced; the primary "Sync Now" on the
-             Sources page runs the whole pipeline (sources -> EPG -> mapping)
+          /* Per-step tools live behind Advanced. Sync now in IPTV Options
+             runs the whole pipeline (providers -> guide -> mapping)
              so most users never need these individually. */
           <Menu as="div" className="relative">
             <Menu.Button className="inline-flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm font-medium text-gray-200 transition-colors hover:bg-gray-700">
@@ -877,34 +977,19 @@ export default function IptvChannelsSettings() {
         </div>
       )}
 
-        {/* Helper Card */}
-        <div className="mb-8 rounded-lg border border-gray-800 bg-gray-900/70 p-5">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
-            <SignalIcon className="h-5 w-5 flex-shrink-0 text-gray-400 sm:mt-0.5" />
-            <div className="min-w-0">
-              <p className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-200">
-                Mapping Tips
-              </p>
-              <ul className="space-y-1 text-sm text-gray-300">
-                <li>
-                  <span className="mr-2 text-red-400">*</span>
-                  Map channels to leagues to enable automatic DVR recording when events are scheduled
-                </li>
-                <li>
-                  <span className="mr-2 text-red-400">*</span>
-                  Use <strong>Auto-Map</strong> to detect networks like ESPN or Sky Sports and suggest league mappings
-                </li>
-                <li>
-                  <span className="mr-2 text-red-400">*</span>
-                  <strong>EPG mapping</strong> links channels to guide data for TV Guide. Sync an EPG source first from the TV Guide page (EPG Sources).
-                </li>
-                <li>
-                  <span className="mr-2 text-red-400">*</span>
-                  Preferred mappings choose the highest quality stream automatically for DVR recording
-                </li>
-              </ul>
-            </div>
-          </div>
+        <div className="mb-6 flex flex-col items-start gap-3 rounded-lg border border-gray-800 bg-gray-900/70 px-4 py-3 sm:flex-row sm:items-center">
+          <SignalIcon className="h-5 w-5 shrink-0 text-green-400" />
+          <p className="min-w-0 flex-1 text-sm text-gray-300">
+            Sportarr maps guide data and leagues during provider sync. Manual tools are available only when a match needs attention.
+          </p>
+          {attentionCount > 0 && (
+            <button
+              onClick={() => setQuickView('attention')}
+              className="shrink-0 rounded-full bg-amber-900/30 px-3 py-1 text-xs font-medium text-amber-300"
+            >
+              {attentionCount} need attention
+            </button>
+          )}
         </div>
 
         {/* Filters and Bulk Actions */}
@@ -921,8 +1006,50 @@ export default function IptvChannelsSettings() {
               />
             </div>
 
+            <div className="flex flex-wrap items-center gap-1 rounded-lg bg-gray-900 p-1">
+              {([
+                ['all', 'All'],
+                ['attention', `Needs attention${attentionCount > 0 ? ` (${attentionCount})` : ''}`],
+                ['favorites', 'Favorites'],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setQuickView(key)}
+                  className={`min-h-10 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                    quickView === key ? 'bg-red-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={() => setShowFilters((current) => !current)}
+              className={`inline-flex min-h-11 items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                showFilters ? 'border-red-700 bg-red-950/30 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700'
+              }`}
+            >
+              <FunnelIcon className="h-4 w-4" /> Filters
+            </button>
+
+            <button
+              onClick={() => {
+                setManageChannels((current) => {
+                  if (current) setSelectedIds(new Set());
+                  return !current;
+                });
+              }}
+              className={`inline-flex min-h-11 items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                manageChannels ? 'border-red-700 bg-red-950/30 text-white' : 'border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700'
+              }`}
+            >
+              <WrenchScrewdriverIcon className="h-4 w-4" /> {manageChannels ? 'Done' : 'Manage'}
+            </button>
+
             {/* Filters */}
-            <div className="flex items-center space-x-4 flex-wrap gap-2">
+            {showFilters && (
+            <div className="flex w-full items-center flex-wrap gap-4 border-t border-gray-800 pt-4">
               <label className="flex items-center space-x-2 cursor-pointer">
                 <input
                   type="checkbox"
@@ -1160,6 +1287,7 @@ export default function IptvChannelsSettings() {
                 )}
               </div>
             </div>
+            )}
 
             {/* Refresh */}
             <button
@@ -1172,7 +1300,7 @@ export default function IptvChannelsSettings() {
           </div>
 
           {/* Bulk Actions */}
-          {selectedIds.size > 0 && (
+          {manageChannels && selectedIds.size > 0 && (
             <div className="mt-4 pt-4 border-t border-gray-800 flex items-center flex-wrap gap-2">
               <span className="text-sm text-gray-400">{selectedIds.size} selected</span>
               <button
@@ -1232,7 +1360,8 @@ export default function IptvChannelsSettings() {
           )}
 
           {/* Quick Actions */}
-          <div className="mt-4 pt-4 border-t border-gray-800 flex items-center space-x-4">
+          {manageChannels && (
+          <div className="mt-4 pt-4 border-t border-gray-800 flex flex-wrap items-center gap-3">
             <button
               onClick={handleHideNonSports}
               className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-sm transition-colors flex items-center space-x-1"
@@ -1248,6 +1377,7 @@ export default function IptvChannelsSettings() {
               <span>Unhide All</span>
             </button>
           </div>
+          )}
         </div>
 
         {/* Channels: card list on phones, table on sm+ */}
@@ -1260,12 +1390,14 @@ export default function IptvChannelsSettings() {
                   className={`p-4 ${selectedIds.has(channel.id) ? 'bg-red-950/20' : ''}`}
                 >
                   <div className="flex items-start gap-3">
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.has(channel.id)}
-                      onChange={() => handleToggleSelect(channel.id)}
-                      className="mt-1.5 h-4 w-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
-                    />
+                    {manageChannels && (
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(channel.id)}
+                        onChange={() => handleToggleSelect(channel.id)}
+                        className="mt-1.5 h-4 w-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
+                      />
+                    )}
                     {channel.logoUrl ? (
                       <img
                         src={channel.logoUrl}
@@ -1338,58 +1470,7 @@ export default function IptvChannelsSettings() {
                       </div>
                     </div>
                   </div>
-                  <div className="mt-2 flex items-center justify-end gap-1">
-                    <button
-                      onClick={() => handleToggleFavorite(channel)}
-                      className="rounded p-2 transition-colors hover:bg-gray-800"
-                      title={channel.isFavorite ? 'Remove from Favorites' : 'Add to Favorites'}
-                    >
-                      {channel.isFavorite ? (
-                        <StarIconSolid className="h-5 w-5 text-yellow-400" />
-                      ) : (
-                        <StarIconOutline className="h-5 w-5 text-gray-400" />
-                      )}
-                    </button>
-                    <button
-                      onClick={() => handleToggleHidden(channel)}
-                      className="rounded p-2 text-gray-400 transition-colors hover:bg-gray-800"
-                      title={channel.isHidden ? 'Show Channel' : 'Hide Channel'}
-                    >
-                      {channel.isHidden ? (
-                        <EyeSlashIcon className="h-5 w-5 text-gray-500" />
-                      ) : (
-                        <EyeIcon className="h-5 w-5" />
-                      )}
-                    </button>
-                    <button
-                      onClick={() => handleTestChannel(channel.id)}
-                      disabled={testingChannelIds.has(channel.id)}
-                      className={`rounded p-2 text-gray-400 transition-colors hover:bg-gray-800 ${
-                        testingChannelIds.has(channel.id) ? 'animate-pulse' : ''
-                      }`}
-                      title="Test Connection"
-                    >
-                      <BoltIcon className="h-5 w-5" />
-                    </button>
-                    <button
-                      onClick={() => setPlayerChannel(channel)}
-                      className="rounded p-2 text-gray-400 transition-colors hover:bg-gray-800"
-                      title="Play Stream"
-                    >
-                      <PlayIcon className="h-5 w-5" />
-                    </button>
-                    <button
-                      onClick={() => handleToggleChannel(channel)}
-                      className="rounded p-2 text-gray-400 transition-colors hover:bg-gray-800"
-                      title={channel.isEnabled ? 'Disable' : 'Enable'}
-                    >
-                      {channel.isEnabled ? (
-                        <CheckCircleIcon className="h-5 w-5 text-green-400" />
-                      ) : (
-                        <XCircleIcon className="h-5 w-5" />
-                      )}
-                    </button>
-                  </div>
+                  <div className="mt-2">{renderChannelActions(channel)}</div>
                 </div>
               ))}
             </div>
@@ -1398,14 +1479,14 @@ export default function IptvChannelsSettings() {
             <table className="w-full">
               <thead className="bg-black/50 border-b border-gray-800">
                 <tr>
-                  <th className="w-12 px-4 py-3">
+                  {manageChannels && <th className="w-12 px-4 py-3">
                     <input
                       type="checkbox"
                       checked={selectedIds.size === filteredChannels.length && filteredChannels.length > 0}
                       onChange={handleSelectAll}
                       className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
                     />
-                  </th>
+                  </th>}
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-400">Channel</th>
                   <th className="px-4 py-3 text-left text-sm font-medium text-gray-400">Network</th>
                   <th className="px-4 py-3 text-center text-sm font-medium text-gray-400">Quality</th>
@@ -1422,14 +1503,14 @@ export default function IptvChannelsSettings() {
                     key={channel.id}
                     className={`hover:bg-gray-800/30 ${selectedIds.has(channel.id) ? 'bg-red-950/20' : ''}`}
                   >
-                    <td className="px-4 py-3">
+                    {manageChannels && <td className="px-4 py-3">
                       <input
                         type="checkbox"
                         checked={selectedIds.has(channel.id)}
                         onChange={() => handleToggleSelect(channel.id)}
                         className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-red-600 focus:ring-red-600"
                       />
-                    </td>
+                    </td>}
                     <td className="px-4 py-3">
                       <div className="flex items-center space-x-3">
                         {channel.logoUrl ? (
@@ -1516,58 +1597,7 @@ export default function IptvChannelsSettings() {
                       </button>
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center justify-center space-x-1">
-                        <button
-                          onClick={() => handleToggleFavorite(channel)}
-                          className="p-1.5 hover:bg-gray-800 rounded transition-colors"
-                          title={channel.isFavorite ? 'Remove from Favorites' : 'Add to Favorites'}
-                        >
-                          {channel.isFavorite ? (
-                            <StarIconSolid className="w-4 h-4 text-yellow-400" />
-                          ) : (
-                            <StarIconOutline className="w-4 h-4 text-gray-400 hover:text-yellow-400" />
-                          )}
-                        </button>
-                        <button
-                          onClick={() => handleToggleHidden(channel)}
-                          className="p-1.5 text-gray-400 hover:bg-gray-800 rounded transition-colors"
-                          title={channel.isHidden ? 'Show Channel' : 'Hide Channel'}
-                        >
-                          {channel.isHidden ? (
-                            <EyeSlashIcon className="w-4 h-4 text-gray-500" />
-                          ) : (
-                            <EyeIcon className="w-4 h-4 hover:text-gray-300" />
-                          )}
-                        </button>
-                        <button
-                          onClick={() => handleTestChannel(channel.id)}
-                          disabled={testingChannelIds.has(channel.id)}
-                          className={`p-1.5 text-gray-400 hover:text-green-400 hover:bg-gray-800 rounded transition-colors ${
-                            testingChannelIds.has(channel.id) ? 'animate-pulse' : ''
-                          }`}
-                          title="Test Connection"
-                        >
-                          <BoltIcon className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => setPlayerChannel(channel)}
-                          className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-gray-800 rounded transition-colors"
-                          title="Play Stream"
-                        >
-                          <PlayIcon className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => handleToggleChannel(channel)}
-                          className="p-1.5 text-gray-400 hover:text-white hover:bg-gray-800 rounded transition-colors"
-                          title={channel.isEnabled ? 'Disable' : 'Enable'}
-                        >
-                          {channel.isEnabled ? (
-                            <CheckCircleIcon className="w-4 h-4 text-green-400" />
-                          ) : (
-                            <XCircleIcon className="w-4 h-4" />
-                          )}
-                        </button>
-                      </div>
+                      {renderChannelActions(channel)}
                     </td>
                   </tr>
                 ))}
@@ -1590,7 +1620,7 @@ export default function IptvChannelsSettings() {
               <p className="text-sm text-gray-600 mt-1">
                 {channels.length > 0
                   ? 'Try adjusting your filters'
-                  : 'Add IPTV sources in the IPTV Sources settings page'}
+                  : 'Add a provider in IPTV Options'}
               </p>
             </div>
           )}
@@ -1657,7 +1687,7 @@ export default function IptvChannelsSettings() {
                 )}
                 {!isEpgPickerSearching && epgPickerResults.length === 0 && (
                   <p className="text-sm text-gray-500 py-2">
-                    No EPG channels found. Sync an EPG source from the TV Guide page first, or broaden the search.
+                    No guide channels found. Sync a guide source from IPTV Options, or broaden the search.
                   </p>
                 )}
                 {!isEpgPickerSearching && epgPickerResults.map((epg) => (

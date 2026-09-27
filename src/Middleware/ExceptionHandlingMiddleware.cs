@@ -24,7 +24,7 @@ public class ExceptionHandlingMiddleware
         _environment = environment;
     }
 
-    public async Task InvokeAsync(HttpContext context)
+    public async Task InvokeAsync(HttpContext context, Sportarr.Api.Services.DatabaseHealthTracker databaseHealth)
     {
         try
         {
@@ -32,6 +32,12 @@ public class ExceptionHandlingMiddleware
         }
         catch (Exception ex)
         {
+            // The command interceptor sees a statement that fails to execute.
+            // It does not see one that fails part way through reading its
+            // rows, which is what damage on a later page looks like. Anything
+            // that reaches here is classified too.
+            databaseHealth.RecordFailure(ex);
+
             // The message is not ours: it can carry a URL with a key in it,
             // and it can carry line breaks that make one entry look like
             // several. The stack trace still goes to the log in full through

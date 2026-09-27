@@ -144,6 +144,7 @@ public static class ServiceCollectionExtensions
         // transient failure produced a burst of four requests at whatever
         // speed the network allowed, right past the request delay the user
         // configured for that indexer.
+        services.AddTransient<IndexerQueryQuotaHandler>();
         services.AddHttpClient("IndexerClient")
             .AddTransientHttpErrorPolicy(policyBuilder =>
                 policyBuilder.WaitAndRetryAsync(
@@ -153,7 +154,7 @@ public static class ServiceCollectionExtensions
                     {
                         Console.WriteLine($"[Indexer] Retry {retryCount} after {timespan.TotalSeconds}s due to {outcome.Exception?.Message ?? outcome.Result.StatusCode.ToString()}");
                     }))
-            .AddHttpMessageHandler<RateLimitHandler>()
+            .AddHttpMessageHandler<IndexerQueryQuotaHandler>()
             .ConfigureHttpClient((sp, client) =>
             {
                 // Config.IndexerHttpTimeoutSeconds, read fresh on every client
@@ -199,8 +200,10 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient("StreamProxy")
             .ConfigurePrimaryHttpMessageHandler(sp => new SocketsHttpHandler
             {
-                AllowAutoRedirect = true,
-                MaxAutomaticRedirections = 10,
+                // Redirects are followed by the proxy endpoint so it can
+                // distinguish a usable final response from an unresolved or
+                // looping redirect instead of returning a bare 3xx to HLS.js.
+                AllowAutoRedirect = false,
                 PooledConnectionLifetime = TimeSpan.FromMinutes(1),
                 PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
                 // SSRF guard: the stream proxy is reachable anonymously and fetches
@@ -375,6 +378,8 @@ public static class ServiceCollectionExtensions
         services.AddScoped<HealthCheckService>();
         services.AddScoped<BackupService>();
         services.AddScoped<NotificationService>();
+        services.AddScoped<INotificationService>(provider =>
+            provider.GetRequiredService<NotificationService>());
         // Singleton: holds the live SSE subscriber channels.
         services.AddSingleton<EventStreamService>();
         // Backup-restore reconciliation stack. PathRemap + LibraryRescan
@@ -392,6 +397,7 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddSportarrIndexing(this IServiceCollection services)
     {
+        services.AddSingleton<DownloadOwnershipCoordinator>();
         services.AddScoped<DownloadClientService>();
         services.AddScoped<QueueRemovalService>();
         services.AddScoped<IndexerStatusService>();
@@ -423,6 +429,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ImportFileSuppressionService>();
         services.AddScoped<SportsFileNameParser>();
         services.AddScoped<FileNamingService>();
+        services.AddScoped<EpisodeNumberResolver>();
         services.AddScoped<FileRenameService>();
         services.AddScoped<EventPartDetector>();
         services.AddScoped<FileFormatManager>();
@@ -454,6 +461,7 @@ public static class ServiceCollectionExtensions
         // the proxy/HDHomeRun path.
         services.AddSingleton<StreamSessionTracker>();
         services.AddScoped<DvrRecordingService>();
+        services.AddScoped<DvrAssignmentService>();
         services.AddSingleton<DvrEarlyFinishGuard>();
         services.AddScoped<EventDvrService>();
         services.AddScoped<DvrQualityScoreCalculator>();
@@ -548,10 +556,16 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddSportarrDatabase(this IServiceCollection services, IConfiguration configuration, string dbPath)
     {
+        // One tracker for the whole process. The interceptor writes to it and
+        // the health surfaces read it, so a damaged database is reported from
+        // in-memory state that still answers when no query can run.
+        var databaseHealth = new Sportarr.Api.Services.DatabaseHealthTracker();
+        services.AddSingleton(databaseHealth);
+
         // Single shared interceptor instance. It only does work inside a
         // SyncMetrics measured block (one AsyncLocal read otherwise), so it
         // is safe to attach to every context including the request path.
-        var commandCounter = new Sportarr.Api.Data.CommandCountingInterceptor();
+        var commandCounter = new Sportarr.Api.Data.CommandCountingInterceptor(databaseHealth);
         var dbSettings = DatabaseSettings.FromConfiguration(configuration);
 
         void ConfigureProvider(DbContextOptionsBuilder options)

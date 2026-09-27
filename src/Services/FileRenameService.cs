@@ -21,6 +21,7 @@ public class FileRenameService
     private readonly CustomFormatService _customFormatService;
     private readonly NotificationService _notificationService;
     private readonly IMetadataWriterService _metadataWriterService;
+    private readonly ConfigService _configService;
 
     // Formats loaded once per scoped instance so per-file token building
     // doesn't re-query on every file of a bulk rename.
@@ -34,7 +35,8 @@ public class FileRenameService
         DiskSpaceService diskSpaceService,
         CustomFormatService customFormatService,
         NotificationService notificationService,
-        IMetadataWriterService metadataWriterService)
+        IMetadataWriterService metadataWriterService,
+        ConfigService configService)
     {
         _db = db;
         _fileNamingService = fileNamingService;
@@ -44,6 +46,7 @@ public class FileRenameService
         _customFormatService = customFormatService;
         _notificationService = notificationService;
         _metadataWriterService = metadataWriterService;
+        _configService = configService;
     }
 
     /// <summary>
@@ -189,7 +192,8 @@ public class FileRenameService
             // rows that are here, and rows come and go, so numbering a season
             // this way would rename files to numbers the hub disagrees with
             // as soon as it answers again.
-            if (events.Any(e => e.HasFile))
+            if (events.Any(e => e.Files.Any(file => file.Exists) ||
+                !string.IsNullOrWhiteSpace(e.FilePath)))
             {
                 _logger.LogInformation("[File Rename] No API episode data available and this season holds files, so numbers are left as they are");
                 return renumberedCount;
@@ -269,6 +273,7 @@ public class FileRenameService
 
         var rootFolders = await RootFolderLoader.LoadAsync(_db, _diskSpaceService);
         int renamedCount = 0;
+        var fileStateChanged = false;
 
         foreach (var file in evt.Files)
         {
@@ -284,6 +289,7 @@ public class FileRenameService
             {
                 _logger.LogWarning("[File Rename] File no longer exists on disk: {FilePath}", file.FilePath);
                 file.Exists = false;
+                fileStateChanged = true;
                 continue;
             }
 
@@ -299,11 +305,14 @@ public class FileRenameService
             }
         }
 
-        if (renamedCount > 0)
+        if (fileStateChanged)
+            await UpdateEventFileStateAsync(eventId);
+
+        if (renamedCount > 0 || fileStateChanged)
         {
             await _db.SaveChangesAsync();
 
-            if (isTopLevel)
+            if (renamedCount > 0 && isTopLevel)
             {
                 var scanPath = CommonDirectory(evt.Files
                     .Where(f => f.Exists && !string.IsNullOrEmpty(f.FilePath))
@@ -431,10 +440,14 @@ public class FileRenameService
 
         try
         {
+            var repairMissingLegacyPath = HasSingleFileOnDisk(evt);
+            var originalLegacyPath = evt.FilePath;
+
             // Tell the watcher this move is ours so it doesn't re-process the rename.
             SelfMoveTracker.Register(currentPath, expectedPath);
             File.Move(currentPath, expectedPath);
             file.FilePath = expectedPath;
+            UpdateLegacyFilePath(evt, originalLegacyPath, currentPath, expectedPath, repairMissingLegacyPath, out _);
 
             // Kodi matches an NFO to its video by basename - move the sidecars
             // with the file now, don't wait for the next sync to regenerate them.
@@ -660,6 +673,7 @@ public class FileRenameService
             .Include(e => e.Files)
             .Where(e => e.LeagueId == leagueId && e.Season == season)
             .Where(e => e.Files.Any())
+            .OrderBy(e => e.Id)
             .ToListAsync();
 
         // Build the full set of (file -> expected path) moves up front. Renumbering can
@@ -668,12 +682,21 @@ public class FileRenameService
         // bug). Resolve this with a two-phase move: first move every file that needs renaming
         // to a unique temp name (freeing all final names), then move each temp to its final
         // name and update the DB.
-        var planned = new List<(EventFile File, string CurrentPath, string ExpectedPath)>();
+        var onDiskFileIds = events
+            .SelectMany(evt => evt.Files)
+            .Where(file => file.Exists && !string.IsNullOrEmpty(file.FilePath) && File.Exists(file.FilePath))
+            .Select(file => file.Id)
+            .ToHashSet();
+        var originalLegacyPaths = events.ToDictionary(evt => evt.Id, evt => evt.FilePath);
+        var singleFileEvents = events.ToDictionary(
+            evt => evt.Id,
+            evt => evt.Files.Count(file => onDiskFileIds.Contains(file.Id)) == 1);
+        var planned = new List<(Event Event, EventFile File, string CurrentPath, string ExpectedPath, bool RepairMissingLegacyPath, string? OriginalLegacyPath)>();
         foreach (var evt in events)
         {
             foreach (var file in evt.Files)
             {
-                if (!file.Exists || string.IsNullOrEmpty(file.FilePath) || !File.Exists(file.FilePath))
+                if (!onDiskFileIds.Contains(file.Id))
                     continue;
 
                 var expectedPath = await BuildExpectedPathAsync(evt, file, settings, rootFolders);
@@ -683,7 +706,7 @@ public class FileRenameService
                 if (numberingOnly && !NumberingChanged(file.FilePath, expectedPath))
                     continue;
 
-                planned.Add((file, file.FilePath, expectedPath));
+                planned.Add((evt, file, file.FilePath, expectedPath, singleFileEvents[evt.Id], originalLegacyPaths[evt.Id]));
             }
         }
 
@@ -691,7 +714,7 @@ public class FileRenameService
             return 0;
 
         // Phase 1: stage every source under a unique temp name, freeing all final names.
-        var staged = new List<(EventFile File, string CurrentPath, string TempPath, string ExpectedPath)>();
+        var staged = new List<(Event Event, EventFile File, string CurrentPath, string TempPath, string ExpectedPath, bool RepairMissingLegacyPath, string? OriginalLegacyPath)>();
         foreach (var move in planned)
         {
             try
@@ -703,7 +726,8 @@ public class FileRenameService
                 var tempPath = move.ExpectedPath + ".sportarr-rename-" + Guid.NewGuid().ToString("N") + ".tmp";
                 SelfMoveTracker.Register(move.CurrentPath, tempPath);
                 File.Move(move.CurrentPath, tempPath);
-                staged.Add((move.File, move.CurrentPath, tempPath, move.ExpectedPath));
+                staged.Add((move.Event, move.File, move.CurrentPath, tempPath, move.ExpectedPath,
+                    move.RepairMissingLegacyPath, move.OriginalLegacyPath));
             }
             catch (Exception ex)
             {
@@ -714,22 +738,22 @@ public class FileRenameService
         // Phase 2: move each staged temp file to its final name and update the DB record.
         int totalRenamed = 0;
         var renamedDirs = new List<string?>();
-        var finalized = new List<(EventFile File, string CurrentPath, string ExpectedPath)>();
-        foreach (var s in staged)
+        var finalized = new List<(Event Event, EventFile File, string CurrentPath, string ExpectedPath, bool LegacyPathChanged, string? PreviousLegacyPath)>();
+        for (var stagedIndex = 0; stagedIndex < staged.Count; stagedIndex++)
         {
+            var s = staged[stagedIndex];
             try
             {
                 if (File.Exists(s.ExpectedPath))
-                {
-                    _logger.LogWarning("[File Rename] Final destination unexpectedly exists; putting {Path} back", s.CurrentPath);
-                    RestoreStagedRename(s.TempPath, s.CurrentPath);
-                    continue;
-                }
+                    throw new IOException($"Final destination unexpectedly exists: {s.ExpectedPath}");
 
                 SelfMoveTracker.Register(s.TempPath, s.ExpectedPath);
                 File.Move(s.TempPath, s.ExpectedPath);
                 s.File.FilePath = s.ExpectedPath;
-                finalized.Add((s.File, s.CurrentPath, s.ExpectedPath));
+                var legacyPathChanged = UpdateLegacyFilePath(
+                    s.Event, s.OriginalLegacyPath, s.CurrentPath, s.ExpectedPath,
+                    s.RepairMissingLegacyPath, out var previousLegacyPath);
+                finalized.Add((s.Event, s.File, s.CurrentPath, s.ExpectedPath, legacyPathChanged, previousLegacyPath));
                 renamedDirs.Add(Path.GetDirectoryName(s.ExpectedPath));
                 totalRenamed++;
             }
@@ -746,7 +770,7 @@ public class FileRenameService
                 // undo run one way and a chain that shifted them down
                 // wants the other, so the undo keeps passing over what is
                 // left until a pass frees nothing.
-                var toUndo = new List<(EventFile File, string CurrentPath, string ExpectedPath)>(finalized);
+                var toUndo = new List<(Event Event, EventFile File, string CurrentPath, string ExpectedPath, bool LegacyPathChanged, string? PreviousLegacyPath)>(finalized);
                 while (toUndo.Count > 0)
                 {
                     var progressed = false;
@@ -759,6 +783,8 @@ public class FileRenameService
                             SelfMoveTracker.Register(done.ExpectedPath, done.CurrentPath);
                             File.Move(done.ExpectedPath, done.CurrentPath);
                             done.File.FilePath = done.CurrentPath;
+                            if (done.LegacyPathChanged && PathsEqual(done.Event.FilePath, done.ExpectedPath))
+                                done.Event.FilePath = done.PreviousLegacyPath;
                             totalRenamed--;
                             toUndo.Remove(done);
                             progressed = true;
@@ -783,6 +809,9 @@ public class FileRenameService
                 finalized.Clear();
 
                 RestoreStagedRename(s.TempPath, s.CurrentPath);
+                for (var remainingIndex = stagedIndex + 1; remainingIndex < staged.Count; remainingIndex++)
+                    RestoreStagedRename(staged[remainingIndex].TempPath, staged[remainingIndex].CurrentPath);
+                break;
             }
         }
 
@@ -1068,8 +1097,8 @@ public class FileRenameService
             file.EventId = newEventId;
             file.Exists = false;
             await _db.SaveChangesAsync();
-            await UpdateHasFileFlagAsync(oldEventId);
-            await UpdateHasFileFlagAsync(newEventId);
+            await UpdateEventFileStateAsync(oldEventId);
+            await UpdateEventFileStateAsync(newEventId);
             return (true, null, currentPath);
         }
 
@@ -1104,8 +1133,8 @@ public class FileRenameService
             // Path unchanged - only the EventId changes
             file.EventId = newEventId;
             await _db.SaveChangesAsync();
-            await UpdateHasFileFlagAsync(oldEventId);
-            await UpdateHasFileFlagAsync(newEventId);
+            await UpdateEventFileStateAsync(oldEventId);
+            await UpdateEventFileStateAsync(newEventId);
             return (true, null, currentPath);
         }
 
@@ -1120,6 +1149,7 @@ public class FileRenameService
         {
             _logger.LogInformation("[File Reassign] Moving file {FileId} from event {OldEvent} to event {NewEvent}: {Old} -> {New}",
                 fileId, oldEventId, newEventId, currentPath, newPath);
+            SelfMoveTracker.Register(currentPath, newPath);
             File.Move(currentPath, newPath);
         }
         catch (Exception ex)
@@ -1132,8 +1162,8 @@ public class FileRenameService
         file.EventId = newEventId;
         await _db.SaveChangesAsync();
 
-        await UpdateHasFileFlagAsync(oldEventId);
-        await UpdateHasFileFlagAsync(newEventId);
+        await UpdateEventFileStateAsync(oldEventId);
+        await UpdateEventFileStateAsync(newEventId);
 
         if (settings.DeleteEmptyFolders && !string.IsNullOrEmpty(currentDir) && currentDir != destDir)
             TryDeleteEmptyDirectories(currentDir, rootFolder);
@@ -1142,20 +1172,109 @@ public class FileRenameService
     }
 
     /// <summary>
-    /// Recompute the HasFile flag for an event based on whether any of its
-    /// EventFiles still exist on disk. Called after reassign/import/delete to
-    /// keep the event row in sync with reality.
+    /// Recompute the denormalized file state for an event after reassignment.
+    /// Keep a valid selected file. Otherwise, use the largest remaining file.
     /// </summary>
-    private async Task UpdateHasFileFlagAsync(int eventId)
+    private async Task UpdateEventFileStateAsync(int eventId)
     {
-        var evt = await _db.Events.Include(e => e.Files).FirstOrDefaultAsync(e => e.Id == eventId);
+        var evt = await _db.Events.Include(e => e.League).Include(e => e.Files)
+            .FirstOrDefaultAsync(e => e.Id == eventId);
         if (evt == null) return;
-        var hasFile = evt.Files.Any(f => f.Exists);
-        if (evt.HasFile != hasFile)
+
+        var originalHasFile = evt.HasFile;
+        var originalFilePath = evt.FilePath;
+        var originalFileSize = evt.FileSize;
+        var originalQuality = evt.Quality;
+        var existingFiles = new List<EventFile>();
+        var staleFileStateChanged = false;
+        foreach (var file in evt.Files.Where(file => file.Exists))
         {
-            evt.HasFile = hasFile;
+            if (!string.IsNullOrEmpty(file.FilePath) && File.Exists(file.FilePath))
+                existingFiles.Add(file);
+            else
+            {
+                file.Exists = false;
+                staleFileStateChanged = true;
+            }
+        }
+        var selectedFile = existingFiles.FirstOrDefault(file =>
+                PathsEqual(file.FilePath, evt.FilePath))
+            ?? existingFiles
+                .OrderByDescending(file => file.Size)
+                .ThenBy(file => file.Id)
+                .FirstOrDefault();
+
+        var config = await _configService.GetConfigAsync();
+        evt.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(
+            evt.Sport, evt.Title, evt.League?.Name, evt.MonitoredParts,
+            evt.League?.MonitoredParts, existingFiles.Select(file => file.PartNumber).ToArray(),
+            config.EnableMultiPartEpisodes);
+        if (selectedFile == null)
+        {
+            evt.FilePath = null;
+            evt.FileSize = null;
+            evt.Quality = null;
+        }
+        else
+        {
+            evt.FilePath = selectedFile.FilePath;
+            evt.FileSize = selectedFile.Size;
+            evt.Quality = selectedFile.Quality;
+        }
+
+        var stateChanged = staleFileStateChanged
+            || evt.HasFile != originalHasFile
+            || evt.FilePath != originalFilePath
+            || evt.FileSize != originalFileSize
+            || evt.Quality != originalQuality;
+        if (stateChanged)
+        {
+            evt.LastUpdate = DateTime.UtcNow;
             await _db.SaveChangesAsync();
         }
+    }
+
+    /// <summary>
+    /// Keep the legacy event path aligned with a moved event file.
+    /// A multi-file event keeps its selected file when another file moves.
+    /// </summary>
+    private static bool UpdateLegacyFilePath(
+        Event evt,
+        string? originalLegacyPath,
+        string currentPath,
+        string expectedPath,
+        bool repairMissingLegacyPath,
+        out string? previousLegacyPath)
+    {
+        previousLegacyPath = evt.FilePath;
+        var tracksMovedFile = PathsEqual(originalLegacyPath, currentPath);
+        if (tracksMovedFile || repairMissingLegacyPath)
+        {
+            evt.FilePath = expectedPath;
+            return previousLegacyPath != expectedPath;
+        }
+
+        return false;
+    }
+
+    private static bool HasSingleFileOnDisk(Event evt) => evt.Files
+        .Where(file => file.Exists && !string.IsNullOrEmpty(file.FilePath) && File.Exists(file.FilePath))
+        .Take(2)
+        .Count() == 1;
+
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right))
+            return false;
+
+        static string Normalize(string path) => Path.DirectorySeparatorChar == '\\'
+            ? path.Replace('/', '\\')
+            : path;
+
+        var comparison = Path.DirectorySeparatorChar == '\\'
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        return string.Equals(Normalize(left), Normalize(right), comparison);
     }
 
     /// <summary>

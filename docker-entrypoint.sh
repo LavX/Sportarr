@@ -95,6 +95,8 @@ if [ "$(id -u)" = "0" ]; then
         echo "[Sportarr] For NVIDIA NVENC, add: --gpus=all"
     fi
 
+    /docker-startup-script.sh
+
     # Check for NVIDIA GPU (nvidia-smi available means NVIDIA runtime is active)
     if command -v nvidia-smi &> /dev/null; then
         echo "[Sportarr] NVIDIA GPU detected:"

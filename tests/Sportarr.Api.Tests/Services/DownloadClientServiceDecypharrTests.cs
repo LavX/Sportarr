@@ -80,7 +80,7 @@ public class DownloadClientServiceDecypharrTests : IDisposable
             NullLogger<DownloadClientService>.Instance,
             new MemoryCache(new MemoryCacheOptions()),
             configService,
-            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>());
+            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>(), new DownloadOwnershipCoordinator());
     }
 
     [Fact]

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Collections.Concurrent;
 using Sportarr.Api.Data;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services;
@@ -67,12 +68,18 @@ public class HealthCheckServiceTests : IDisposable
         }
     }
 
-    private HealthCheckService CreateService(SportarrDbContext db, HttpMessageHandler? githubHandler = null, HttpMessageHandler? hubHandler = null)
+    private HealthCheckService CreateService(
+        SportarrDbContext db,
+        HttpMessageHandler? githubHandler = null,
+        HttpMessageHandler? hubHandler = null,
+        DatabaseHealthTracker? databaseHealth = null)
     {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?> { ["Sportarr:DataPath"] = _tempDataPath })
+            .Build();
+
         var configService = new ConfigService(
-            new ConfigurationBuilder()
-                .AddInMemoryCollection(new Dictionary<string, string?> { ["Sportarr:DataPath"] = _tempDataPath })
-                .Build(),
+            configuration,
             Mock.Of<ILogger<ConfigService>>());
 
         var downloadClientService = new DownloadClientService(
@@ -81,7 +88,7 @@ public class HealthCheckServiceTests : IDisposable
             Mock.Of<ILogger<DownloadClientService>>(),
             new MemoryCache(new MemoryCacheOptions()),
             configService,
-            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>());
+            Mock.Of<Sportarr.Api.Services.Interfaces.IRemotePathMappingService>(), new DownloadOwnershipCoordinator());
 
         var sportarrApiClient = new SportarrApiClient(
             new HttpClient(hubHandler ?? new StubHandler(HttpStatusCode.OK, "{}")),
@@ -102,7 +109,9 @@ public class HealthCheckServiceTests : IDisposable
             new DiskSpaceService(Mock.Of<ILogger<DiskSpaceService>>()),
             sportarrApiClient,
             httpClientFactory.Object,
-            new FileNamingService(Mock.Of<ILogger<FileNamingService>>()));
+            new FileNamingService(Mock.Of<ILogger<FileNamingService>>()),
+            databaseHealth ?? new DatabaseHealthTracker(),
+            new BackupService(db, Mock.Of<ILogger<BackupService>>(), configuration, configService));
     }
 
     [Fact]
@@ -240,5 +249,109 @@ public class HealthCheckServiceTests : IDisposable
         var results = await service.PerformAllChecksAsync();
 
         results.Should().NotContain(r => r.Type == HealthCheckType.MetadataApiUnavailable);
+    }
+
+    // Issue #288. A damaged database had no health check of its own. The
+    // CorruptedDatabase type existed but only the catch-all raised it, under
+    // the message "Health check system error", and only if a check happened
+    // to touch a damaged table. An instance ran 15 days without a word.
+
+    [Fact]
+    public async Task PerformAllChecksAsync_DamagedDatabase_SurfacesAnError()
+    {
+        using var db = CreateDb();
+        var damaged = new DatabaseHealthTracker();
+        damaged.RecordFailure(new Microsoft.Data.Sqlite.SqliteException("database disk image is malformed", 11));
+        var service = CreateService(db, databaseHealth: damaged);
+
+        var results = await service.PerformAllChecksAsync();
+
+        var damage = results.Should().ContainSingle(r => r.Type == HealthCheckType.CorruptedDatabase).Subject;
+        damage.Level.Should().Be(HealthCheckLevel.Error);
+        damage.Message.Should().Contain("damaged");
+        damage.Details.Should().Contain("Restoring a backup", "a restore from before the damage is the usual repair");
+        damage.Details.Should().Contain("REINDEX", "index damage can sometimes be undone without a restore");
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_HealthyDatabase_SaysNothingAboutDamage()
+    {
+        using var db = CreateDb();
+        var service = CreateService(db);
+
+        var results = await service.PerformAllChecksAsync();
+
+        results.Should().NotContain(r => r.Type == HealthCheckType.CorruptedDatabase);
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_OrdinaryQueryFailure_IsNotReportedAsDamage()
+    {
+        // A constraint violation must never take an instance unhealthy.
+        using var db = CreateDb();
+        var tracker = new DatabaseHealthTracker();
+        tracker.RecordFailure(new Microsoft.Data.Sqlite.SqliteException("UNIQUE constraint failed", 19));
+        var service = CreateService(db, databaseHealth: tracker);
+
+        var results = await service.PerformAllChecksAsync();
+
+        results.Should().NotContain(r => r.Type == HealthCheckType.CorruptedDatabase);
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_NoBackupsYet_SaysNothing()
+    {
+        // A fresh install and an install whose backups broke look identical
+        // from here, so silence until a first backup exists.
+        using var db = CreateDb();
+        var service = CreateService(db);
+
+        var results = await service.PerformAllChecksAsync();
+
+        results.Should().NotContain(r => r.Type == HealthCheckType.BackupsFailing);
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_BackupsStoppedAfterWorking_SurfacesAWarning()
+    {
+        // The scheduled run logs its failure and moves on, so backups that
+        // stop leave no trace a user would see.
+        using var db = CreateDb();
+        var backupFolder = Path.Combine(_tempDataPath, "Backups");
+        Directory.CreateDirectory(backupFolder);
+        var stale = Path.Combine(backupFolder, "sportarr_backup_20260101_000000.zip");
+        await File.WriteAllTextAsync(stale, "not a real archive");
+        File.SetCreationTimeUtc(stale, DateTime.UtcNow.AddDays(-60));
+
+        var service = CreateService(db);
+
+        var results = await service.PerformAllChecksAsync();
+
+        var backups = results.Should().ContainSingle(r => r.Type == HealthCheckType.BackupsFailing).Subject;
+        backups.Level.Should().Be(HealthCheckLevel.Warning);
+        backups.Message.Should().Contain("stopped");
+    }
+
+    [Fact]
+    public async Task PerformAllChecksAsync_DoesNotWriteToAnIdleRootFolder()
+    {
+        using var db = CreateDb();
+        var root = Path.Combine(_tempDataPath, "library");
+        Directory.CreateDirectory(root);
+        db.RootFolders.Add(new RootFolder { Path = root });
+        await db.SaveChangesAsync();
+        var writes = new ConcurrentBag<string>();
+        using var watcher = new FileSystemWatcher(root)
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+            EnableRaisingEvents = true
+        };
+        watcher.Created += (_, args) => writes.Add(args.Name ?? string.Empty);
+        watcher.Changed += (_, args) => writes.Add(args.Name ?? string.Empty);
+
+        await CreateService(db).PerformAllChecksAsync();
+        await Task.Delay(100);
+
+        writes.Should().BeEmpty("recurring health checks must not wake an idle media disk");
     }
 }

@@ -33,6 +33,8 @@ public class ReleaseEvaluator
     /// </summary>
     public const int DefaultSportsRuntimeMinutes = 180;
 
+    private const int MotorsportQualifyingSizeRuntimeMinutes = 60;
+
     /// <summary>
     /// Highlights-tagged release titles (mirrors the release matcher's
     /// non-event pattern). Used to skip runtime-based size checks when a
@@ -66,6 +68,7 @@ public class ReleaseEvaluator
     /// <param name="eventTitle">Optional event title for event-type-specific part handling (e.g., Fight Night vs PPV)</param>
     /// <param name="runtimeMinutes">Event runtime in minutes (defaults to 180 for sports events)</param>
     /// <param name="isPack">Whether this is a weekly pack search (relaxes size/format validation)</param>
+    /// <param name="isSizeExemptPack">Whether passive acquisition identified a pack that only bypasses single-event size limits</param>
     public ReleaseEvaluation EvaluateRelease(
         ReleaseSearchResult release,
         QualityProfile? profile,
@@ -77,9 +80,14 @@ public class ReleaseEvaluator
         string? eventTitle = null,
         int? runtimeMinutes = null,
         bool isPack = false,
-        bool allowHighlights = false)
+        bool allowHighlights = false,
+        bool isSizeExemptPack = false,
+        string? leagueName = null)
     {
         var evaluation = new ReleaseEvaluation();
+        var configuredSizeRuntimeMinutes = Math.Max(1, runtimeMinutes ?? DefaultSportsRuntimeMinutes);
+        var minimumSizeRuntimeMinutes = ResolveMinimumSizeRuntimeMinutes(
+            sport, eventTitle, configuredSizeRuntimeMinutes);
 
         // Parse quality from title using robust quality parser
         var qualityModel = QualityParser.ParseQuality(release.Title);
@@ -93,7 +101,8 @@ public class ReleaseEvaluator
 
         if (isFightingSport)
         {
-            var detectedPart = _partDetector.DetectPart(release.Title, sport ?? "Fighting", eventTitle);
+            var detectedPart = _partDetector.DetectPart(
+                release.Title, sport ?? "Fighting", eventTitle, leagueName);
 
             if (!enableMultiPartEpisodes)
             {
@@ -175,7 +184,7 @@ public class ReleaseEvaluator
         // Check file size limits using per-quality definitions
         // Size limits are defined in MB per minute of runtime
         // SKIP size validation for weekly packs - they contain multiple events so will always be large
-        if (isPack)
+        if (isPack || isSizeExemptPack)
         {
             _logger.LogDebug("[Release Evaluator] {Title} - Skipping size validation (weekly pack)", release.Title);
         }
@@ -193,7 +202,8 @@ public class ReleaseEvaluator
                 release,
                 qualityModel.Quality,
                 qualityDefinitions,
-                runtimeMinutes ?? DefaultSportsRuntimeMinutes);
+                minimumSizeRuntimeMinutes,
+                configuredSizeRuntimeMinutes);
 
             if (sizeRejection != null)
             {
@@ -205,7 +215,7 @@ public class ReleaseEvaluator
                 release.Size,
                 qualityModel.Quality,
                 qualityDefinitions,
-                runtimeMinutes ?? DefaultSportsRuntimeMinutes);
+                configuredSizeRuntimeMinutes);
         }
         else if (profile != null && release.Size > 0)
         {
@@ -265,14 +275,29 @@ public class ReleaseEvaluator
         return evaluation;
     }
 
+    private static int ResolveMinimumSizeRuntimeMinutes(
+        string? sport,
+        string? eventTitle,
+        int configuredRuntimeMinutes)
+    {
+        if (!EventPartDetector.IsMotorsport(sport ?? "") || string.IsNullOrWhiteSpace(eventTitle))
+            return configuredRuntimeMinutes;
+
+        var session = EventPartDetector.DetectMotorsportSessionFromFilename(eventTitle);
+        return session is "Qualifying" or "Qualifying 1" or "Qualifying 2" or "Sprint Qualifying"
+            ? Math.Min(configuredRuntimeMinutes, MotorsportQualifyingSizeRuntimeMinutes)
+            : configuredRuntimeMinutes;
+    }
+
     /// <summary>
-    /// Calculate quality score using deterministic resolution + source scoring.
-    /// Higher resolution and better source = higher score.
-    /// This is independent of profile item ordering to avoid inversion bugs.
+    /// Calculate the configured quality profile rank.
+    /// Fall back to deterministic scoring when no profile is available.
     /// </summary>
     private static int CalculateQualityScore(QualityParser.QualityDefinition quality, QualityProfile? profile)
     {
-        return CalculateQualityScoreFromDefinition(quality);
+        return profile?.Items?.Count > 0
+            ? Helpers.QualityProfileRanker.GetRank(profile, quality.Name)
+            : CalculateQualityScoreFromDefinition(quality);
     }
 
     /// <summary>
@@ -538,7 +563,8 @@ public class ReleaseEvaluator
         bool isPack = false)
     {
         // Try to get cached format matches first (avoids expensive regex evaluation)
-        var cached = _cfCache.TryGetCached(release.Title);
+        var evidenceFingerprint = CustomFormatMatchCache.CreateEvidenceFingerprint(release);
+        var cached = _cfCache.TryGetCached(release.Title, evidenceFingerprint);
         if (cached != null)
         {
             // Cache hit! Just look up scores (fast dictionary lookup)
@@ -603,7 +629,7 @@ public class ReleaseEvaluator
         }
 
         // Cache the format matches for future searches (only caches which formats matched, not scores)
-        _cfCache.Store(release.Title, matchedFormatInfo);
+        _cfCache.Store(release.Title, matchedFormatInfo, evidenceFingerprint);
 
         // Log total score summary for releases with significant negative scores
         if (totalScore <= -1000 && matchedFormats.Any())
@@ -847,18 +873,8 @@ public class ReleaseEvaluator
         if (string.IsNullOrEmpty(pattern))
             return false;
 
-        // Extract release group from title (typically at the end after a dash or in brackets)
-        var groupMatch = Regex.Match(release.Title, @"-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$", RegexOptions.IgnoreCase);
-        if (!groupMatch.Success)
-        {
-            // Try bracket format
-            groupMatch = Regex.Match(release.Title, @"\[([A-Za-z0-9]+)\](?:\.[a-z]{2,4})?$", RegexOptions.IgnoreCase);
-        }
-
-        if (!groupMatch.Success)
-            return false;
-
-        var releaseGroup = groupMatch.Groups[1].Value;
+        var releaseGroup = ReleaseGroupParser.Parse(release.Title);
+        if (releaseGroup == null) return false;
 
         try
         {
@@ -1149,7 +1165,8 @@ public class ReleaseEvaluator
         ReleaseSearchResult release,
         QualityParser.QualityDefinition quality,
         List<QualityDefinition> qualityDefinitions,
-        int runtimeMinutes)
+        int minimumRuntimeMinutes,
+        int maximumRuntimeMinutes)
     {
         var qualityDef = FindMatchingQualityDefinition(quality, qualityDefinitions);
         if (qualityDef == null)
@@ -1164,16 +1181,16 @@ public class ReleaseEvaluator
 
         // Calculate size limits based on runtime
         // QualityDefinition stores MB per minute
-        var minSizeMB = (double)qualityDef.MinSize * runtimeMinutes;
-        var maxSizeMB = qualityDef.MaxSize.HasValue ? (double)qualityDef.MaxSize.Value * runtimeMinutes : (double?)null;
+        var minSizeMB = (double)qualityDef.MinSize * minimumRuntimeMinutes;
+        var maxSizeMB = qualityDef.MaxSize.HasValue ? (double)qualityDef.MaxSize.Value * maximumRuntimeMinutes : (double?)null;
 
         // Check minimum size
         if (sizeMB < minSizeMB)
         {
             var minSizeGB = minSizeMB / 1024.0;
             _logger.LogInformation("[Size Validation] REJECTED: {Title} - Size {SizeGB:F2}GB below minimum {MinGB:F2}GB for {Quality} (runtime: {Runtime}min)",
-                release.Title, sizeGB, minSizeGB, qualityDef.Title, runtimeMinutes);
-            return $"Size {sizeGB:F2}GB is below minimum {minSizeGB:F2}GB for {qualityDef.Title} ({qualityDef.MinSize}MB/min × {runtimeMinutes}min runtime)";
+                release.Title, sizeGB, minSizeGB, qualityDef.Title, minimumRuntimeMinutes);
+            return $"Size {sizeGB:F2}GB is below minimum {minSizeGB:F2}GB for {qualityDef.Title} ({qualityDef.MinSize}MB/min × {minimumRuntimeMinutes}min runtime)";
         }
 
         // Check maximum size (if defined)
@@ -1181,8 +1198,8 @@ public class ReleaseEvaluator
         {
             var maxSizeGB = maxSizeMB.Value / 1024.0;
             _logger.LogInformation("[Size Validation] REJECTED: {Title} - Size {SizeGB:F2}GB exceeds maximum {MaxGB:F2}GB for {Quality} (runtime: {Runtime}min)",
-                release.Title, sizeGB, maxSizeGB, qualityDef.Title, runtimeMinutes);
-            return $"Size {sizeGB:F2}GB exceeds maximum {maxSizeGB:F2}GB for {qualityDef.Title} ({qualityDef.MaxSize}MB/min × {runtimeMinutes}min runtime)";
+                release.Title, sizeGB, maxSizeGB, qualityDef.Title, maximumRuntimeMinutes);
+            return $"Size {sizeGB:F2}GB exceeds maximum {maxSizeGB:F2}GB for {qualityDef.Title} ({qualityDef.MaxSize}MB/min × {maximumRuntimeMinutes}min runtime)";
         }
 
         _logger.LogDebug("[Size Validation] {Title} - Size {SizeGB:F2}GB is within limits for {Quality} (min: {MinGB:F2}GB, max: {MaxGB}GB)",

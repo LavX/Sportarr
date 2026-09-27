@@ -8,16 +8,20 @@ namespace Sportarr.Api.Services;
 
 /// <summary>
 /// Whether a file may take the place of the file an event already holds.
-/// One rule for every way a file arrives (a completed download, a file
-/// found in the library, a manual import), so they never disagree.
-/// A lower quality never replaces. The same quality replaces unless it is
+/// Automatic imports use one rule for every way a file arrives.
+/// An explicit choice can override a preference rejection.
+/// A lower profile rank never replaces. The same rank replaces unless it is
 /// a revision downgrade while propers are preferred, or its custom format
-/// score is lower. A higher quality always replaces.
+/// score is lower. A higher profile rank always replaces.
 /// </summary>
 public static class ImportUpgradeRule
 {
+    public const string LowerQualityRejection = "Not an upgrade for the existing file.";
+    public const string RevisionRejection = "Not a revision upgrade for the existing file.";
+    public const string CustomFormatRejection = "Not a custom format upgrade for the existing file.";
+
     /// <summary>
-    /// Equal is true when quality, revision and custom format score all
+    /// Equal is true when profile rank, revision and custom format score all
     /// match: an accepted copy that improves nothing. An automatic import
     /// of such a copy that already sits in the league folder keeps the file
     /// the event holds, or two equal copies would swap places on every
@@ -30,39 +34,45 @@ public static class ImportUpgradeRule
     public static Decision Evaluate(
         string? existingQuality, int existingFormatScore, string? existingTitle,
         string? newQuality, int newFormatScore, string? newTitle,
-        string? propersSetting)
+        string? propersSetting,
+        QualityProfile? profile = null)
     {
-        var existingScore = ReleaseEvaluator.CalculateQualityScoreFromName(existingQuality);
-        var newScore = ReleaseEvaluator.CalculateQualityScoreFromName(newQuality);
+        var qualityComparison = QualityProfileRanker.Compare(profile, newQuality, existingQuality);
 
-        if (newScore < existingScore)
+        if (qualityComparison < 0)
         {
             return new Decision(false,
-                $"Not an upgrade for the existing file. Existing quality: {Label(existingQuality)}. New quality: {Label(newQuality)}.");
+                $"{LowerQualityRejection} Existing quality: {Label(existingQuality)}. New quality: {Label(newQuality)}.");
         }
 
-        if (newScore == existingScore)
+        if (qualityComparison == 0)
         {
             var propersPreferred = !string.Equals(propersSetting, "doNotPrefer", StringComparison.OrdinalIgnoreCase);
-            if (propersPreferred && ReleaseRevision.Parse(newTitle) < ReleaseRevision.Parse(existingTitle ?? existingQuality))
+            var revisionComparison = ReleaseRevision.Parse(newTitle)
+                .CompareTo(ReleaseRevision.Parse(existingTitle ?? existingQuality));
+            var preference = ReleasePreferenceComparer.Compare(
+                profile,
+                newQuality, newTitle, newFormatScore,
+                existingQuality, existingTitle, existingFormatScore,
+                propersSetting);
+
+            if (preference < 0 && propersPreferred && revisionComparison < 0)
             {
-                return new Decision(false, "Not a revision upgrade for the existing file.");
+                return new Decision(false, RevisionRejection);
             }
 
-            if (newFormatScore < existingFormatScore)
+            if (preference > 0)
+            {
+                return Accept;
+            }
+
+            if (preference < 0)
             {
                 return new Decision(false,
-                    $"Not a custom format upgrade for the existing file. New score {newFormatScore} does not improve on {existingFormatScore}.");
+                    $"{CustomFormatRejection} New score {newFormatScore} does not improve on {existingFormatScore}.");
             }
 
-            // A revision only tells copies apart while propers are preferred;
-            // otherwise two copies that differ only by a PROPER mark would
-            // take turns.
-            if (newFormatScore == existingFormatScore
-                && (!propersPreferred || ReleaseRevision.Parse(newTitle) == ReleaseRevision.Parse(existingTitle ?? existingQuality)))
-            {
-                return new Decision(true, null, Equal: true);
-            }
+            return new Decision(true, null, Equal: true);
         }
 
         return Accept;

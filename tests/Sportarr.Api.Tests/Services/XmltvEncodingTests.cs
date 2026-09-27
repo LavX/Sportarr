@@ -1,5 +1,6 @@
 using System.Text;
 using FluentAssertions;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Sportarr.Api.Services;
 using Xunit;
@@ -22,7 +23,8 @@ public class XmltvEncodingTests
     {
         var parser = new XmltvParserService(
             NullLogger<XmltvParserService>.Instance,
-            new PassthroughHttpClientFactory());
+            new PassthroughHttpClientFactory(),
+            new ConfigService(new ConfigurationBuilder().Build(), NullLogger<ConfigService>.Instance));
 
         string? name = null;
         using var stream = new MemoryStream(bytes);

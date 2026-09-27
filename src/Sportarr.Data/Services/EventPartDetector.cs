@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
 
@@ -310,9 +311,6 @@ public class EventPartDetector
             new("Race", new[] { @"(?<!practice\s)(?<!sprint\s)(?<!qualifying\s)(?<!quali\s)(?<!shootout\s)\brace\b" }),
         },
 
-        // NOTE: Formula E sessions removed - Sportarr API only has main race events, not individual sessions.
-        // Can be added back when the API provides FP1/FP2/FP3/Qualifying as separate events.
-
         // MotoGP sessions - Similar structure to F1 but with different terminology
         // IMPORTANT: Most specific patterns MUST come first (first match wins)
         // MotoGP has separate Qualifying 1 and Qualifying 2 events
@@ -410,6 +408,16 @@ public class EventPartDetector
             new("Qualifying", new[] { @"\bqualif(ying|ier)?\b", @"\bquali\b", @"\bduels?\b" }),
             // Listed so the selector can offer it. The race is the E Prix
             // itself, which the default below reads.
+            new("Race", new[] { @"\brace\b" }),
+        },
+
+        // NASCAR support sessions name themselves, while the race uses its
+        // sponsor title. The default below identifies that unnamed race.
+        ["NASCAR"] = new List<MotorsportSessionType>
+        {
+            new("Practice 2", new[] { @"\b(final\s*|free\s*)?practice\s*(2|two)\b", @"\bfp2\b" }),
+            new("Practice 1", new[] { @"\b(final\s*|free\s*)?practice\s*(1|one)?\b", @"\bfp1\b" }),
+            new("Qualifying", new[] { @"\bqualif(ying|ier)?\b", @"\bquali\b" }),
             new("Race", new[] { @"\brace\b" }),
         },
 
@@ -691,6 +699,9 @@ public class EventPartDetector
         if (!IsFightingSport(sport))
             return false;
 
+        if (leagueName?.Equals("ACA", StringComparison.OrdinalIgnoreCase) == true)
+            return false;
+
         // UFC Contender Series: single episode, no parts
         if (DetectUfcEventType(eventTitle) == UfcEventType.ContenderSeries)
             return false;
@@ -776,6 +787,9 @@ public class EventPartDetector
     /// </summary>
     private static List<CardSegment> GetSegmentsForEventType(string? eventTitle, string? leagueName = null)
     {
+        if (leagueName?.Equals("ACA", StringComparison.OrdinalIgnoreCase) == true)
+            return new List<CardSegment>();
+
         // Wrestling segments — dispatch per promotion so AEW/ROH don't
         // route through WWE's WweEventType detector and default to PLE.
         switch (DetectWrestlingPromotion(leagueName))
@@ -838,10 +852,9 @@ public class EventPartDetector
     }
 
     /// <summary>
-    /// The "main" segment name for an event (e.g. "Main Card" for fighting,
-    /// "Main Show" for wrestling) -- the highest-ordered segment. A release for
-    /// the main segment normally ships under the bare event title with no part
-    /// label, so an unlabelled fighting release maps to this part. Returns null
+    /// Gets the main segment name for an event. It uses "Main Card" or "Main Show"
+    /// when defined. It falls back to the highest-numbered segment for custom
+    /// definitions. An unlabelled fighting release maps to this part. Returns null
     /// for sports without multi-part episodes.
     /// </summary>
     public static string? GetMainPartName(string sport, string? eventTitle = null, string? leagueName = null)
@@ -849,9 +862,10 @@ public class EventPartDetector
         if (!IsFightingSport(sport))
             return null;
 
-        return GetSegmentsForEventType(eventTitle, leagueName)
-            .OrderByDescending(s => s.PartNumber)
-            .FirstOrDefault()?.Name;
+        var segments = GetSegmentsForEventType(eventTitle, leagueName);
+        return segments.FirstOrDefault(segment =>
+                segment.Name is "Main Card" or "Main Show")?.Name
+            ?? segments.OrderByDescending(segment => segment.PartNumber).FirstOrDefault()?.Name;
     }
 
     /// <summary>
@@ -977,6 +991,14 @@ public class EventPartDetector
         return required.All(p => presentPartNumbers.Any(n => n == p.PartNumber));
     }
 
+    public static bool AreAllMonitoredPartsPresent(Event evt, bool enableMultiPartEpisodes, League? leagueOverride = null)
+    {
+        var league = leagueOverride ?? evt.League;
+        var presentParts = evt.Files.Where(f => f.Exists).Select(f => f.PartNumber).ToArray();
+        return AreAllMonitoredPartsPresent(evt.Sport, evt.Title, league?.Name,
+            evt.MonitoredParts, league?.MonitoredParts, presentParts, enableMultiPartEpisodes);
+    }
+
     /// <summary>
     /// Check if this is a fighting sport that uses multi-part episodes
     /// </summary>
@@ -985,7 +1007,10 @@ public class EventPartDetector
         if (string.IsNullOrEmpty(sport))
             return false;
 
-        var fightingSports = new[]
+        return FightingSportNames.Any(s => sport.Equals(s, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static IReadOnlyList<string> FightingSportNames { get; } = Array.AsReadOnly(new[]
         {
             "Fighting",
             "Combat",  // hub canonical name — TheSportsDB labels the same sport "Fighting"
@@ -994,10 +1019,7 @@ public class EventPartDetector
             "Kickboxing",
             "Muay Thai",
             "Wrestling"
-        };
-
-        return fightingSports.Any(s => sport.Equals(s, StringComparison.OrdinalIgnoreCase));
-    }
+        });
 
     // Generational suffixes that trail a fighter's name; the token before
     // them is the actual surname ("Roy Jones Jr" -> "Jones").
@@ -1121,7 +1143,116 @@ public class EventPartDetector
         ["IndyCar"] = "Race",
         ["WEC"] = "Race",
         ["Formula E"] = "Race",
+        ["NASCAR"] = "Race",
     };
+
+    private static readonly Regex WorldSuperbikeSuperpoleRacePattern = new(
+        @"\bsuperpole[\s._-]+race\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex WorldSuperbikeNumberedRacePattern = new(
+        @"\brace[\s._-]*(?<number>1|2|3|one|two|three)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex WorldSuperbikeSuperpolePattern = new(
+        @"\bsuperpole\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex IndyCarFinalPracticePattern = new(
+        @"\bfinal[\s._-]+practice\b|\bfp\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex NumberedPracticePattern = new(
+        @"\b(?:(?:free[\s._-]*)?practice|fp)[\s._-]*(?<number>\d{1,2})\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    public static string? DetectMotorsportSessionIdentity(
+        string title,
+        string? leagueName,
+        bool releaseTitle)
+    {
+        var normalizedTitle = Regex.Replace(title, @"[._-]+", " ");
+
+        var numberedPractice = NumberedPracticePattern.Match(normalizedTitle);
+        if (numberedPractice.Success &&
+            int.TryParse(numberedPractice.Groups["number"].Value, out var practiceNumber) &&
+            practiceNumber > 0)
+        {
+            return $"Practice {practiceNumber}";
+        }
+
+        if (IsWorldSuperbikeLeague(leagueName))
+            return DetectWorldSuperbikeSession(normalizedTitle);
+
+        if (leagueName?.Contains("IndyCar", StringComparison.OrdinalIgnoreCase) == true &&
+            IndyCarFinalPracticePattern.IsMatch(normalizedTitle))
+        {
+            return "Final Practice";
+        }
+
+        var session = releaseTitle
+            ? DetectMotorsportSessionFromFilename(normalizedTitle, leagueName)
+            : DetectMotorsportSessionType(normalizedTitle, leagueName ?? "");
+
+        if (leagueName?.Contains("Supercars", StringComparison.OrdinalIgnoreCase) == true &&
+            session != null && Regex.IsMatch(session, @"^Race\s+\d+$", RegexOptions.IgnoreCase))
+        {
+            return "Race";
+        }
+
+        return session;
+    }
+
+    public static string? DetectWorldSuperbikeSession(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return null;
+
+        var cleaned = Regex.Replace(title, @"[._-]+", " ");
+
+        if (WorldSuperbikeSuperpoleRacePattern.IsMatch(cleaned))
+            return "Superpole Race";
+
+        var numberedRace = WorldSuperbikeNumberedRacePattern.Match(cleaned);
+        if (numberedRace.Success)
+        {
+            var number = numberedRace.Groups["number"].Value.ToLowerInvariant() switch
+            {
+                "one" => "1",
+                "two" => "2",
+                "three" => "3",
+                var value => value,
+            };
+            return $"Race {number}";
+        }
+
+        if (WorldSuperbikeSuperpolePattern.IsMatch(cleaned))
+            return "Superpole";
+
+        if (Regex.IsMatch(cleaned, @"\bfp\s*3\b|\b(?:free\s+)?practice\s*(?:3|three)\b", RegexOptions.IgnoreCase))
+            return "Practice 3";
+        if (Regex.IsMatch(cleaned, @"\bfp\s*2\b|\b(?:free\s+)?practice\s*(?:2|two)\b", RegexOptions.IgnoreCase))
+            return "Practice 2";
+        if (Regex.IsMatch(cleaned, @"\bfp\s*1\b|\b(?:free\s+)?practice\s*(?:1|one)?\b", RegexOptions.IgnoreCase))
+            return "Practice 1";
+        if (Regex.IsMatch(cleaned, @"\bwarm\s*up\b", RegexOptions.IgnoreCase))
+            return "Warm Up";
+        if (Regex.IsMatch(cleaned, @"\brace\b", RegexOptions.IgnoreCase))
+            return "Race";
+
+        return null;
+    }
+
+    public static bool IsWorldSuperbikeLeague(string? leagueName)
+    {
+        if (string.IsNullOrWhiteSpace(leagueName)) return false;
+
+        var normalized = leagueName.Trim();
+        return normalized.Equals("SBK", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("WSBK", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("World Superbike", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("Superbike World", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("WorldSBK", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// Get available session types for a motorsport league
@@ -1258,8 +1389,9 @@ public class EventPartDetector
     /// This is used for release matching to ensure FP1 releases match FP1 events.
     /// </summary>
     /// <param name="filename">The release filename (e.g., "Formula1.2025.Abu.Dhabi.FP1.1080p-GROUP")</param>
+    /// <param name="leagueName">The league name when the caller knows it</param>
     /// <returns>The detected session type name, or null if not detected</returns>
-    public static string? DetectMotorsportSessionFromFilename(string filename)
+    public static string? DetectMotorsportSessionFromFilename(string filename, string? leagueName = null)
     {
         if (string.IsNullOrEmpty(filename))
             return null;
@@ -1273,10 +1405,29 @@ public class EventPartDetector
         if (IsMotorsportMatch(cleanFilename, @"\b(notebook|ted'?s|highlights|review|analysis|preview|magazine|morning|afternoon)\b", RegexOptions.IgnoreCase))
             return null;
 
-        // Try all known motorsport session patterns (currently F1, but extensible)
-        foreach (var kvp in MotorsportSessionsByLeague)
+        List<MotorsportSessionType>? leagueSessions = null;
+        if (!string.IsNullOrWhiteSpace(leagueName))
         {
-            foreach (var session in kvp.Value)
+            leagueSessions = MotorsportSessionsByLeague
+                .FirstOrDefault(kvp => leagueName.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase))
+                .Value;
+        }
+
+        var sessions = leagueSessions ?? MotorsportSessionsByLeague.SelectMany(kvp => kvp.Value);
+        foreach (var session in sessions)
+        {
+            foreach (var pattern in session.Patterns)
+            {
+                if (IsMotorsportMatch(cleanFilename, pattern, RegexOptions.IgnoreCase))
+                {
+                    return session.Name;
+                }
+            }
+        }
+
+        if (leagueSessions != null)
+        {
+            foreach (var session in MotorsportSessionsByLeague.SelectMany(kvp => kvp.Value))
             {
                 foreach (var pattern in session.Patterns)
                 {

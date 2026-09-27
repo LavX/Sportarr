@@ -27,6 +27,27 @@ The `/config` volume stores your database and settings. The `/data` volume is yo
 
 After starting the container, open the web UI at `http://your-server-ip:1867`.
 
+### Optional root startup script
+
+Set `SPORTARR_STARTUP_SCRIPT` to an absolute path inside the container when
+another command must run before Sportarr starts. Mount the script read-only.
+The container runs it once as root after its normal permission and device
+setup, then switches to `PUID` and `PGID`. A failed script stops the container
+so a required setup step cannot fail silently.
+
+```yaml
+services:
+  sportarr:
+    environment:
+      - SPORTARR_STARTUP_SCRIPT=/custom/startup.sh
+    volumes:
+      - ./startup.sh:/custom/startup.sh:ro
+```
+
+Only configure scripts you trust. This setting intentionally grants the
+mounted script root access inside the container. It is ignored when the
+container itself starts as a non-root user.
+
 Or with `docker run`:
 
 ```bash

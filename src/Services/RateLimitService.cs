@@ -17,7 +17,11 @@ public interface IRateLimitService
     /// <param name="baseKey">The base key (typically the host)</param>
     /// <param name="subKey">The sub key (typically the indexer ID)</param>
     /// <param name="rateLimit">Minimum time between requests</param>
-    Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit);
+    Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit,
+        CancellationToken cancellationToken = default);
+
+    Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit,
+        Func<CancellationToken, Task> beforePulse, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Get the time until the next request is allowed for a given key combination.
@@ -60,12 +64,19 @@ public class RateLimitService : IRateLimitService
     /// </summary>
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _keyGates = new();
 
-    public async Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit)
+    public async Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit,
+        CancellationToken cancellationToken = default)
+    {
+        await WaitAndPulseAsync(baseKey, subKey, rateLimit, _ => Task.CompletedTask, cancellationToken);
+    }
+
+    public async Task WaitAndPulseAsync(string baseKey, string? subKey, TimeSpan rateLimit,
+        Func<CancellationToken, Task> beforePulse, CancellationToken cancellationToken = default)
     {
         var key = BuildKey(baseKey, subKey);
         var gate = _keyGates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
-        await gate.WaitAsync();
+        await gate.WaitAsync(cancellationToken);
         try
         {
             // Re-read inside the gate: whoever went before has already stamped
@@ -89,11 +100,13 @@ public class RateLimitService : IRateLimitService
                     _logger.LogDebug("[RateLimit] Waiting {WaitMs}ms for {Key} (includes {JitterMs}ms jitter)",
                         (int)waitTime.TotalMilliseconds, key, (int)jitter.TotalMilliseconds);
 
-                    await Task.Delay(waitTime);
+                    await Task.Delay(waitTime, cancellationToken);
                 }
             }
 
-            // Record the request time
+            await beforePulse(cancellationToken);
+
+            // Record the request time immediately before dispatch.
             _lastRequestTimes[key] = DateTime.UtcNow;
         }
         finally

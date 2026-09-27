@@ -73,11 +73,10 @@ export default function MobileTabBar() {
       label: 'IPTV', path: '/iptv', match: ['/iptv'],
       icon: SignalIcon, activeIcon: SignalSolidIcon,
       children: [
-        { label: 'Sources', path: '/iptv/sources' },
+        { label: 'Guide', path: '/iptv/guide' },
         { label: 'Channels', path: '/iptv/channels' },
-        { label: 'TV Guide', path: '/iptv/guide' },
         { label: 'Recordings', path: '/iptv/recordings' },
-        { label: 'DVR Settings', path: '/iptv/dvr-settings' },
+        { label: 'Options', path: '/iptv/settings' },
       ],
     },
     {
@@ -97,12 +96,19 @@ export default function MobileTabBar() {
   ];
 
   const openTab = tabs.find((t) => t.label === openMenu);
+  const openTabIndex = tabs.findIndex((tab) => tab.label === openMenu);
+  const openTabAnchor = openTabIndex >= 0
+    ? ((openTabIndex + 0.5) / tabs.length) * 100
+    : 50;
 
   return (
     <>
       {/* Invisible backdrop while a pill is open - tap anywhere else to close */}
       {openMenu && (
-        <div className="fixed inset-0 z-40 xl:hidden" onClick={() => setOpenMenu(null)} />
+        <div
+          className="fixed inset-0 z-40 bg-[rgba(0,0,0,0.18)] xl:hidden"
+          onClick={() => setOpenMenu(null)}
+        />
       )}
 
       <nav
@@ -111,8 +117,11 @@ export default function MobileTabBar() {
       >
         {/* Pill menu for the open section */}
         {openTab?.children && (
-          <div className="absolute inset-x-3 bottom-full mb-2 animate-pill-up">
-            <div className="max-h-[70dvh] overflow-y-auto rounded-2xl border border-red-900/40 bg-gradient-to-b from-gray-900 to-black shadow-2xl shadow-black/70">
+          <div
+            className="absolute bottom-full mb-2 w-48 -translate-x-1/2"
+            style={{ left: `clamp(6.75rem, ${openTabAnchor}%, calc(100% - 6.75rem))` }}
+          >
+            <div className="max-h-[70dvh] animate-pill-up overflow-y-auto rounded-2xl border border-red-900/40 bg-gradient-to-b from-gray-900 to-black shadow-2xl shadow-black/70">
               {openTab.children.map((child) => {
                 const current = navPath === child.path
                   || (child.path !== '/leagues' && navPath.startsWith(child.path));

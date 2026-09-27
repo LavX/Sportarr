@@ -35,7 +35,6 @@ public class MediaFileParser
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex VideoCodecPattern = new(@"(?<codec>x265|x264|h[\.\s]?265|h[\.\s]?264|HEVC|AVC|XviD|DivX|VP9|AV1)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex AudioCodecPattern = new(@"(?<audio>AAC(?:[\s\.]2[\s\.]0)?|AC3|E[\-\s]?AC[\-\s]?3|DDP|DD(?:[\s\.]5[\s\.]1)?|TrueHD|Atmos|DTS(?:[\s\-]HD)?(?:[\s\-]MA)?|FLAC|MP3|Opus)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex ReleaseGroupPattern = new(@"-([A-Za-z0-9]+)(?:\[.*?\])?$", RegexOptions.Compiled);
     private static readonly Regex ProperRepackPattern = new(@"\b(?<proper>PROPER|REPACK)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     // REAL only counts as a proper-marker when fully uppercase (scene
     // convention). A case-insensitive match flags every file containing
@@ -205,7 +204,7 @@ public class MediaFileParser
         {
             EventTitle = ExtractEventTitle(cleanName),
             Quality = BuildQualityFromParts(resolution, source),
-            ReleaseGroup = ExtractReleaseGroup(originalName), // Use original for release group
+            ReleaseGroup = ReleaseGroupParser.Parse(originalName), // Use original for release group
             Resolution = resolution,
             VideoCodec = ExtractVideoCodec(cleanName),
             AudioCodec = ExtractAudioCodec(cleanName),
@@ -319,6 +318,19 @@ public class MediaFileParser
                 // Include date in title
                 return cleanName.Substring(0, fullDateMatch.Index + fullDateMatch.Length).Trim();
             }
+
+            var qualityMarker = QualityPattern.Match(afterDate);
+            var sourceMarker = SourcePattern.Match(afterDate);
+            var fixtureEnd = Math.Min(
+                qualityMarker.Success ? qualityMarker.Index : afterDate.Length,
+                sourceMarker.Success ? sourceMarker.Index : afterDate.Length);
+            var fixture = afterDate[..fixtureEnd].Trim(' ', '.', '-', '_');
+            if (Regex.IsMatch(fixture, @"\s(?:vs?\.?|@)\s",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                    TimeSpan.FromMilliseconds(100)))
+            {
+                return fixture;
+            }
         }
 
         // For non-date filenames, find the first metadata marker
@@ -408,59 +420,6 @@ public class MediaFileParser
                     .Replace("E AC-3", "E-AC-3");
 
         return audio;
-    }
-
-    private string? ExtractReleaseGroup(string cleanName)
-    {
-        var match = ReleaseGroupPattern.Match(cleanName);
-        if (!match.Success) return null;
-
-        var group = match.Groups[1].Value;
-
-        // Reject tokens that are actually quality / resolution / source / codec
-        // / audio markers. The trailing "-TOKEN" pattern catches scene-style
-        // group names but also matches "WEBDL-2160p" -> "2160p", which is
-        // never a release group. The legacy DL/WEB/HD/SD/UHD list missed
-        // resolution tokens and codecs entirely.
-        if (LooksLikeQualityToken(group)) return null;
-
-        return group;
-    }
-
-    /// <summary>
-    /// Heuristic: does this token look like a quality / resolution / source /
-    /// codec / audio descriptor rather than a release-group name? Used to
-    /// short-circuit the trailing-hyphen release-group regex on filenames
-    /// like "Match.WEBDL-2160p" where the trailing token is technical
-    /// metadata, not a group.
-    /// </summary>
-    private static bool LooksLikeQualityToken(string token)
-    {
-        if (string.IsNullOrEmpty(token)) return true;
-        var t = token.ToUpperInvariant();
-
-        // Resolutions
-        if (Regex.IsMatch(t, @"^(360|480|540|576|720|1080|1440|2160)P?I?$")) return true;
-        // Resolution shorthand
-        if (t is "4K" or "UHD" or "FHD" or "HD" or "SD" or "QHD" or "FULLHD") return true;
-        // Sources
-        if (t is "WEBDL" or "WEB" or "WEBRIP" or "WEBHD" or "WEBCAP" or "WEBMUX"
-            or "BLURAY" or "BLU" or "BD" or "BDRIP" or "BRRIP" or "BDREMUX" or "BDMUX"
-            or "HDDVD"
-            or "HDTV" or "PDTV" or "SDTV" or "DSR" or "TVRIP"
-            or "DVD" or "DVDRIP" or "DVDR" or "DVD5" or "DVD9"
-            or "RAWHD" or "REMUX" or "VHSRIP"
-            or "TS" or "TELESYNC" or "HDCAM" or "CAM" or "TELECINE"
-            or "DL" or "RIP" or "MUX") return true;
-        // Video codecs
-        if (t is "X264" or "X265" or "H264" or "H265" or "HEVC" or "AVC"
-            or "XVID" or "DIVX" or "AV1" or "VP9" or "MPEG2" or "MPEG4") return true;
-        // Audio codecs / channel layouts
-        if (t is "AAC" or "AC3" or "EAC3" or "DD" or "DDP" or "DTS" or "DTSHD" or "DTSMA"
-            or "TRUEHD" or "FLAC" or "MP3" or "OPUS" or "ATMOS"
-            or "5" or "7" or "2") return true;
-
-        return false;
     }
 
     private string? ExtractEdition(string cleanName)

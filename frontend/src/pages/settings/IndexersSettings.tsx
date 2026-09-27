@@ -10,6 +10,7 @@ import SettingsHeader from '../../components/SettingsHeader';
 import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import TagSelector from '../../components/TagSelector';
 import { MultiSelect } from '../../components/MultiSelect';
+import { toApiIndexer } from '../../utils/indexerPayload';
 
 
 interface Indexer {
@@ -489,88 +490,10 @@ export default function IndexersSettings() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAddModal, supportsCaps, capsKey]);
 
-  // Helper function to convert component format to API format
-  const toApiFormat = (indexer: Partial<Indexer>): Partial<ApiIndexer> => {
-    const fields: { name: string; value: string | string[] }[] = [
-      { name: 'baseUrl', value: indexer.implementation === 'BroadcasTheNet' ? 'https://api.broadcasthe.net' : (indexer.baseUrl || '') },
-      { name: 'apiPath', value: indexer.implementation === 'BroadcasTheNet' ? '' : (indexer.apiPath || '/api') },
-      { name: 'apiKey', value: indexer.apiKey || '' },
-      { name: 'categories', value: indexer.categories?.join(',') || '' },
-      { name: 'minimumSeeders', value: String(indexer.minimumSeeders ?? 1) },
-    ];
-
-    if (indexer.animeCategories && indexer.animeCategories.length > 0) {
-      fields.push({ name: 'animeCategories', value: indexer.animeCategories.join(',') });
-    }
-    if (indexer.seedRatio !== undefined) {
-      fields.push({ name: 'seedRatio', value: String(indexer.seedRatio) });
-    }
-    if (indexer.seedTime !== undefined) {
-      fields.push({ name: 'seedTime', value: String(indexer.seedTime) });
-    }
-    // Always send queryLimit/grabLimit so the backend can clear them
-    // (null = unlimited) when the user empties the field.
-    fields.push({
-      name: 'queryLimit',
-      value: indexer.queryLimit !== undefined ? String(indexer.queryLimit) : '',
-    });
-    fields.push({
-      name: 'grabLimit',
-      value: indexer.grabLimit !== undefined ? String(indexer.grabLimit) : '',
-    });
-    fields.push({ name: 'requestDelayMs', value: String(indexer.requestDelayMs ?? 0) });
-    if (indexer.seasonPackSeedTime !== undefined) {
-      fields.push({ name: 'seasonPackSeedTime', value: String(indexer.seasonPackSeedTime) });
-    }
-    // Always send earlyReleaseLimit so the backend can clear it when the
-    // user empties the field. Other optional ints aren't user-clearable
-    // through this form, so they keep the omit-when-undefined pattern.
-    fields.push({
-      name: 'earlyReleaseLimit',
-      value: indexer.earlyReleaseLimit !== undefined ? String(indexer.earlyReleaseLimit) : '',
-    });
-    if (indexer.additionalParameters) {
-      fields.push({ name: 'additionalParameters', value: indexer.additionalParameters });
-    }
-    if (indexer.multiLanguages && indexer.multiLanguages.length > 0) {
-      fields.push({ name: 'multiLanguages', value: indexer.multiLanguages.join(',') });
-    }
-    if (indexer.rejectBlocklistedTorrentHashes !== undefined) {
-      fields.push({ name: 'rejectBlocklistedTorrentHashes', value: String(indexer.rejectBlocklistedTorrentHashes) });
-    }
-    if (indexer.downloadClientId !== undefined) {
-      fields.push({ name: 'downloadClientId', value: String(indexer.downloadClientId) });
-    }
-    // RSS-specific fields. Always emit when set so the backend can clear
-    // them by sending an empty string.
-    if (indexer.cookie !== undefined && indexer.cookie !== null) {
-      fields.push({ name: 'cookie', value: indexer.cookie });
-    }
-    if (indexer.allowZeroSize !== undefined) {
-      fields.push({ name: 'allowZeroSize', value: String(indexer.allowZeroSize) });
-    }
-    // Always emit failDownloads so the backend can clear the list by
-    // sending an empty string. List is converted back to int[] on the
-    // server side.
-    fields.push({ name: 'failDownloads', value: (indexer.failDownloads ?? []).join(',') });
-    return {
-      id: indexer.id,
-      name: indexer.name || '',
-      implementation: indexer.implementation || 'Torznab',
-      enable: indexer.enabled ?? true,
-      enableRss: indexer.enableRss ?? true,
-      enableAutomaticSearch: indexer.enableAutomaticSearch ?? true,
-      enableInteractiveSearch: indexer.enableInteractiveSearch ?? true,
-      priority: indexer.priority || 25,
-      fields,
-      tags: indexer.tags || [],
-    };
-  };
-
   const handleSaveIndexer = async () => {
     try {
       setError(null);
-      const apiIndexer = toApiFormat(formData);
+      const apiIndexer = toApiIndexer(formData);
 
       if (editingIndexer) {
         // Update existing indexer
@@ -661,7 +584,7 @@ export default function IndexersSettings() {
     try {
 
       // Convert to API format for testing
-      const apiIndexer = toApiFormat(indexer);
+      const apiIndexer = toApiIndexer(indexer);
 
       const response = await apiClient.post('/indexer/test', apiIndexer);
       const successMessage = response.data?.message || 'Connection successful!';

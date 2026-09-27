@@ -19,6 +19,7 @@ import apiClient from '../../api/client';
 import { apiGet } from '../../utils/api';
 import type { QualityProfile } from '../../types';
 import SettingsHeader from '../../components/SettingsHeader';
+import IptvSettingsNav from '../../components/IptvSettingsNav';
 
 // Naming preset types (same as MediaManagementSettings)
 interface NamingPreset {
@@ -214,6 +215,7 @@ function encodingSettingsFrom(data: DvrSettings) {
 }
 
 export default function DvrSettingsPage() {
+  const [showAdvanced, setShowAdvanced] = useState(false);
   // State
   // FFmpeg state
   const [ffmpegAvailable, setFfmpegAvailable] = useState<boolean | null>(null);
@@ -513,8 +515,8 @@ export default function DvrSettingsPage() {
   return (
     <div className="pb-8">
       <SettingsHeader
-        title="DVR Settings"
-        subtitle="Recording quality, hardware acceleration, storage, padding, and catchup options"
+        title="IPTV Options"
+        subtitle="Choose how Sportarr records and stores live events"
         onSave={handleSaveSettings}
         isSaving={isSavingSettings}
         hasUnsavedChanges={settingsHasChanges}
@@ -535,17 +537,28 @@ export default function DvrSettingsPage() {
           <VideoCameraIcon className="h-5 w-5 text-gray-400" />
           Recordings
         </Link>
+        <button
+          onClick={() => setShowAdvanced((current) => !current)}
+          className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
+            showAdvanced
+              ? 'border-red-700 bg-red-950/30 text-white'
+              : 'border-gray-700 bg-gray-800 text-gray-200 hover:bg-gray-700'
+          }`}
+        >
+          {showAdvanced ? 'Hide advanced' : 'Advanced'}
+        </button>
       </SettingsHeader>
 
-      <div className="max-w-6xl mx-auto px-6">
+      <div className="mx-auto max-w-6xl px-4 sm:px-6">
+      <IptvSettingsNav />
 
       {/* FFmpeg Warning */}
       {ffmpegAvailable === false && (
         <div className="mb-6 bg-yellow-950/30 border border-yellow-900/50 rounded-lg p-4 flex items-start">
           <ExclamationTriangleIcon className="w-6 h-6 text-yellow-400 mr-3 flex-shrink-0 mt-0.5" />
-          <div className="flex-1">
+          <div className="min-w-0 flex-1">
             <h3 className="text-lg font-semibold text-yellow-400 mb-1">FFmpeg Not Found</h3>
-            <p className="text-sm text-gray-300">
+            <p className="break-words text-sm text-gray-300">
               FFmpeg is required for DVR recordings. Please install FFmpeg and ensure it's available in your system PATH.
             </p>
           </div>
@@ -555,7 +568,7 @@ export default function DvrSettingsPage() {
       <div className="mb-8 bg-gradient-to-br from-gray-900 to-black border border-red-900/30 rounded-lg overflow-hidden">
         <div className="p-6">
               {/* Recording Quality & Encoding Settings */}
-              <div className="mb-8">
+              <div className={showAdvanced ? 'mb-8' : 'hidden'}>
                 <h4 className="text-lg font-semibold text-white mb-4 flex items-center">
                   <FilmIcon className="w-5 h-5 mr-2 text-purple-400" />
                   Recording Quality & Encoding
@@ -862,7 +875,7 @@ export default function DvrSettingsPage() {
               </div>
 
               {/* Hardware Acceleration */}
-              <div className="mb-8">
+              <div className={showAdvanced ? 'mb-8' : 'hidden'}>
                 <h4 className="text-lg font-semibold text-white mb-4 flex items-center">
                   <CpuChipIcon className="w-5 h-5 mr-2 text-blue-400" />
                   Hardware Acceleration
@@ -1126,7 +1139,7 @@ export default function DvrSettingsPage() {
                 </div>
 
                 {/* Trusted networks for LAN stream sources */}
-                <div className="mb-6">
+                <div className={showAdvanced ? 'mb-6' : 'hidden'}>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Trusted Stream Networks</label>
                   <input
                     type="text"
@@ -1146,7 +1159,7 @@ export default function DvrSettingsPage() {
                 </div>
 
                 {/* File Naming - Enhanced with TRaSH presets */}
-                <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                <div className={showAdvanced ? 'rounded-lg border border-gray-700 bg-gray-800/50 p-4' : 'hidden'}>
                   <div className="flex items-center justify-between mb-3">
                     <label className="flex items-center gap-2 text-sm font-medium text-white">
                       <DocumentTextIcon className="w-5 h-5 text-purple-400" />
@@ -1253,7 +1266,7 @@ export default function DvrSettingsPage() {
                   <ClockIcon className="w-5 h-5 mr-2 text-green-400" />
                   Recording Padding
                 </h4>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Pre-Padding (minutes)</label>
                     <input
@@ -1278,13 +1291,6 @@ export default function DvrSettingsPage() {
                     />
                     <p className="text-xs text-gray-500 mt-1">Continue recording after scheduled end (for overtime)</p>
                   </div>
-                </div>
-              </div>
-
-              {/* Advanced Settings */}
-              <div className="mb-8">
-                <h4 className="text-lg font-semibold text-white mb-4">Advanced Settings</h4>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Max Concurrent Recordings</label>
                     <input
@@ -1294,8 +1300,15 @@ export default function DvrSettingsPage() {
                       min="0"
                       className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-red-600"
                     />
-                    <p className="text-xs text-gray-500 mt-1">0 = unlimited</p>
+                    <p className="text-xs text-gray-500 mt-1">0 uses every available provider slot</p>
                   </div>
+                </div>
+              </div>
+
+              {/* Advanced Settings */}
+              <div className={showAdvanced ? 'mb-8' : 'hidden'}>
+                <h4 className="text-lg font-semibold text-white mb-4">Advanced Settings</h4>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Channels per Event</label>
                     <input
@@ -1366,7 +1379,7 @@ export default function DvrSettingsPage() {
               </div>
 
               {/* Reconnection Settings */}
-              <div className="mb-6">
+              <div className={showAdvanced ? 'mb-6' : 'hidden'}>
                 <h4 className="text-lg font-semibold text-white mb-4">Stream Reconnection</h4>
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <div className="flex items-center">
@@ -1430,7 +1443,7 @@ export default function DvrSettingsPage() {
               </div>
 
               {/* Catchup Settings */}
-              <div className="mb-6">
+              <div className={showAdvanced ? 'mb-6' : 'hidden'}>
                 <h4 className="text-lg font-semibold text-white mb-1">Catchup Recording</h4>
                 <p className="text-xs text-gray-500 mb-4">
                   When a channel's provider keeps a catchup archive, finished events are downloaded

@@ -1263,6 +1263,50 @@ public class SportarrApiClient
     #region Plex Metadata API
 
     /// <summary>
+    /// Fetch the authoritative episode number for one event by exact identity.
+    /// </summary>
+    public async Task<int?> GetEpisodeNumberFromApiAsync(string externalId)
+    {
+        if (string.IsNullOrWhiteSpace(externalId))
+            return null;
+
+        try
+        {
+            var root = _apiBaseUrl.Replace("/api/v2/json", string.Empty).TrimEnd('/');
+            var url = $"{root}/api/metadata/agents/episode/{Uri.EscapeDataString(externalId)}";
+            using var response = await _httpClient.GetAsync(url);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "[SportarrAPI] Failed to fetch episode number for event {EventId}: HTTP {StatusCode}",
+                    externalId, response.StatusCode);
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var episode = JsonSerializer.Deserialize<PlexEpisode>(json, _jsonOptions);
+            if (episode?.EpisodeNumber is not > 0)
+                return null;
+
+            if (episode.EpisodeNumber == 1 && episode.EpisodeNumberAuthoritative != true)
+            {
+                _logger.LogWarning(
+                    "[SportarrAPI] Event {EventId} returned an unconfirmed E01 fallback",
+                    externalId);
+                return null;
+            }
+
+            return episode.EpisodeNumber;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[SportarrAPI] Failed to fetch episode number for event {EventId}", externalId);
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Fetch episode numbers from sportarr.net Plex metadata API.
     /// This returns the correct episode numbering that Plex uses, which is sequential
     /// across ALL events in the league/season, not just monitored ones.
@@ -1471,6 +1515,9 @@ public class PlexEpisode
 
     [JsonPropertyName("episode_number")]
     public int? EpisodeNumber { get; set; }
+
+    [JsonPropertyName("episode_number_authoritative")]
+    public bool? EpisodeNumberAuthoritative { get; set; }
 
     [JsonPropertyName("season_number")]
     public int? SeasonNumber { get; set; }

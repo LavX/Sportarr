@@ -22,9 +22,7 @@ interface EpgSourcesPanelProps {
   onSourcesChanged?: () => void;
 }
 
-/// Shared XMLTV EPG source manager. Rendered both on the TV Guide page
-/// (behind the cogwheel) and in Settings > IPTV, so EPG setup is
-/// discoverable next to the IPTV sources it belongs with.
+/// Shared XMLTV guide-source manager for IPTV Options.
 export default function EpgSourcesPanel({ onSourcesChanged }: EpgSourcesPanelProps) {
   const { timezone } = useUISettings();
   const [sources, setSources] = useState<EpgSource[]>([]);

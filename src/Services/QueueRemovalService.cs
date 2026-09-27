@@ -87,6 +87,8 @@ public class QueueRemovalService
         }
 
         var clientRemovalFailed = false;
+        var blocklistIndexer = string.IsNullOrWhiteSpace(item.Indexer) ||
+            string.Equals(item.Indexer, "Unknown", StringComparison.OrdinalIgnoreCase) ? null : item.Indexer;
 
         // Handle removal method.
         if (item.DownloadClient != null)
@@ -147,7 +149,8 @@ public class QueueRemovalService
                     // here let hashless torrents re-add the same entry repeatedly.
                     existingBlock = await _db.Blocklist
                         .FirstOrDefaultAsync(b => b.Title == item.Title &&
-                                                 b.Indexer == (item.Indexer ?? "Unknown"));
+                                                 (b.Indexer == blocklistIndexer ||
+                                                  blocklistIndexer == null && (b.Indexer == "Unknown" || b.Indexer == "")));
                 }
 
                 if (existingBlock == null)
@@ -157,8 +160,9 @@ public class QueueRemovalService
                         EventId = item.EventId,
                         Title = item.Title,
                         TorrentInfoHash = item.TorrentInfoHash, // null for Usenet
-                        Indexer = item.Indexer ?? "Unknown",
+                        Indexer = blocklistIndexer,
                         Protocol = item.Protocol ?? (string.IsNullOrEmpty(item.TorrentInfoHash) ? "Usenet" : "Torrent"),
+                        Part = item.Part,
                         Reason = BlocklistReason.ManualBlock,
                         Message = blocklistAction == "blocklistAndSearch" ? "Manually removed and blocklisted" : "Manually blocklisted",
                         BlockedAt = DateTime.UtcNow
@@ -167,11 +171,6 @@ public class QueueRemovalService
                     _logger.LogInformation("[QUEUE] Added to blocklist: {Title} ({Protocol})", item.Title, blocklistItem.Protocol);
                 }
 
-                // Queue automatic search for replacement if requested (uses its own scope)
-                if (blocklistAction == "blocklistAndSearch")
-                {
-                    _ = _searchQueueService.QueueSearchAsync(item.EventId, part: null, isManualSearch: false);
-                }
                 break;
 
             case "none":
@@ -195,6 +194,11 @@ public class QueueRemovalService
 
         _db.DownloadQueue.Remove(item);
         await _db.SaveChangesAsync();
+
+        if (blocklistAction == "blocklistAndSearch")
+        {
+            await _searchQueueService.QueueSearchAsync(item.EventId, part: item.Part, isManualSearch: false);
+        }
 
         if (clientRemovalFailed)
         {

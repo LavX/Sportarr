@@ -15,10 +15,75 @@ public class QBittorrentClient
     private readonly HttpClient _httpClient;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly ILogger<QBittorrentClient> _logger;
-    private string? _cookie;
-    private string? _apiKey; // qBittorrent 5.2+ Bearer API key (when configured)
+    private volatile string? _cookie;
     private System.Version? _webApiVersion; // cached /api/v2/app/webapiVersion (instances are per-config); System.Version, not Sportarr.Api.Version
     private HttpClient? _customHttpClient; // For SSL bypass
+    private readonly SemaphoreSlim _sessionLock = new(1, 1);
+
+    private async Task<HttpResponseMessage> SendWithSessionRecoveryAsync(
+        DownloadClient config, string baseUrl, HttpMethod method, string url,
+        HttpContent? content = null, CancellationToken cancellationToken = default)
+    {
+        async Task<HttpResponseMessage> SendOnceAsync()
+        {
+            using var request = new HttpRequestMessage(method, url) { Content = content };
+            var cookie = _cookie;
+            if (cookie != null)
+                request.Headers.TryAddWithoutValidation("Cookie", cookie.Split(';', 2)[0]);
+            if (!string.IsNullOrEmpty(config.ApiKey))
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
+
+            try
+            {
+                return await GetHttpClient(config).SendAsync(request, cancellationToken);
+            }
+            finally
+            {
+                request.Content = null;
+            }
+        }
+
+        var sentCookie = _cookie;
+        var response = await SendOnceAsync();
+        if (!string.IsNullOrEmpty(config.ApiKey) ||
+            (response.StatusCode != System.Net.HttpStatusCode.Unauthorized &&
+             response.StatusCode != System.Net.HttpStatusCode.Forbidden))
+        {
+            return response;
+        }
+
+        try
+        {
+            await _sessionLock.WaitAsync(cancellationToken);
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
+        try
+        {
+            if (_cookie == sentCookie)
+            {
+                _cookie = null;
+                _logger.LogInformation("[qBittorrent] Session rejected; logging in again");
+                if (!await LoginCoreAsync(config, baseUrl, config.Username, config.Password, cancellationToken))
+                    return response;
+            }
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
+
+        response.Dispose();
+        return await SendOnceAsync();
+    }
 
     public QBittorrentClient(HttpClient httpClient, ILogger<QBittorrentClient> logger, IHttpClientFactory? httpClientFactory = null)
     {
@@ -52,35 +117,11 @@ public class QBittorrentClient
                 };
                 _customHttpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(100) };
 
-                // Copy cookie if we have one
-                if (_cookie != null)
-                {
-                    _customHttpClient.DefaultRequestHeaders.Add("Cookie", _cookie);
-                }
-                // Carry the Bearer API key (qBittorrent 5.2+) onto the
-                // lazily-created SSL-bypass client too — LoginAsync may have
-                // set it on _httpClient before this client existed.
-                if (_apiKey != null)
-                {
-                    SetBearerHeader(_customHttpClient, _apiKey);
-                }
             }
             return _customHttpClient;
         }
 
         return _httpClient;
-    }
-
-    /// <summary>
-    /// Set the Bearer Authorization header for qBittorrent 5.2+ API-key
-    /// auth. Uses the typed Authorization property so re-applying it across
-    /// per-operation calls (or after a key rotation) replaces rather than
-    /// throwing on a duplicate header.
-    /// </summary>
-    private static void SetBearerHeader(HttpClient client, string apiKey)
-    {
-        client.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
     }
 
     /// <summary>
@@ -100,8 +141,8 @@ public class QBittorrentClient
 
         try
         {
-            var client = GetHttpClient(config);
-            using var response = await client.GetAsync($"{baseUrl}/api/v2/app/webapiVersion");
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Get, $"{baseUrl}/api/v2/app/webapiVersion");
             if (!response.IsSuccessStatusCode)
             {
                 return null;
@@ -150,8 +191,6 @@ public class QBittorrentClient
         try
         {
             var baseUrl = GetBaseUrl(config);
-            var client = GetHttpClient(config);
-
             // Login
             if (!await LoginAsync(config, baseUrl, config.Username, config.Password))
             {
@@ -159,7 +198,8 @@ public class QBittorrentClient
             }
 
             // Test API version
-            using var response = await client.GetAsync($"{baseUrl}/api/v2/app/version");
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Get, $"{baseUrl}/api/v2/app/version");
             if (response.IsSuccessStatusCode)
             {
                 var version = await response.Content.ReadAsStringAsync();
@@ -215,8 +255,6 @@ public class QBittorrentClient
             _logger.LogInformation("[qBittorrent] Base URL: {BaseUrl}", baseUrl);
             _logger.LogInformation("[qBittorrent] Torrent URL: {Url}", Sportarr.Api.Helpers.SecretRedactor.Url(torrentUrl));
             _logger.LogInformation("[qBittorrent] Category: {Category}", category);
-
-            var client = GetHttpClient(config);
 
             // For magnet links, pass URL directly to qBittorrent.
             // For torrent URLs (especially Prowlarr), download bytes first then send to qBittorrent.
@@ -361,7 +399,8 @@ public class QBittorrentClient
             }
 
             _logger.LogInformation("[qBittorrent] POSTing to {Endpoint}", $"{baseUrl}/api/v2/torrents/add");
-            using var response = await client.PostAsync($"{baseUrl}/api/v2/torrents/add", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/add", content);
             _logger.LogInformation("[qBittorrent] Response status: {StatusCode} ({StatusCodeInt})", response.StatusCode, (int)response.StatusCode);
 
             if (response.IsSuccessStatusCode)
@@ -781,14 +820,13 @@ public class QBittorrentClient
         try
         {
             var baseUrl = GetBaseUrl(config);
-            var client = GetHttpClient(config);
-
-            if (!await LoginAsync(config, baseUrl, config.Username, config.Password))
+            if (!await LoginAsync(config, baseUrl, config.Username, config.Password, cts.Token))
             {
                 return null;
             }
 
-            using var response = await client.GetAsync($"{baseUrl}/api/v2/torrents/info", cts.Token);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Get, $"{baseUrl}/api/v2/torrents/info", cancellationToken: cts.Token);
 
             if (response.IsSuccessStatusCode)
             {
@@ -939,14 +977,13 @@ public class QBittorrentClient
         try
         {
             var baseUrl = GetBaseUrl(config);
-            var client = GetHttpClient(config);
-
             if (!await LoginAsync(config, baseUrl, config.Username, config.Password))
             {
                 return null;
             }
 
-            using var response = await client.GetAsync($"{baseUrl}/api/v2/torrents/files?hash={hash}");
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Get, $"{baseUrl}/api/v2/torrents/files?hash={hash}");
 
             if (response.IsSuccessStatusCode)
             {
@@ -1182,7 +1219,8 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("hashes", hash)
             });
 
-            using var response = await GetHttpClient(config).PostAsync($"{baseUrl}/api/v2/torrents/topPrio", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/topPrio", content);
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
@@ -1200,8 +1238,6 @@ public class QBittorrentClient
         try
         {
             var baseUrl = GetBaseUrl(config);
-            var client = GetHttpClient(config);
-
             if (!await LoginAsync(config, baseUrl, config.Username, config.Password))
             {
                 return false;
@@ -1213,7 +1249,8 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("value", value.ToString().ToLower())
             });
 
-            using var response = await client.PostAsync($"{baseUrl}/api/v2/torrents/setForceStart", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/setForceStart", content);
 
             if (response.IsSuccessStatusCode)
             {
@@ -1251,7 +1288,8 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("deleteFiles", deleteFiles.ToString().ToLower())
             });
 
-            using var response = await _httpClient.PostAsync($"{baseUrl}/api/v2/torrents/delete", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/delete", content);
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
@@ -1287,7 +1325,8 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("category", category)
             });
 
-            using var response = await _httpClient.PostAsync($"{baseUrl}/api/v2/torrents/setCategory", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/setCategory", content);
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
@@ -1513,36 +1552,38 @@ public class QBittorrentClient
 
     // Private helper methods
 
-    private async Task<bool> LoginAsync(DownloadClient config, string baseUrl, string? username, string? password)
+    private async Task<bool> LoginAsync(DownloadClient config, string baseUrl, string? username, string? password,
+        CancellationToken cancellationToken = default)
     {
-        // qBittorrent 5.2+ API key: stateless Bearer auth. When a key is
-        // configured we attach it to the client(s) and skip the cookie
-        // auth/login round-trip entirely (the login/logout endpoints reject
-        // API-key auth anyway). The key is generated in qBittorrent under
-        // Web UI -> API Key. Assigning DefaultRequestHeaders.Authorization
-        // is idempotent across the per-operation calls and survives a key
-        // rotation (it replaces, never duplicates).
         if (!string.IsNullOrEmpty(config.ApiKey))
-        {
-            _apiKey = config.ApiKey;
-            SetBearerHeader(_httpClient, _apiKey);
-            if (_customHttpClient != null)
-            {
-                SetBearerHeader(_customHttpClient, _apiKey);
-            }
             return true;
-        }
 
         if (_cookie != null)
-        {
             return true;
-        }
 
+        await _sessionLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_cookie != null)
+                return true;
+
+            return await LoginCoreAsync(config, baseUrl, username, password, cancellationToken);
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
+    }
+
+    private async Task<bool> LoginCoreAsync(DownloadClient config, string baseUrl, string? username, string? password,
+        CancellationToken cancellationToken)
+    {
         // Tight per-call timeout — see the comment on GetTorrentsAsync for the
         // motivation. A hung remote qBittorrent must not be allowed to occupy
         // the HttpClient for the full 100s configured timeout while monitor
         // polls keep arriving every 30s.
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(10));
         try
         {
             var client = GetHttpClient(config);
@@ -1593,12 +1634,6 @@ public class QBittorrentClient
                 if (hasSessionCookie)
                 {
                     _cookie = cookies.FirstOrDefault();
-                    _httpClient.DefaultRequestHeaders.Add("Cookie", _cookie);
-                    // Also add to custom client if it exists
-                    if (_customHttpClient != null)
-                    {
-                        _customHttpClient.DefaultRequestHeaders.Add("Cookie", _cookie);
-                    }
                     _logger.LogDebug("[qBittorrent] Login successful, session cookie stored");
                 }
                 else
@@ -1632,6 +1667,10 @@ public class QBittorrentClient
                     response.StatusCode, trimmedBody);
             }
             return false;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -1676,7 +1715,8 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("hashes", hash)
             });
 
-            using var response = await GetHttpClient(config).PostAsync($"{baseUrl}/api/v2/torrents/{action}", content);
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/{action}", content);
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
@@ -1690,10 +1730,9 @@ public class QBittorrentClient
     {
         try
         {
-            var client = GetHttpClient(config);
-
             // Check if category already exists before creating - preserves user's save path and TMM settings
-            using var response = await client.GetAsync($"{baseUrl}/api/v2/torrents/categories");
+            using var response = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Get, $"{baseUrl}/api/v2/torrents/categories");
             if (response.IsSuccessStatusCode)
             {
                 var json = await response.Content.ReadAsStringAsync();
@@ -1712,7 +1751,10 @@ public class QBittorrentClient
                 new KeyValuePair<string, string>("category", category)
             });
 
-            await client.PostAsync($"{baseUrl}/api/v2/torrents/createCategory", content);
+            using var createResponse = await SendWithSessionRecoveryAsync(config, baseUrl,
+                HttpMethod.Post, $"{baseUrl}/api/v2/torrents/createCategory", content);
+            if (!createResponse.IsSuccessStatusCode)
+                return false;
             _logger.LogInformation("[qBittorrent] Category '{Category}' created", category);
             return true;
         }

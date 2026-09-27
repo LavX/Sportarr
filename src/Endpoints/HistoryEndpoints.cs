@@ -189,7 +189,9 @@ app.MapGet("/api/event/{eventId:int}/history", async (int eventId, string? part,
             DestinationPath = (string?)null,
             h.Quality,
             Size = (long?)null,
-            Decision = h.Type == EventFileHistoryType.DeletedForUpgrade ? "Deleted for upgrade" : "Deleted",
+            Decision = h.Type == EventFileHistoryType.ReplacedManually
+                ? "Replaced manually"
+                : h.Type == EventFileHistoryType.DeletedForUpgrade ? "Deleted for upgrade" : "Deleted",
             Warnings = new List<string>(),
             Errors = !string.IsNullOrEmpty(h.Reason) ? new List<string> { h.Reason! } : new List<string>(),
             Date = h.Date,
@@ -310,7 +312,9 @@ app.MapGet("/api/leagues/{leagueId:int}/seasons/{season}/history", async (int le
             DestinationPath = (string?)null,
             h.Quality,
             Size = (long?)null,
-            Decision = h.Type == EventFileHistoryType.DeletedForUpgrade ? "Deleted for upgrade" : "Deleted",
+            Decision = h.Type == EventFileHistoryType.ReplacedManually
+                ? "Replaced manually"
+                : h.Type == EventFileHistoryType.DeletedForUpgrade ? "Deleted for upgrade" : "Deleted",
             Warnings = new List<string>(),
             Errors = !string.IsNullOrEmpty(h.Reason) ? new List<string> { h.Reason! } : new List<string>(),
             Date = h.Date,
@@ -368,6 +372,7 @@ app.MapDelete("/api/history/{id:int}", async (
         : Path.GetFileNameWithoutExtension(item.SourcePath);
     var indexer = item.DownloadQueueItem?.Indexer ?? "Unknown";
     var protocol = item.DownloadQueueItem?.Protocol ?? (string.IsNullOrEmpty(torrentHash) ? "Usenet" : "Torrent");
+    var replacementPart = item.Part ?? item.DownloadQueueItem?.Part;
 
     switch (blocklistAction)
     {
@@ -398,6 +403,7 @@ app.MapDelete("/api/history/{id:int}", async (
                     TorrentInfoHash = torrentHash, // null for Usenet
                     Indexer = indexer,
                     Protocol = protocol,
+                    Part = replacementPart,
                     Reason = BlocklistReason.ManualBlock,
                     Message = blocklistAction == "blocklistAndSearch" ? "Manually removed from history and blocklisted" : "Manually blocklisted from history",
                     BlockedAt = DateTime.UtcNow
@@ -406,11 +412,6 @@ app.MapDelete("/api/history/{id:int}", async (
                 logger.LogInformation("[HISTORY] Added to blocklist: {Title} ({Protocol})", releaseTitle, protocol);
             }
 
-            // Queue automatic search for replacement if requested (uses its own scope)
-            if (blocklistAction == "blocklistAndSearch" && item.EventId.HasValue)
-            {
-                _ = searchQueueService.QueueSearchAsync(item.EventId.Value, part: null, isManualSearch: false);
-            }
             break;
 
         case "none":
@@ -421,6 +422,10 @@ app.MapDelete("/api/history/{id:int}", async (
 
     db.ImportHistories.Remove(item);
     await db.SaveChangesAsync();
+    if (blocklistAction == "blocklistAndSearch" && item.EventId.HasValue)
+    {
+        await searchQueueService.QueueSearchAsync(item.EventId.Value, part: replacementPart, isManualSearch: false);
+    }
     return Results.NoContent();
 });
 
@@ -585,6 +590,7 @@ app.MapGet("/api/grab-history/{id:int}", async (int id, SportarrDbContext db) =>
 // Re-grab a release from history
 app.MapPost("/api/grab-history/{id:int}/regrab", async (
     int id,
+    CancellationToken cancellationToken,
     SportarrDbContext db,
     DownloadClientService downloadClientService,
     NotificationService notificationService,
@@ -597,6 +603,11 @@ app.MapPost("/api/grab-history/{id:int}/regrab", async (
 
     if (grabHistory is null)
         return Results.NotFound(new { error = "Grab history not found" });
+
+    using var eventDecision = await downloadClientService.EnterEventDecisionAsync(grabHistory.EventId, cancellationToken);
+    await db.Entry(grabHistory).ReloadAsync(cancellationToken);
+    if (db.Entry(grabHistory).State == EntityState.Detached)
+        return Results.NotFound(new { error = "Grab history no longer exists" });
 
     if (string.IsNullOrEmpty(grabHistory.DownloadUrl))
         return Results.BadRequest(new { error = "No download URL stored for this grab" });
@@ -655,6 +666,7 @@ app.MapPost("/api/grab-history/{id:int}/regrab", async (
     try
     {
 
+        using var acquisition = await downloadClientService.BeginAcquisitionAsync(cancellationToken);
         // Attempt to re-grab with seed config from indexer
         var downloadId = await downloadClientService.AddDownloadAsync(
             downloadClient,
@@ -709,6 +721,8 @@ app.MapPost("/api/grab-history/{id:int}/regrab", async (
         grabHistory.FileExists = false; // Reset since we are re-downloading
 
         await db.SaveChangesAsync();
+        acquisition.Dispose();
+        eventDecision.Dispose();
 
         try
         {
@@ -776,18 +790,28 @@ app.MapPost("/api/grab-history/{id:int}/regrab", async (
 
 // Bulk re-grab missing files from history
 app.MapPost("/api/grab-history/regrab-missing", async (
+    CancellationToken cancellationToken,
     SportarrDbContext db,
     DownloadClientService downloadClientService,
     ILogger<Program> logger,
     int? limit = null) =>
 {
-    // Find all grabs where file was imported but is now missing
-    // Exclude superseded grabs - only re-grab the most recent version for each event+part
-    var missingGrabs = await db.GrabHistory
+    var eligibleGrabs = db.GrabHistory
+        .Where(g => g.WasImported && !g.FileExists && !g.Superseded && !string.IsNullOrEmpty(g.DownloadUrl));
+    var regrabCutoff = DateTime.UtcNow.AddMinutes(-5);
+    // Select the newest owner before cooldown so older history cannot bypass it.
+    // Inline whitespace constants keep provider translation independent of captured parameters.
+    var missingGrabs = await eligibleGrabs
         .Include(g => g.Event)
-        .Where(g => g.WasImported && !g.FileExists && !g.Superseded && !string.IsNullOrEmpty(g.DownloadUrl))
-        .Where(g => !g.LastRegrabAttempt.HasValue || g.LastRegrabAttempt < DateTime.UtcNow.AddMinutes(-5))
+        .Where(g => g.DestinationPath == null || g.DestinationPath.Trim(new[] {
+            '\u0009', '\u000A', '\u000B', '\u000C', '\u000D', '\u0020', '\u0085', '\u00A0', '\u1680',
+            '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2007', '\u2008',
+            '\u2009', '\u200A', '\u2028', '\u2029', '\u202F', '\u205F', '\u3000' }) == "" ||
+            !eligibleGrabs.Any(newer => newer.EventId == g.EventId && newer.DestinationPath == g.DestinationPath &&
+                (newer.GrabbedAt > g.GrabbedAt || newer.GrabbedAt == g.GrabbedAt && newer.Id > g.Id)))
+        .Where(g => !g.LastRegrabAttempt.HasValue || g.LastRegrabAttempt < regrabCutoff)
         .OrderByDescending(g => g.GrabbedAt)
+        .ThenByDescending(g => g.Id)
         .Take(limit ?? 50) // Default to 50, prevent flooding
         .ToListAsync();
 
@@ -800,6 +824,13 @@ app.MapPost("/api/grab-history/regrab-missing", async (
 
     foreach (var grabHistory in missingGrabs)
     {
+        using var eventDecision = await downloadClientService.EnterEventDecisionAsync(grabHistory.EventId, cancellationToken);
+        await db.Entry(grabHistory).ReloadAsync(cancellationToken);
+        if (db.Entry(grabHistory).State == EntityState.Detached || grabHistory.Superseded ||
+            grabHistory.FileExists || !grabHistory.WasImported || string.IsNullOrEmpty(grabHistory.DownloadUrl) ||
+            grabHistory.LastRegrabAttempt >= regrabCutoff)
+            continue;
+
         // Find a suitable download client (canonical map, see the single
         // re-grab endpoint above for why this can't be a local list).
         var supportedTypes = DownloadClientService.GetClientTypesForProtocol(grabHistory.Protocol).ToArray();
@@ -835,6 +866,7 @@ app.MapPost("/api/grab-history/regrab-missing", async (
         try
         {
 
+            using var acquisition = await downloadClientService.BeginAcquisitionAsync(cancellationToken);
             var downloadId = await downloadClientService.AddDownloadAsync(
                 downloadClient,
                 grabHistory.DownloadUrl,
@@ -913,6 +945,8 @@ app.MapPost("/api/grab-history/regrab-missing", async (
             // loop had added by the time it failed. Sportarr would never import
             // them and the client would keep them for ever.
             await db.SaveChangesAsync();
+            acquisition.Dispose();
+            eventDecision.Dispose();
 
             successCount++;
             logger.LogInformation("[Re-grab] Queued: {Title}", grabHistory.Title);

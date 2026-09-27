@@ -547,6 +547,11 @@ public class EventDvrService
             return true;
         }
 
+        if (recording.Method == DvrRecordingMethod.Catchup)
+        {
+            await _dvrService.RenameCompletedOutputAsync(recording);
+        }
+
         // Get quality score based on event's quality profile
         var qualityScore = recording.QualityScore ?? 50;
         var customFormatScore = recording.CustomFormatScore ?? 0;
@@ -563,9 +568,9 @@ public class EventDvrService
             Source = "IPTV",
             Codec = recording.VideoCodec,
             PartName = recording.PartName,
-            PartNumber = !string.IsNullOrEmpty(recording.PartName)
-                ? GetPartNumberFromName(recording.PartName)
-                : null,
+            PartNumber = EventPartDetector.ResolvePartNumber(
+                recording.PartName, recording.Event.Sport, recording.Event.Title,
+                recording.Event.League?.Name),
             Added = DateTime.UtcNow,
             LastVerified = DateTime.UtcNow,
             Exists = true,
@@ -575,7 +580,16 @@ public class EventDvrService
         _db.EventFiles.Add(eventFile);
 
         // Update event status
-        recording.Event.HasFile = true;
+        var presentParts = await _db.EventFiles
+            .Where(file => file.EventId == recording.EventId && file.Exists)
+            .Select(file => file.PartNumber)
+            .ToListAsync();
+        presentParts.Add(eventFile.PartNumber);
+        var config = await _configService.GetConfigAsync();
+        recording.Event.HasFile = EventPartDetector.AreAllMonitoredPartsPresent(
+            recording.Event.Sport, recording.Event.Title, recording.Event.League?.Name,
+            recording.Event.MonitoredParts, recording.Event.League?.MonitoredParts,
+            presentParts, config.EnableMultiPartEpisodes);
         recording.Event.FilePath = recording.OutputPath;
         recording.Event.FileSize = recording.FileSize;
         recording.Event.Quality = recording.Quality ?? "DVR";
@@ -660,25 +674,14 @@ public class EventDvrService
 
         try
         {
-            var probeResult = await _ffmpegService.ProbeFileAsync(recording.OutputPath);
-            if (!probeResult.Success)
+            var probeResult = await _dvrService.ProbeCompletedOutputAsync(recording);
+            if (probeResult == null)
             {
-                _logger.LogWarning("[EventDVR] Failed to probe recording {RecordingId}: {Error}",
-                    recording.Id, probeResult.Error);
                 return;
             }
 
-            // Update recording with detected quality info
-            recording.VideoWidth = probeResult.Width;
-            recording.VideoHeight = probeResult.Height;
-            recording.VideoCodec = probeResult.GetCodecDisplay();
-            recording.AudioCodec = probeResult.AudioCodec;
-            recording.AudioChannels = probeResult.AudioChannels;
-
-            // Determine quality based on resolution
             var resolution = probeResult.GetResolution();
             var qualityDef = QualityParser.MapQuality(QualityParser.QualitySource.IPTV, resolution, false);
-            recording.Quality = qualityDef.Name;
 
             // Calculate quality score based on event's quality profile
             if (recording.Event != null)
@@ -872,20 +875,6 @@ public class EventDvrService
         return importedCount;
     }
 
-    /// <summary>
-    /// Get part number from part name for fighting sports.
-    /// </summary>
-    private static int? GetPartNumberFromName(string partName)
-    {
-        return partName.ToLowerInvariant() switch
-        {
-            "early prelims" => 1,
-            "prelims" => 2,
-            "main card" => 3,
-            "full event" => 0,
-            _ => null
-        };
-    }
 }
 
 /// <summary>

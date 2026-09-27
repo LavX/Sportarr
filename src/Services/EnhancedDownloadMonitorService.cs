@@ -214,10 +214,17 @@ public class EnhancedDownloadMonitorService : BackgroundService
         // Note: RemoveCompletedDownloads and RemoveFailedDownloads are now per-client settings
         // accessed via download.DownloadClient.RemoveCompletedDownloads/RemoveFailedDownloads
 
+        var coordinator = _serviceProvider.GetRequiredService<DownloadOwnershipCoordinator>();
         foreach (var download in activeDownloads)
         {
+            using var ownershipDecision = coordinator.TryEnterExternalDecision(download.DownloadClientId, download.DownloadId);
+            if (ownershipDecision == null) continue;
             if (cancellationToken.IsCancellationRequested)
                 break;
+
+            await db.Entry(download).ReloadAsync(cancellationToken);
+            if (db.Entry(download).State == EntityState.Detached || download.Status == DownloadStatus.Imported)
+                continue;
 
             try
             {
@@ -268,6 +275,12 @@ public class EnhancedDownloadMonitorService : BackgroundService
         int stalledFailMinutes,
         CancellationToken cancellationToken)
     {
+        // An import owns this row until it finishes. Startup recovers interrupted imports.
+        if (download.Status == DownloadStatus.Importing) return;
+
+        // Preserve member warnings until the user retries with corrected files or identity.
+        if (PackImportBoundary.IsHeld(download)) return;
+
         // For ImportPending downloads, skip the download client check and just retry import
         // The download already completed on the client, we're just waiting for the file to be accessible
         if (download.Status == DownloadStatus.ImportPending && enableCompletedHandling)
@@ -392,6 +405,9 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
             if (titleMatchStatus != null && newDownloadId != null)
             {
+                var coordinator = _serviceProvider.GetRequiredService<DownloadOwnershipCoordinator>();
+                if (coordinator.IsQuarantined(download.DownloadClient.Id, newDownloadId)) return;
+
                 _logger.LogInformation("[Enhanced Download Monitor] Found download by title match. Updating ID: {OldId} → {NewId}",
                     download.DownloadId, newDownloadId);
 
@@ -476,7 +492,8 @@ public class EnhancedDownloadMonitorService : BackgroundService
         download.Downloaded = status.Downloaded;
         download.Size = status.Size;
         download.TimeRemaining = status.TimeRemaining;
-        download.LastUpdate = DateTime.UtcNow;
+        if (previousStatus != DownloadStatus.Failed || status.Status is not ("failed" or "error"))
+            download.LastUpdate = DateTime.UtcNow;
 
         // Keep the last path the client reported. The v3 queue shim serves it
         // as outputPath so an external extractor can find the job folder when
@@ -690,79 +707,15 @@ public class EnhancedDownloadMonitorService : BackgroundService
     /// before it removes the job from the client, while the directory can
     /// still be seen.
     /// </summary>
-    private async Task TryRemoveCompletedFolderAsync(string? folder, string title, SportarrDbContext? db)
-    {
-        if (string.IsNullOrWhiteSpace(folder))
-            return;
-
-        try
-        {
-            var rootFolders = new List<string>();
-            var clientFolders = new List<string>();
-            var categoryNames = new List<string>();
-            if (db != null)
-            {
-                rootFolders.AddRange(await db.RootFolders.Select(r => r.Path).ToListAsync());
-                foreach (var client in await db.DownloadClients
-                    .Select(c => new { c.Directory, c.BlackholeFolder, c.WatchFolder, c.Category, c.PostImportCategory })
-                    .ToListAsync())
-                {
-                    clientFolders.Add(client.Directory ?? "");
-                    clientFolders.Add(client.BlackholeFolder ?? "");
-                    clientFolders.Add(client.WatchFolder ?? "");
-                    categoryNames.Add(client.Category ?? "");
-                    categoryNames.Add(client.PostImportCategory ?? "");
-                    if (!string.IsNullOrWhiteSpace(client.Directory))
-                    {
-                        if (!string.IsNullOrWhiteSpace(client.Category))
-                            clientFolders.Add(Path.Combine(client.Directory, client.Category));
-                        if (!string.IsNullOrWhiteSpace(client.PostImportCategory))
-                            clientFolders.Add(Path.Combine(client.Directory, client.PostImportCategory));
-                    }
-                }
-            }
-
-            if (!LeftoverFolderPolicy.IsSafeTarget(folder, rootFolders, clientFolders, categoryNames, out var full) || full == null)
-            {
-                _logger.LogDebug("[Enhanced Download Monitor] Leaving the leftover folder alone for {Title}: {Folder}", title, folder);
-                return;
-            }
-
-            Directory.Delete(full, recursive: true);
-            _logger.LogInformation("[Enhanced Download Monitor] Removed the leftover download folder for {Title}: {Folder}", title, full);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "[Enhanced Download Monitor] Could not remove the leftover folder for {Title}", title);
-        }
-    }
+    private Task TryRemoveCompletedFolderAsync(string? folder, string title, SportarrDbContext? db) =>
+        new CompletedDownloadCleanup(_serviceProvider, _logger).TryRemoveCompletedFolderAsync(folder, title, db);
 
     /// <summary>
     /// Check if a torrent has reached its seed limits (ratio and/or time) from the indexer settings.
     /// Returns true if all configured limits are met, or if no limits are configured.
     /// </summary>
-    private static bool HasReachedSeedLimit(DownloadClientStatus status, Indexer indexer)
-    {
-        // Check ratio limit
-        if (indexer.SeedRatio.HasValue && indexer.SeedRatio.Value > 0)
-        {
-            if ((status.Ratio ?? 0) < indexer.SeedRatio.Value)
-                return false;
-        }
-
-        // Check time limit (SeedTime is in minutes)
-        if (indexer.SeedTime.HasValue && indexer.SeedTime.Value > 0)
-        {
-            var seedingMinutes = status.CompletedAt.HasValue
-                ? (DateTime.UtcNow - status.CompletedAt.Value).TotalMinutes
-                : 0;
-
-            if (seedingMinutes < indexer.SeedTime.Value)
-                return false;
-        }
-
-        return true;
-    }
+    private static bool HasReachedSeedLimit(DownloadClientStatus status, Indexer indexer) =>
+        CompletedDownloadCleanup.HasReachedSeedLimit(status, indexer);
 
     private async Task HandleCompletedDownload(
         DownloadQueueItem download,
@@ -798,7 +751,10 @@ public class EnhancedDownloadMonitorService : BackgroundService
             download.Status = DownloadStatus.Importing;
 
             // Import the download
-            var importResult = await fileImportService.ImportDownloadAsync(download);
+            var importResult = download.IsPack
+                ? await fileImportService.ImportCompletedPackAsync(download,
+                    () => new CompletedDownloadCleanup(_serviceProvider, _logger).RunAsync(download, downloadClientService, db))
+                : await fileImportService.ImportDownloadAsync(download);
 
             // A null result means ImportDownloadAsync rejected the import (e.g. "not an
             // upgrade") without throwing - it has already set Status/ErrorMessage and
@@ -814,6 +770,8 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
             _logger.LogInformation("[Enhanced Download Monitor] ✓ Import successful: {Title}", download.Title);
 
+            if (!download.IsPack)
+            {
             // Remove from download client if configured in the client's settings
             // Pass deleteFiles: true to also remove the download folder from disk
             // The video files have already been moved/hardlinked to the library, but non-video files (nfo, srr, etc.)
@@ -935,6 +893,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                 // import names the setting that decides the behavior.
                 _logger.LogInformation("[Enhanced Download Monitor] Leaving download in client (Remove Completed Downloads is off for '{Client}'): {Title}",
                     download.DownloadClient!.Name, download.Title);
+            }
             }
         }
         catch (IndexerFailDownloadException ex)
@@ -1065,8 +1024,9 @@ public class EnhancedDownloadMonitorService : BackgroundService
     {
         download.RetryCount = (download.RetryCount ?? 0) + 1;
 
-        _logger.LogWarning("[Enhanced Download Monitor] Download failed: {Title} (Attempt {Retry}/3) - {Error}",
-            download.Title, download.RetryCount, download.ErrorMessage ?? "Unknown error");
+        _logger.LogWarning("[Enhanced Download Monitor] Download failed: {Title} (Attempt {Retry}/{Max}) - {Error}",
+            download.Title, download.RetryCount, DownloadFailurePolicy.MaxRedownloadAttempts,
+            download.ErrorMessage ?? "Unknown error");
 
         // Add to blocklist to prevent re-grabbing the same release
         // For torrents: use TorrentInfoHash
@@ -1142,16 +1102,16 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
         // Retry if enabled and under retry limit (respects interactive vs automatic search setting)
         var shouldRedownload = download.IsManualSearch ? redownloadFailedFromInteractive : redownloadFailed;
-        if (shouldRedownload && download.RetryCount < 3)
+        if (shouldRedownload && download.RetryCount < DownloadFailurePolicy.MaxRedownloadAttempts)
         {
             _logger.LogInformation("[Enhanced Download Monitor] Will retry download on next search cycle: {Title}", download.Title);
             // The automatic search service will pick this up
             download.Status = DownloadStatus.Failed; // Keep as failed but allow retry
         }
-        else if (download.RetryCount >= 3)
+        else if (download.RetryCount >= DownloadFailurePolicy.MaxRedownloadAttempts)
         {
             _logger.LogWarning("[Enhanced Download Monitor] Max retries reached for: {Title}", download.Title);
-            download.ErrorMessage = $"Max retries (3) reached. {download.ErrorMessage}";
+            download.ErrorMessage = $"Max retries ({DownloadFailurePolicy.MaxRedownloadAttempts}) reached. {download.ErrorMessage}";
         }
 
         await db.SaveChangesAsync();
@@ -1164,111 +1124,18 @@ public class EnhancedDownloadMonitorService : BackgroundService
     private async Task DetectExternalDownloadsAsync(CancellationToken cancellationToken)
     {
         using var scope = _serviceProvider.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+        var pollDb = scope.ServiceProvider.GetRequiredService<SportarrDbContext>();
         var downloadClientService = scope.ServiceProvider.GetRequiredService<DownloadClientService>();
-        var libraryImport = scope.ServiceProvider.GetRequiredService<LibraryImportService>();
+        var coordinator = scope.ServiceProvider.GetRequiredService<DownloadOwnershipCoordinator>();
 
         // Get all enabled download clients
-        var clients = await db.DownloadClients
+        var clients = await pollDb.DownloadClients
             .Where(c => c.Enabled)
             .ToListAsync(cancellationToken);
 
         if (clients.Count == 0) return;
 
-        // Get all known download IDs to filter out:
-        // 1. Active downloads in queue (Sportarr-initiated, currently downloading/importing)
-        // CASE-INSENSITIVE comparer: qBittorrent/SABnzbd can return the torrent hash or nzb id
-        // in a different case between the initial add response and later /info polls. Without
-        // OrdinalIgnoreCase the HashSet would miss the match and Sportarr-grabbed downloads
-        // would re-appear as "external" PendingImport rows.
-        var knownDownloadIds = new HashSet<string>(
-            await db.DownloadQueue.Select(d => d.DownloadId).ToListAsync(cancellationToken),
-            StringComparer.OrdinalIgnoreCase);
-
-        // 2. ALL pending imports (any status — prevents re-detection of completed/rejected imports)
-        var pendingDownloadIds = new HashSet<string>(
-            await db.PendingImports
-                .Select(pi => pi.DownloadId)
-                .ToListAsync(cancellationToken),
-            StringComparer.OrdinalIgnoreCase);
-
-        // 3. Grab history (Sportarr-initiated downloads), keyed to the LATEST
-        // grab per download id WITH its import state. The download client is
-        // the authority on whether a download exists; import history is the
-        // authority on its outcome. A grab that was imported must never be
-        // re-detected (finished jobs stay in the client's history forever),
-        // but a grab that never imported and still sits in the client is a
-        // download Sportarr lost track of (crash, removed queue row) and gets
-        // re-adopted into the queue below instead of being ignored.
-        var grabsByDownloadId = new Dictionary<string, GrabHistory>(StringComparer.OrdinalIgnoreCase);
-        // Same grabs keyed by hash. A Real-Debrid download changes its id
-        // between the grab and the poll, so the id lookup misses and the hash
-        // dedup below then skipped the download as already known. It was
-        // neither re-adopted nor offered as a pending import, and it sat in the
-        // client for ever, which is the case the id keying cannot cover.
-        var grabsByHash = new Dictionary<string, GrabHistory>(StringComparer.OrdinalIgnoreCase);
-        foreach (var grab in await db.GrabHistory
-                     .AsNoTracking()
-                     .Where(g => g.DownloadId != null)
-                     .OrderBy(g => g.GrabbedAt)
-                     .ToListAsync(cancellationToken))
-        {
-            grabsByDownloadId[grab.DownloadId!] = grab; // later grabs win
-            if (!string.IsNullOrEmpty(grab.TorrentInfoHash))
-            {
-                grabsByHash[grab.TorrentInfoHash] = grab;
-            }
-        }
-
-        // Hash-based fallback dedup. Real-Debrid uncached downloads can return
-        // a different DownloadId from Decypharr at grab-time vs poll-time (the
-        // ID changes once RD finishes caching the torrent), so DownloadId alone
-        // misses the duplicate. The torrent info hash stays stable.
-        var liveHashes = new HashSet<string>(
-            (await db.DownloadQueue
-                .Where(d => d.TorrentInfoHash != null)
-                .Select(d => d.TorrentInfoHash!)
-                .Concat(db.PendingImports
-                    .Where(pi => pi.TorrentInfoHash != null)
-                    .Select(pi => pi.TorrentInfoHash!))
-                .ToListAsync(cancellationToken))
-            .Select(h => h.ToLowerInvariant()),
-            StringComparer.OrdinalIgnoreCase);
-
-        var knownHashes = new HashSet<string>(
-            (await db.DownloadQueue
-                .Where(d => d.TorrentInfoHash != null)
-                .Select(d => d.TorrentInfoHash!)
-                .Concat(db.PendingImports
-                    .Where(pi => pi.TorrentInfoHash != null)
-                    .Select(pi => pi.TorrentInfoHash!))
-                .Concat(db.GrabHistory
-                    .Where(g => g.TorrentInfoHash != null)
-                    .Select(g => g.TorrentInfoHash!))
-                .ToListAsync(cancellationToken))
-            .Select(h => h.ToLowerInvariant()),
-            StringComparer.OrdinalIgnoreCase);
-
-        // Blocklist dedup. When the user clicks Remove on a
-        // pending import, the row is hard-deleted and a Blocklist entry is
-        // written. If the download client silently fails to actually delete
-        // the download (SABnzbd's queue-delete returns success even for
-        // history-only ids; some torrent clients keep completed torrents in
-        // a history view), the next poll would otherwise re-detect it as a
-        // brand-new external download and recreate the PendingImport row,
-        // producing the infinite re-add loop the user reported.
-        var blocklistedHashes = new HashSet<string>(
-            (await db.Blocklist
-                .Where(b => b.TorrentInfoHash != null)
-                .Select(b => b.TorrentInfoHash!)
-                .ToListAsync(cancellationToken))
-            .Select(h => h.ToLowerInvariant()),
-            StringComparer.OrdinalIgnoreCase);
-        var blocklistedTitles = new HashSet<string>(
-            await db.Blocklist
-                .Select(b => b.Title)
-                .ToListAsync(cancellationToken),
-            StringComparer.OrdinalIgnoreCase);
+        var ownership = await ReadDownloadOwnershipAsync(pollDb, cancellationToken);
 
         foreach (var client in clients)
         {
@@ -1285,8 +1152,11 @@ public class EnhancedDownloadMonitorService : BackgroundService
                 // poll — an empty list can also mean the client was unreachable, so a
                 // non-empty response is required before purging, to avoid wiping the
                 // Activity list on a transient outage.
-                if (allDownloads.Count > 0)
+                using (var reconciliation = coordinator.TryEnterExternalDecision())
+                if (reconciliation != null && allDownloads.Count > 0)
                 {
+                    using var reconcileScope = _serviceProvider.CreateScope();
+                    var db = reconcileScope.ServiceProvider.GetRequiredService<SportarrDbContext>();
                     var currentIds = new HashSet<string>(
                         allDownloads.Select(d => d.DownloadId),
                         StringComparer.OrdinalIgnoreCase);
@@ -1300,7 +1170,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                         .ToListAsync(cancellationToken);
 
                     var stale = clientPending
-                        .Where(pi => !currentIds.Contains(pi.DownloadId)
+                        .Where(pi => !coordinator.IsQuarantined(client.Id, pi.DownloadId) && !currentIds.Contains(pi.DownloadId)
                                      && (string.IsNullOrEmpty(pi.TorrentInfoHash)
                                          || !currentHashes.Contains(pi.TorrentInfoHash.ToLowerInvariant())))
                         .ToList();
@@ -1310,7 +1180,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                         db.PendingImports.RemoveRange(stale);
                         await db.SaveChangesAsync(cancellationToken);
                         foreach (var pi in stale)
-                            pendingDownloadIds.Remove(pi.DownloadId);
+                            ownership.PendingDownloadIds.Remove(pi.DownloadId);
                         _logger.LogInformation(
                             "[Enhanced Download Monitor] Removed {Count} stale pending import(s) for '{Client}' no longer present with its category",
                             stale.Count, client.Name);
@@ -1319,6 +1189,34 @@ public class EnhancedDownloadMonitorService : BackgroundService
 
                 foreach (var download in allDownloads)
                 {
+                    if (ownership.KnownDownloadIds.Contains(download.DownloadId) ||
+                        ownership.PendingDownloadIds.Contains(download.DownloadId)) continue;
+                    if (coordinator.HasAcquisitions || coordinator.IsQuarantined(client.Id, download.DownloadId)) continue;
+                    if (!ownership.GrabsByDownloadId.TryGetValue(download.DownloadId, out var previousGrab) &&
+                        !string.IsNullOrEmpty(download.TorrentInfoHash) && !ownership.LiveHashes.Contains(download.TorrentInfoHash))
+                        ownership.GrabsByHash.TryGetValue(download.TorrentInfoHash, out previousGrab);
+                    // Positive exclusions avoid rescanning already imported or rejected content.
+                    if (previousGrab?.WasImported == true || ownership.BlocklistedTitles.Contains(download.Title) ||
+                        (!string.IsNullOrEmpty(download.TorrentInfoHash) && ownership.BlocklistedHashes.Contains(download.TorrentInfoHash))) continue;
+
+                    // Prepare file analysis without holding up new grabs.
+                    var prepared = await PrepareExternalFileAsync(client, download);
+                    using var externalDecision = coordinator.TryEnterExternalDecision(client.Id, download.DownloadId);
+                    if (externalDecision == null) continue;
+
+                    using var decisionScope = _serviceProvider.CreateScope();
+                    var db = decisionScope.ServiceProvider.GetRequiredService<SportarrDbContext>();
+                    var libraryImport = decisionScope.ServiceProvider.GetRequiredService<LibraryImportService>();
+                    // Absence before the client poll cannot authorize an import.
+                    ownership = await ReadDownloadOwnershipAsync(db, cancellationToken);
+                    var knownDownloadIds = ownership.KnownDownloadIds;
+                    var pendingDownloadIds = ownership.PendingDownloadIds;
+                    var grabsByDownloadId = ownership.GrabsByDownloadId;
+                    var grabsByHash = ownership.GrabsByHash;
+                    var liveHashes = ownership.LiveHashes;
+                    var knownHashes = ownership.KnownHashes;
+                    var blocklistedHashes = ownership.BlocklistedHashes;
+                    var blocklistedTitles = ownership.BlocklistedTitles;
                     // Skip downloads we already know about (queue, pending imports,
                     // or grab history). Match by DownloadId first, then by torrent
                     // hash as a fallback for Real-Debrid uncached downloads where
@@ -1411,11 +1309,7 @@ public class EnhancedDownloadMonitorService : BackgroundService
                         {
                             knownHashes.Add(download.TorrentInfoHash);
 
-                            // The live set was read once before this loop, so a
-                            // hash re-adopted here still looked absent from it.
-                            // Two clients reporting the same torrent in one pass
-                            // would each re-adopt it and leave two queue rows for
-                            // one download, which then imported twice.
+                            // Keep the pass snapshot current for later client aliases.
                             liveHashes.Add(download.TorrentInfoHash);
                         }
 
@@ -1475,30 +1369,11 @@ public class EnhancedDownloadMonitorService : BackgroundService
                     var imported = false;
                     string? rejectedReason = null;
 
-                    // Only completed downloads get engine analysis: a
-                    // still-downloading torrent's folder holds partial
-                    // files that must never be imported.
-                    string? scanFolder = null;
-                    if (download.IsCompleted && !string.IsNullOrEmpty(download.FilePath))
-                    {
-                        using var pathScope = _serviceProvider.CreateScope();
-                        var pathMapping = pathScope.ServiceProvider.GetRequiredService<IRemotePathMappingService>();
-                        var localFilePath = await pathMapping.RemapRemoteToLocalAsync(client.Host, download.FilePath);
-
-                        if (Directory.Exists(localFilePath))
-                            scanFolder = localFilePath;
-                        else if (File.Exists(localFilePath))
-                            scanFolder = Path.GetDirectoryName(localFilePath);
-                    }
-
-                    if (scanFolder != null)
+                    if (prepared != null)
                     {
                         try
                         {
-                            var scan = await libraryImport.ScanFolderAsync(scanFolder, includeSubfolders: true);
-                            var best = scan.MatchedFiles
-                                .OrderByDescending(f => f.MatchConfidence ?? 0)
-                                .FirstOrDefault();
+                            var best = prepared;
                             if (best != null)
                             {
                                 suggestedEventId = best.MatchedEventId;
@@ -1581,6 +1456,8 @@ public class EnhancedDownloadMonitorService : BackgroundService
                     };
 
                     db.PendingImports.Add(pendingImport);
+                    await db.SaveChangesAsync(cancellationToken);
+                    externalDecision.Dispose();
                     pendingDownloadIds.Add(download.DownloadId); // Prevent duplicates within this scan
                     if (!string.IsNullOrEmpty(download.TorrentInfoHash))
                         knownHashes.Add(download.TorrentInfoHash);
@@ -1633,7 +1510,139 @@ public class EnhancedDownloadMonitorService : BackgroundService
             }
         }
 
-        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    private sealed record DownloadOwnershipSnapshot(
+        HashSet<string> KnownDownloadIds,
+        HashSet<string> PendingDownloadIds,
+        Dictionary<string, GrabHistory> GrabsByDownloadId,
+        Dictionary<string, GrabHistory> GrabsByHash,
+        HashSet<string> LiveHashes,
+        HashSet<string> KnownHashes,
+        HashSet<string> BlocklistedHashes,
+        HashSet<string> BlocklistedTitles);
+
+    private static async Task<DownloadOwnershipSnapshot> ReadDownloadOwnershipAsync(
+        SportarrDbContext db, CancellationToken cancellationToken)
+    {
+        // Get all known download IDs to filter out:
+        // 1. Active downloads in queue (Sportarr-initiated, currently downloading/importing)
+        // CASE-INSENSITIVE comparer: qBittorrent/SABnzbd can return the torrent hash or nzb id
+        // in a different case between the initial add response and later /info polls. Without
+        // OrdinalIgnoreCase the HashSet would miss the match and Sportarr-grabbed downloads
+        // would re-appear as "external" PendingImport rows.
+        var knownDownloadIds = new HashSet<string>(
+            await db.DownloadQueue.Select(d => d.DownloadId).ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Include every pending status to prevent repeated detection.
+        var pendingDownloadIds = new HashSet<string>(
+            await db.PendingImports
+                .Select(pi => pi.DownloadId)
+                .ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        // 3. Grab history (Sportarr-initiated downloads), keyed to the LATEST
+        // grab per download id WITH its import state. The download client is
+        // the authority on whether a download exists; import history is the
+        // authority on its outcome. A grab that was imported must never be
+        // re-detected (finished jobs stay in the client's history forever),
+        // but a grab that never imported and still sits in the client is a
+        // download Sportarr lost track of (crash, removed queue row) and gets
+        // re-adopted into the queue below instead of being ignored.
+        var grabsByDownloadId = new Dictionary<string, GrabHistory>(StringComparer.OrdinalIgnoreCase);
+        // Same grabs keyed by hash. A Real-Debrid download changes its id
+        // between the grab and the poll, so the id lookup misses and the hash
+        // dedup below then skipped the download as already known. It was
+        // neither re-adopted nor offered as a pending import, and it sat in the
+        // client for ever, which is the case the id keying cannot cover.
+        var grabsByHash = new Dictionary<string, GrabHistory>(StringComparer.OrdinalIgnoreCase);
+        foreach (var grab in await db.GrabHistory
+                     .AsNoTracking()
+                     .Where(g => g.DownloadId != null)
+                     .OrderBy(g => g.GrabbedAt)
+                     .ToListAsync(cancellationToken))
+        {
+            grabsByDownloadId[grab.DownloadId!] = grab; // later grabs win
+            if (!string.IsNullOrEmpty(grab.TorrentInfoHash))
+            {
+                grabsByHash[grab.TorrentInfoHash] = grab;
+            }
+        }
+
+        // Hash-based fallback dedup. Real-Debrid uncached downloads can return
+        // a different DownloadId from Decypharr at grab-time vs poll-time (the
+        // ID changes once RD finishes caching the torrent), so DownloadId alone
+        // misses the duplicate. The torrent info hash stays stable.
+        var liveHashes = new HashSet<string>(
+            (await db.DownloadQueue
+                .Where(d => d.TorrentInfoHash != null)
+                .Select(d => d.TorrentInfoHash!)
+                .Concat(db.PendingImports
+                    .Where(pi => pi.TorrentInfoHash != null)
+                    .Select(pi => pi.TorrentInfoHash!))
+                .ToListAsync(cancellationToken))
+            .Select(h => h.ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+
+        var knownHashes = new HashSet<string>(
+            (await db.DownloadQueue
+                .Where(d => d.TorrentInfoHash != null)
+                .Select(d => d.TorrentInfoHash!)
+                .Concat(db.PendingImports
+                    .Where(pi => pi.TorrentInfoHash != null)
+                    .Select(pi => pi.TorrentInfoHash!))
+                .Concat(db.GrabHistory
+                    .Where(g => g.TorrentInfoHash != null)
+                    .Select(g => g.TorrentInfoHash!))
+                .ToListAsync(cancellationToken))
+            .Select(h => h.ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Blocklist dedup. When the user clicks Remove on a
+        // pending import, the row is hard-deleted and a Blocklist entry is
+        // written. If the download client silently fails to actually delete
+        // the download (SABnzbd's queue-delete returns success even for
+        // history-only ids; some torrent clients keep completed torrents in
+        // a history view), the next poll would otherwise re-detect it as a
+        // brand-new external download and recreate the PendingImport row,
+        // producing the infinite re-add loop the user reported.
+        var blocklistedHashes = new HashSet<string>(
+            (await db.Blocklist
+                .Where(b => b.TorrentInfoHash != null)
+                .Select(b => b.TorrentInfoHash!)
+                .ToListAsync(cancellationToken))
+            .Select(h => h.ToLowerInvariant()),
+            StringComparer.OrdinalIgnoreCase);
+        var blocklistedTitles = new HashSet<string>(
+            await db.Blocklist
+                .Select(b => b.Title)
+                .ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
+        return new(knownDownloadIds, pendingDownloadIds, grabsByDownloadId, grabsByHash,
+            liveHashes, knownHashes, blocklistedHashes, blocklistedTitles);
+    }
+
+    private async Task<ImportableFile?> PrepareExternalFileAsync(DownloadClient client, ExternalDownloadInfo download)
+    {
+        if (!download.IsCompleted || string.IsNullOrEmpty(download.FilePath)) return null;
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var pathMapping = scope.ServiceProvider.GetRequiredService<IRemotePathMappingService>();
+            var localPath = await pathMapping.RemapRemoteToLocalAsync(client.Host, download.FilePath);
+            var folder = Directory.Exists(localPath) ? localPath : File.Exists(localPath) ? Path.GetDirectoryName(localPath) : null;
+            if (folder == null) return null;
+            var libraryImport = scope.ServiceProvider.GetRequiredService<LibraryImportService>();
+            var scan = await libraryImport.ScanFolderAsync(folder, includeSubfolders: true);
+            return scan.MatchedFiles.OrderByDescending(f => f.MatchConfidence ?? 0).FirstOrDefault();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[Enhanced Download Monitor] File analysis failed for {Title}", download.Title);
+            return null;
+        }
     }
 
     /// <summary>

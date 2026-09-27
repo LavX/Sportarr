@@ -22,11 +22,19 @@ public class ExistingFileUpgradeGateTests
         Exists = true,
     };
 
-    private static QualityProfile Profile(bool upgrades = true, int increment = 1) => new()
+    private static QualityProfile Profile(
+        bool upgrades = true,
+        int increment = 1,
+        int? cutoffQuality = null,
+        int? cutoffFormatScore = null,
+        params QualityItem[] items) => new()
     {
         Name = "Any",
         UpgradesAllowed = upgrades,
         FormatScoreIncrement = increment,
+        CutoffQuality = cutoffQuality,
+        CutoffFormatScore = cutoffFormatScore,
+        Items = items.ToList(),
     };
 
     private static Config Config(string propers = "preferAndUpgrade") => new()
@@ -109,4 +117,78 @@ public class ExistingFileUpgradeGateTests
         ExistingFileUpgradeGate.RefusalReason(File("WEBDL-1080p", cf: 0), "UFC.300.Prelims.1080p.WEB.Alt", "WEBDL-1080p", 60, Profile(increment: 50), Config())
             .Should().BeNull();
     }
+
+    [Fact]
+    public void QualitiesInOneGroupUseCustomFormatScore()
+    {
+        var profile = Profile(items:
+        [
+            Group("Preferred", Item("HDTV-1080p", 6), Item("WEBDL-2160p", 19)),
+        ]);
+
+        ExistingFileUpgradeGate.RefusalReason(
+                File("HDTV-1080p", cf: 2000), "Formula1.2160p.WEB", "WEBDL-2160p", 560,
+                profile, Config())
+            .Should().Contain("custom format");
+    }
+
+    [Fact]
+    public void HigherProfileRankAllowsQualityUpgrade()
+    {
+        var profile = Profile(items:
+        [
+            Item("WEBDL-2160p", 19),
+            Item("HDTV-1080p", 6),
+        ]);
+
+        ExistingFileUpgradeGate.RefusalReason(
+                File("HDTV-1080p", cf: 2000), "Formula1.2160p.WEB", "WEBDL-2160p", 560,
+                profile, Config())
+            .Should().BeNull();
+    }
+
+    [Fact]
+    public void QualityOnlyUpgradeStopsAtCutoff()
+    {
+        var profile = Profile(cutoffQuality: 6, items:
+        [
+            Item("WEBDL-2160p", 19),
+            Item("HDTV-1080p", 6),
+        ]);
+
+        ExistingFileUpgradeGate.RefusalReason(
+                File("HDTV-1080p", cf: 2000), "Formula1.2160p.WEB", "WEBDL-2160p", 560,
+                profile, Config())
+            .Should().Contain("cutoff");
+    }
+
+    [Fact]
+    public void FormatUpgradeContinuesAtQualityCutoffUntilFormatCutoff()
+    {
+        var profile = Profile(cutoffQuality: 6, cutoffFormatScore: 3000, items:
+        [
+            Item("WEBDL-2160p", 19),
+            Item("HDTV-1080p", 6),
+        ]);
+
+        ExistingFileUpgradeGate.RefusalReason(
+                File("HDTV-1080p", cf: 2000), "Formula1.2160p.WEB", "WEBDL-2160p", 3500,
+                profile, Config())
+            .Should().BeNull();
+    }
+
+    private static QualityItem Item(string name, int quality) => new()
+    {
+        Name = name,
+        Quality = quality,
+        Allowed = true,
+    };
+
+    private static QualityItem Group(string name, params QualityItem[] items) => new()
+    {
+        Name = name,
+        Quality = 0,
+        Allowed = true,
+        Items = items.ToList(),
+    };
 }

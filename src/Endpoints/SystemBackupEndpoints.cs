@@ -172,6 +172,12 @@ public static class SystemBackupEndpoints
 
                 var manifest = await backupService.RestoreBackupAsync(backupName, scope);
 
+                // The file that was failing has been replaced, so the recorded
+                // damage is about a database that is gone. Cleared before the
+                // initialize below, which marks it again if the restored file
+                // is damaged too.
+                rootProvider.GetRequiredService<DatabaseHealthTracker>().Reset();
+
                 // BeginAsync creates the pending report row synchronously so
                 // we can hand the id back to the client immediately. The
                 // actual scan + polling happens in a fire-and-forget task

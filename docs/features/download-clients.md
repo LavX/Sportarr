@@ -12,6 +12,12 @@
 
 Sportarr does not unpack archives for torrents. Where an indexer delivers packed releases, run [Unpackerr](../integrations/unpackerr.md) against the same download folder and it extracts them before Sportarr imports.
 
+## SAB-compatible clients
+
+Give Sportarr its own category when SABnzbd, NZBdav, or Decypharr shares a queue with another application. Sportarr sends both common category parameter names so compatible clients keep the job in that category.
+
+Sportarr tracks each grab by the job ID returned by the client. That exact ID remains authoritative if a compatible client files the job under the wrong category. If the client replaces the ID, Sportarr can recover a single exact release-title match. It refuses partial or ambiguous title matches.
+
 ## Post-import behavior
 
 Each download client has a **Post-Import Mode** controlling how files reach your library:
@@ -28,11 +34,19 @@ With **Remove Completed Downloads** enabled on a client, a move import finishes 
 
 ### A file for an event that already has one
 
-Sportarr keeps one file per event, or per part of an event. Every way a file can arrive is judged by the same rule. A lower quality never replaces the file you have. The same quality replaces it unless it is an older revision while propers and repacks are preferred, or its custom format score is lower. A higher quality always replaces it.
+Sportarr keeps one file per event, or per part of an event. Automatic searches, RSS grabs, completed downloads, and library scans all use the assigned quality profile. Qualities nearer the top of the profile are preferred. A lower-ranked quality never replaces a higher-ranked file, while a higher-ranked quality can replace a lower-ranked file even when its custom format score is lower.
+
+Qualities placed in the same profile group have equal rank. The **Propers and Repacks** setting applies next. **Prefer and Upgrade** lets a newer revision win, **Do Not Upgrade Automatically** blocks an older revision without treating a newer revision as an upgrade, and **Do Not Prefer** ignores the revision. The custom format score follows. Use a group when those qualities should compete as equals instead of being ordered separately.
 
 A copy that is equal to the file an event already holds is not swapped in. It is listed in Activity with the reason, so you decide whether to import it, ignore it or remove it.
 
 A completed download that fails the rule stays in the queue with the reason and an **Import Anyway** button. A file that appears in a league folder and fails the rule is left where it is and listed in Activity with the reason. **Library Import** also lists it and imports whatever you select. The Remove button on such a row deletes the file too, to the recycle bin when one is set, unless you untick that in the remove dialog. Ignore keeps the file and only stops the scans listing it. When a copy that already sits beside the file it replaces takes over, the replaced file stays on disk untracked. A copy from anywhere else replaces it through the recycle bin.
+
+## Retry a completed import
+
+Activity shows **Retry Import** when a completed download has failed to import or a pack member is held for correction. Resolve the displayed reason, then retry the import. Retrying uses the completed download and does not submit another download job. Bulk import supports these retries. **Import Anyway** requires confirmation on each download and is not available in bulk.
+
+Pack members are checked against their own events and parts. A completed member does not allow Sportarr to remove a shared download while another member still needs it.
 
 ## Per-indexer client assignment
 

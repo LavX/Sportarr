@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Text;
 using FluentAssertions;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services;
@@ -24,7 +25,8 @@ public class XmltvParserServiceTests
 
     private static XmltvParserService NewParser() => new(
         NullLogger<XmltvParserService>.Instance,
-        new PassthroughHttpClientFactory());
+        new PassthroughHttpClientFactory(),
+        new ConfigService(new ConfigurationBuilder().Build(), NullLogger<ConfigService>.Instance));
 
     private static byte[] Gzip(string text)
     {

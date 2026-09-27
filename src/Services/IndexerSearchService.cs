@@ -2,6 +2,8 @@ using Sportarr.Api.Data;
 using Sportarr.Api.Models;
 using Sportarr.Api.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace Sportarr.Api.Services;
 
@@ -20,7 +22,7 @@ public record SkippedIndexer(int IndexerId, string Name, string Reason, string C
 ///
 /// Rate limiting strategy:
 /// 1. Max 5 concurrent indexer queries per search (prevents overwhelming any single search).
-/// 2. HTTP-layer rate limiting via RateLimitHandler (2-second delay per indexer + jitter).
+/// 2. HTTP-layer pacing via IndexerQueryQuotaHandler (2-second default delay plus jitter).
 /// 3. Exponential backoff for failed indexers (0s, 1m, 5m, 15m, 30m, 1h, 24h max).
 /// 4. HTTP 429 responses use Retry-After header only (no additional backoff).
 /// </summary>
@@ -36,6 +38,7 @@ public class IndexerSearchService : IIndexerSearchService
     private readonly QualityDetectionService _qualityDetection;
     private readonly IndexerStatusService _indexerStatus;
     private readonly ConfigService _configService;
+    private readonly SourceOutcomeCache? _sourceOutcomes;
 
     // Max concurrent indexer queries per search (prevents overwhelming many indexers at once)
     private const int MaxConcurrentIndexerQueries = 5;
@@ -73,7 +76,8 @@ public class IndexerSearchService : IIndexerSearchService
         ReleaseProfileService releaseProfileService,
         QualityDetectionService qualityDetection,
         IndexerStatusService indexerStatus,
-        ConfigService configService)
+        ConfigService configService,
+        SearchResultCache? searchResultCache = null)
     {
         _db = db;
         _loggerFactory = loggerFactory;
@@ -85,7 +89,52 @@ public class IndexerSearchService : IIndexerSearchService
         _qualityDetection = qualityDetection;
         _indexerStatus = indexerStatus;
         _configService = configService;
+        _sourceOutcomes = searchResultCache?.SourceOutcomes;
     }
+
+    public async Task<string> GetSearchSourceFingerprintAsync(bool interactiveSearch, IEnumerable<int>? leagueTags)
+    {
+        // Include excluded rows so changes to them refresh cached skip warnings.
+        var indexers = await _db.Indexers.AsNoTracking()
+            .Where(i => i.Enabled && (interactiveSearch ? i.EnableInteractiveSearch : i.EnableAutomaticSearch))
+            .OrderBy(i => i.Id)
+            .ToListAsync();
+
+        var clientTypes = await _db.DownloadClients.AsNoTracking()
+            .Where(client => client.Enabled)
+            .OrderBy(client => client.Type)
+            .Select(client => client.Type)
+            .Distinct()
+            .ToListAsync();
+        var identity = new
+        {
+            Mode = interactiveSearch ? "interactive" : "automatic",
+            LeagueTags = leagueTags?.OrderBy(tag => tag).ToArray(),
+            Indexers = indexers.Select(SourceIdentity),
+            ClientTypes = clientTypes
+        };
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(identity)));
+    }
+
+    private static object SourceIdentity(Indexer i) => new
+    {
+        i.Id, i.Name, i.Type, i.Url, i.ApiPath, i.ApiKey, i.AdditionalParameters,
+        Categories = i.Categories.OrderBy(value => value).ToArray(),
+        Tags = i.Tags.OrderBy(value => value).ToArray(),
+        i.MinimumSeeders, i.DownloadClientId, i.EarlyReleaseLimit,
+        MultiLanguages = i.MultiLanguages?.OrderBy(value => value).ToArray(),
+        i.RssUseEzrssFormat, i.RssUseEnclosureUrl, i.RssUseEnclosureLength,
+        i.RssParseSizeInDescription, i.RssParseSeedersInDescription,
+        i.RssAllowZeroSize, i.RssSizeElementName, i.LastModified
+    };
+
+    private static string SourceRequestKey(Indexer indexer, string query, int maximum, string? eventId,
+        bool useCategoryFilter, bool interactiveSearch) => Convert.ToHexString(SHA256.HashData(
+        JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            Source = SourceIdentity(indexer), Query = query, Maximum = maximum,
+            EventId = Helpers.SportarrIdToken.Normalize(eventId), useCategoryFilter, interactiveSearch
+        })));
 
     /// <summary>
     /// Search all enabled indexers for releases matching query with rate limiting
@@ -97,9 +146,18 @@ public class IndexerSearchService : IIndexerSearchService
     /// <param name="sport">Sport type for part validation (e.g., "Fighting")</param>
     /// <param name="enableMultiPartEpisodes">Whether multi-part episodes are enabled. When false, rejects releases with detected parts.</param>
     /// <param name="eventTitle">Optional event title for event-type-specific part handling (e.g., Fight Night vs PPV)</param>
-    public async Task<List<ReleaseSearchResult>> SearchAllIndexersAsync(string query, int maxResultsPerIndexer = 10000, int? qualityProfileId = null, string? requestedPart = null, string? sport = null, bool enableMultiPartEpisodes = true, string? eventTitle = null, List<int>? leagueTags = null, List<SkippedIndexer>? skippedIndexers = null, bool allowHighlights = false, string? sportarrId = null, bool useCategoryFilter = true)
+    public async Task<List<ReleaseSearchResult>> SearchAllIndexersAsync(string query, int maxResultsPerIndexer = 10000, int? qualityProfileId = null, string? requestedPart = null, string? sport = null, bool enableMultiPartEpisodes = true, string? eventTitle = null, List<int>? leagueTags = null, List<SkippedIndexer>? skippedIndexers = null, bool allowHighlights = false, string? sportarrId = null, bool useCategoryFilter = true, bool interactiveSearch = true, string? leagueName = null)
+        => (await SearchAllIndexersDetailedAsync(query, maxResultsPerIndexer, qualityProfileId, requestedPart, sport, enableMultiPartEpisodes, eventTitle, leagueTags, skippedIndexers, allowHighlights, sportarrId, useCategoryFilter, interactiveSearch, leagueName: leagueName)).Releases;
+
+    public async Task<SearchOperationOutcome> SearchAllIndexersDetailedAsync(string query, int maxResultsPerIndexer = 10000, int? qualityProfileId = null, string? requestedPart = null, string? sport = null, bool enableMultiPartEpisodes = true, string? eventTitle = null, List<int>? leagueTags = null, List<SkippedIndexer>? skippedIndexers = null, bool allowHighlights = false, string? sportarrId = null, bool useCategoryFilter = true, bool interactiveSearch = true, bool forceRefresh = false, bool cacheSuccessfulSources = false, string? leagueName = null)
     {
         _logger.LogInformation("[Indexer Search] Searching all indexers for: {Query}", query);
+
+        var diagnostics = new System.Collections.Concurrent.ConcurrentBag<IndexerSearchDiagnostic>();
+        var sourceCache = cacheSuccessfulSources ? _sourceOutcomes : null;
+        var cachedExpiries = new System.Collections.Concurrent.ConcurrentBag<DateTimeOffset>();
+        var fetchedOutcomes = new System.Collections.Concurrent.ConcurrentBag<(string Key, IndexerSearchOutcome Outcome)>();
+        var cacheDuration = (await _configService.GetConfigAsync()).SearchCacheDuration;
 
         // Lock for thread-safe appends to skippedIndexers from parallel tasks
         var skipLock = new object();
@@ -113,7 +171,7 @@ public class IndexerSearchService : IIndexerSearchService
         }
 
         var indexers = await _db.Indexers
-            .Where(i => i.Enabled)
+            .Where(i => i.Enabled && (interactiveSearch ? i.EnableInteractiveSearch : i.EnableAutomaticSearch))
             .OrderBy(i => i.Priority)
             .ToListAsync();
 
@@ -144,7 +202,7 @@ public class IndexerSearchService : IIndexerSearchService
         if (!indexers.Any())
         {
             _logger.LogWarning("[Indexer Search] No enabled indexers configured");
-            return new List<ReleaseSearchResult>();
+            return new(new(), Array.Empty<IndexerSearchDiagnostic>(), false);
         }
 
         // Check available download client types
@@ -158,7 +216,7 @@ public class IndexerSearchService : IIndexerSearchService
         {
             _logger.LogWarning("[Indexer Search] No enabled download clients configured - cannot search any indexers. " +
                 "Please add and enable a download client (qBittorrent, SABnzbd, etc.) in Settings > Download Clients.");
-            return new List<ReleaseSearchResult>();
+            return new(new(), Array.Empty<IndexerSearchDiagnostic>(), false);
         }
 
         // Determine which protocols are supported based on available clients.
@@ -206,7 +264,7 @@ public class IndexerSearchService : IIndexerSearchService
         {
             _logger.LogWarning("[Indexer Search] No indexers available for configured download clients ({OriginalCount} total indexers, but none match available clients)",
                 countBeforeClientFilter);
-            return new List<ReleaseSearchResult>();
+            return new(new(), Array.Empty<IndexerSearchDiagnostic>(), false);
         }
 
         _logger.LogInformation("[Indexer Search] Using {Count} of {OriginalCount} indexers (filtered by download client availability)",
@@ -236,6 +294,7 @@ public class IndexerSearchService : IIndexerSearchService
             // Combined with HTTP-layer rate limiting, this prevents rate limit errors.
             using var indexerSemaphore = new SemaphoreSlim(MaxConcurrentIndexerQueries, MaxConcurrentIndexerQueries);
 
+            using var requestBatch = new IndexerSearchRequestBatch();
             var searchTasks = indexers.Select(async indexer =>
             {
                 await indexerSemaphore.WaitAsync();
@@ -249,10 +308,12 @@ public class IndexerSearchService : IIndexerSearchService
 
                 try
                 {
+                    var sourceKey = SourceRequestKey(indexer, query, maxResultsPerIndexer, sportarrId, useCategoryFilter, interactiveSearch);
+                    if (forceRefresh) sourceCache?.Invalidate(sourceKey);
                     // Pre-check availability so we can surface the skip reason to callers.
                     // SearchIndexerAsync also runs this check internally (for safety); the
                     // duplicate call is cheap and keeps the public API unchanged.
-                    if (skippedIndexers != null)
+                    if (skippedIndexers != null || sourceCache != null)
                     {
                         var (isAvailable, reason) = await _indexerStatus.IsIndexerAvailableAsync(indexer.Id);
                         if (!isAvailable)
@@ -276,11 +337,22 @@ public class IndexerSearchService : IIndexerSearchService
                                         indexers.Count - _currentSearch.CompletedIndexers));
                                 }
                             }
+                            diagnostics.Add(new(indexer.Id, indexer.Name, query, SearchTermination.Unavailable, 0, Array.Empty<SearchPageObservation>(), false, false));
                             return new List<ReleaseSearchResult>();
                         }
                     }
 
-                    var results = await SearchIndexerAsync(indexer, query, maxResultsPerIndexer, sportarrId, useCategoryFilter);
+                    var outcome = forceRefresh ? null : sourceCache?.TryGet(sourceKey, cacheDuration);
+                    if (outcome == null)
+                    {
+                        var retrievalCache = sourceCache == null ? null : new RawIndexerRetrievalCache(sourceCache,
+                            cacheDuration, forceRefresh, SourceRequestKey(indexer, query, maxResultsPerIndexer, null, useCategoryFilter, interactiveSearch));
+                        outcome = await SearchIndexerCoreDetailedAsync(indexer, query, maxResultsPerIndexer, sportarrId, useCategoryFilter, requestBatch, retrievalCache);
+                        fetchedOutcomes.Add((sourceKey, outcome));
+                    }
+                    if (outcome.CacheExpiresAt.HasValue) cachedExpiries.Add(outcome.CacheExpiresAt.Value);
+                    diagnostics.Add(new(indexer.Id, indexer.Name, query, outcome.Termination, outcome.RawCursor, outcome.Pages, outcome.KnownPageLimit, outcome.SatisfiesRequest));
+                    var results = outcome.Releases;
 
                     // Update status with results (ensure non-negative in case of race conditions)
                     lock (_statusLock)
@@ -330,6 +402,59 @@ public class IndexerSearchService : IIndexerSearchService
             });
         }
 
+        // Keep healthy evidence when another source prevents aggregate caching.
+        // Store before evaluation and never extend a reused row's expiry.
+        if (diagnostics.Any(d => !d.SatisfiesRequest && d.Termination is not (SearchTermination.UnknownTail or SearchTermination.PageCeiling)))
+            foreach (var fetched in fetchedOutcomes)
+                sourceCache?.Store(fetched.Key, fetched.Outcome, cacheDuration);
+
+        await EvaluateReleasesAsync(allResults, qualityProfileId, requestedPart, sport,
+            enableMultiPartEpisodes, eventTitle, leagueTags, allowHighlights, leagueName);
+
+        // Sort by ranking priority (quality trumps all):
+        // 1. Approved status (approved first)
+        // 2. Quality score (profile position)
+        // 3. Revision (repack > proper > none) unless propers are set to Do Not Prefer
+        // 4. Custom format score
+        // 5. Indexer flags (freeleech etc.) when Prefer Indexer Flags is on
+        // 6. Seeders (for torrents)
+        // 7. Size score (proximity to preferred size, or larger if no preferred)
+        var rankingConfig = await _configService.GetConfigAsync();
+        var preferIndexerFlags = rankingConfig.PreferIndexerFlags;
+        var preferRevisions = rankingConfig.DownloadPropersAndRepacks != "doNotPrefer";
+        allResults = allResults
+            .OrderByDescending(r => r.Approved)
+            .ThenByDescending(r => r.QualityScore)
+            .ThenByDescending(r => preferRevisions ? Helpers.ReleaseRevision.Parse(r.Title) : 0)
+            .ThenByDescending(r => r.CustomFormatScore)
+            .ThenByDescending(r => preferIndexerFlags && !string.IsNullOrEmpty(r.IndexerFlags) ? 1 : 0)
+            .ThenByDescending(r => r.Seeders ?? 0)
+            .ThenByDescending(r => r.SizeScore)
+            .ToList();
+
+        _logger.LogInformation("[Indexer Search] Found {Count} total results across {IndexerCount} indexers ({Approved} approved)",
+            allResults.Count, indexers.Count, allResults.Count(r => r.Approved));
+
+        return new(allResults, diagnostics.OrderBy(d => d.IndexerId).ToArray(), diagnostics.All(d => d.SatisfiesRequest))
+        {
+            CacheExpiresAt = cachedExpiries.IsEmpty ? null : cachedExpiries.Min()
+        };
+    }
+
+    /// <summary>
+    /// Apply current search policy before event matching and blocklist validation.
+    /// </summary>
+    public async Task EvaluateReleasesAsync(
+        List<ReleaseSearchResult> releases,
+        int? qualityProfileId,
+        string? requestedPart,
+        string? sport,
+        bool enableMultiPartEpisodes,
+        string? eventTitle,
+        List<int>? leagueTags = null,
+        bool allowHighlights = false,
+        string? leagueName = null)
+    {
         // Load release profiles for keyword filtering.
         var releaseProfiles = await _releaseProfileService.LoadReleaseProfilesAsync();
 
@@ -356,11 +481,23 @@ public class IndexerSearchService : IIndexerSearchService
         var retentionCutoff = retentionDays > 0 ? DateTime.UtcNow.AddDays(-retentionDays) : (DateTime?)null;
 
         // Evaluate each release
-        foreach (var release in allResults)
+        foreach (var release in releases)
         {
+            // Mixed cache hits can include rows that already passed this policy.
+            release.Score = 0;
+            release.QualityScore = 0;
+            release.CustomFormatScore = 0;
+            release.SizeScore = 0;
+            release.Approved = true;
+            release.Rejections = new List<string>();
+            release.MatchedFormats = new List<MatchedFormat>();
+            release.Part = requestedPart;
+
             // Check indexer retention - reject releases older than configured days
             if (retentionCutoff.HasValue && release.PublishDate < retentionCutoff.Value)
             {
+                // Rejected rows retain the quality supplied before evaluation.
+                release.Quality = release.SourceQuality;
                 var ageInDays = (DateTime.UtcNow - release.PublishDate).Days;
                 release.Approved = false;
                 release.Rejections.Add($"Release is {ageInDays} days old (retention: {retentionDays} days)");
@@ -381,9 +518,10 @@ public class IndexerSearchService : IIndexerSearchService
                 sport,
                 enableMultiPartEpisodes,
                 eventTitle,
-                null,  // runtimeMinutes
+                config.DefaultSportsRuntimeMinutes,
                 isPack,
-                allowHighlights);
+                allowHighlights,
+                leagueName: leagueName);
 
             // Update release with evaluation results
             release.Score = evaluation.TotalScore;
@@ -394,7 +532,6 @@ public class IndexerSearchService : IIndexerSearchService
             release.Rejections = evaluation.Rejections;
             release.MatchedFormats = evaluation.MatchedFormats;
             release.Quality = evaluation.Quality;
-            release.Part = requestedPart; // Store the requested part for multi-part imports
 
             // Apply release profile filtering (Required/Ignored keywords, Preferred score)
             if (releaseProfiles.Any())
@@ -417,129 +554,100 @@ public class IndexerSearchService : IIndexerSearchService
             }
         }
 
-        // Sort by ranking priority (quality trumps all):
-        // 1. Approved status (approved first)
-        // 2. Quality score (profile position)
-        // 3. Custom format score
-        // 4. Revision (repack > proper > none) unless propers are set to Do Not Prefer
-        // 5. Indexer flags (freeleech etc.) when Prefer Indexer Flags is on
-        // 6. Seeders (for torrents)
-        // 7. Size score (proximity to preferred size, or larger if no preferred)
-        var rankingConfig = await _configService.GetConfigAsync();
-        var preferIndexerFlags = rankingConfig.PreferIndexerFlags;
-        var preferRevisions = rankingConfig.DownloadPropersAndRepacks != "doNotPrefer";
-        allResults = allResults
-            .OrderByDescending(r => r.Approved)
-            .ThenByDescending(r => r.QualityScore)
-            .ThenByDescending(r => r.CustomFormatScore)
-            .ThenByDescending(r => preferRevisions ? Helpers.ReleaseRevision.Parse(r.Title) : 0)
-            .ThenByDescending(r => preferIndexerFlags && !string.IsNullOrEmpty(r.IndexerFlags) ? 1 : 0)
-            .ThenByDescending(r => r.Seeders ?? 0)
-            .ThenByDescending(r => r.SizeScore)
-            .ToList();
-
-        _logger.LogInformation("[Indexer Search] Found {Count} total results across {IndexerCount} indexers ({Approved} approved)",
-            allResults.Count, indexers.Count, allResults.Count(r => r.Approved));
-
-        return allResults;
     }
 
     /// <summary>
     /// Search a single indexer with health tracking.
-    /// Rate limiting is handled at the HTTP layer via RateLimitHandler.
+    /// Rate limiting is handled at the HTTP layer via IndexerQueryQuotaHandler.
     /// </summary>
     public async Task<List<ReleaseSearchResult>> SearchIndexerAsync(Indexer indexer, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
+        => (await SearchIndexerDetailedAsync(indexer, query, maxResults, sportarrId, useCategoryFilter)).Releases;
+
+    public Task<IndexerSearchOutcome> SearchIndexerDetailedAsync(Indexer indexer, string query, int maxResults = 10000, string? sportarrId = null, bool useCategoryFilter = true)
+        => SearchIndexerCoreDetailedAsync(indexer, query, maxResults, sportarrId, useCategoryFilter, null);
+
+    private async Task<IndexerSearchOutcome> SearchIndexerCoreDetailedAsync(Indexer indexer, string query, int maxResults, string? sportarrId, bool useCategoryFilter, IndexerSearchRequestBatch? requestBatch, RawIndexerRetrievalCache? retrievalCache = null)
     {
+        IndexerSearchOutcome outcome;
         try
         {
-            // Check if indexer is available (not disabled due to failures or rate limits)
-            var (isAvailable, reason) = await _indexerStatus.IsIndexerAvailableAsync(indexer.Id);
-            if (!isAvailable)
+            var (available, reason) = await _indexerStatus.IsIndexerAvailableAsync(indexer.Id);
+            if (!available)
             {
                 _logger.LogInformation("[Indexer Search] Skipping {Indexer}: {Reason}", indexer.Name, reason);
-                return new List<ReleaseSearchResult>();
+                return new(new(), SearchTermination.Unavailable, 0, Array.Empty<SearchPageObservation>());
             }
-
-            _logger.LogInformation("[Indexer Search] Searching {Indexer} ({Type})", indexer.Name, indexer.Type);
-
-            List<ReleaseSearchResult> results;
-            try
+            if (indexer.Type == IndexerType.Torznab)
+                outcome = await SearchTorznabAsync(indexer, query, maxResults, sportarrId, useCategoryFilter, requestBatch, retrievalCache);
+            else if (indexer.Type == IndexerType.Newznab)
+                outcome = await SearchNewznabAsync(indexer, query, maxResults, sportarrId, useCategoryFilter, requestBatch, retrievalCache);
+            else
             {
-                results = indexer.Type switch
+                var legacy = indexer.Type switch
                 {
-                    IndexerType.Torznab => await SearchTorznabAsync(indexer, query, maxResults, sportarrId, useCategoryFilter),
-                    IndexerType.Newznab => await SearchNewznabAsync(indexer, query, maxResults, sportarrId, useCategoryFilter),
                     IndexerType.BroadcasTheNet => await SearchBroadcasTheNetAsync(indexer, query, maxResults),
-                    // Plain-RSS feeds have no ?q= parameter, so a "search"
-                    // fetches the current feed and filters it locally by the
-                    // query's terms. The feed only ever contains recent
-                    // items, so this surfaces what's available right now;
-                    // ongoing coverage still comes from RSS sync.
-                    // A plain torrent feed is a torrent RSS feed. This case was
-                    // absent, so every indexer of this type fell through to the
-                    // empty default and silently returned nothing, for ever.
                     IndexerType.Rss or IndexerType.Torrent => await SearchPlainRssAsync(indexer, query, maxResults),
                     _ => new List<ReleaseSearchResult>()
                 };
-
-                // Record success
-                await _indexerStatus.RecordSuccessAsync(indexer.Id);
+                outcome = new(legacy, SearchTermination.Exhausted, 0, Array.Empty<SearchPageObservation>());
             }
-            catch (IndexerRateLimitException ex)
-            {
-                // Handle HTTP 429 - record rate limit status
-                await _indexerStatus.RecordRateLimitedAsync(indexer.Id, ex.RetryAfter);
-                return new List<ReleaseSearchResult>();
-            }
-            catch (IndexerRequestException ex)
-            {
-                // Handle other HTTP errors - record failure with backoff
-                await _indexerStatus.RecordFailureAsync(indexer.Id, ex.Message);
-                return new List<ReleaseSearchResult>();
-            }
-
-            // Set protocol and indexer ID based on indexer type
-            var protocol = indexer.Type switch
-            {
-                IndexerType.Torznab => "Torrent",
-                IndexerType.BroadcasTheNet => "Torrent",
-                IndexerType.Torrent => "Torrent",
-                IndexerType.Rss => "Torrent", // RSS feeds are typically torrents
-                IndexerType.Newznab => "Usenet",
-                _ => "Torrent" // Default to torrent for unknown types
-            };
-            foreach (var result in results)
-            {
-                result.Protocol = protocol;
-                result.IndexerId = indexer.Id; // For release profile filtering
-            }
-
-            // Filter by minimum seeders (for torrents). Releases with UNKNOWN
-            // seed counts pass: some indexers omit the seeders attribute
-            // entirely, and rejecting null as "below minimum" silently threw
-            // away every result they returned (null >= min is false).
-            if ((indexer.Type == IndexerType.Torznab || indexer.Type == IndexerType.BroadcasTheNet) && indexer.MinimumSeeders > 0)
-            {
-                var beforeSeederFilter = results.Count;
-                results = results.Where(r => !r.Seeders.HasValue || r.Seeders.Value >= indexer.MinimumSeeders).ToList();
-                if (results.Count < beforeSeederFilter)
-                {
-                    _logger.LogInformation("[Indexer Search] {Indexer}: {Dropped} of {Total} results below minimum seeders ({Min})",
-                        indexer.Name, beforeSeederFilter - results.Count, beforeSeederFilter, indexer.MinimumSeeders);
-                }
-            }
-
-            _logger.LogInformation("[Indexer Search] {Indexer} returned {Count} results", indexer.Name, results.Count);
-
-            return results;
         }
-        catch (Exception ex)
+        catch (Exception failure)
         {
-            _logger.LogError(ex, "[Indexer Search] Error searching {Indexer}", indexer.Name);
-            // Record general failure
-            await _indexerStatus.RecordFailureAsync(indexer.Id, ex.Message);
-            return new List<ReleaseSearchResult>();
+            outcome = IndexerSearchOutcome.Failed(failure);
         }
+
+        if (outcome.Failure is IndexerQueryAdmissionException admission)
+            LogQueryAdmissionFailure(indexer, admission);
+        else if (outcome.Failure is IndexerRateLimitException rateLimit)
+            await _indexerStatus.RecordRateLimitedAsync(indexer.Id, rateLimit.RetryAfter);
+        else if (outcome.Termination == SearchTermination.LocalCancelled)
+            _logger.LogInformation("[Indexer Search] Search cancelled for {Indexer}", indexer.Name);
+        else if (outcome.Failure != null)
+            await RecordQueryOutcomeFailureAsync(indexer, outcome.Failure.Message);
+        else if (outcome.SatisfiesRequest && !outcome.FromCache)
+        {
+            if (UsesQueryAdmission(indexer)) await _indexerStatus.RecordSuccessHealthAsync(indexer.Id);
+            else await _indexerStatus.RecordSuccessAsync(indexer.Id);
+        }
+
+        var results = outcome.Releases;
+        // Set protocol and indexer ID based on indexer type
+        var protocol = indexer.Type switch
+        {
+            IndexerType.Torznab => "Torrent",
+            IndexerType.BroadcasTheNet => "Torrent",
+            IndexerType.Torrent => "Torrent",
+            IndexerType.Rss => "Torrent", // RSS feeds are typically torrents
+            IndexerType.Newznab => "Usenet",
+            _ => "Torrent" // Default to torrent for unknown types
+        };
+        foreach (var result in results)
+        {
+            result.SourceQuality = result.Quality;
+            result.Protocol = protocol;
+            result.IndexerId = indexer.Id; // For release profile filtering
+        }
+
+        // Filter by minimum seeders (for torrents). Releases with UNKNOWN
+        // seed counts pass: some indexers omit the seeders attribute
+        // entirely, and rejecting null as "below minimum" silently threw
+        // away every result they returned (null >= min is false).
+        if ((indexer.Type == IndexerType.Torznab || indexer.Type == IndexerType.BroadcasTheNet) && indexer.MinimumSeeders > 0)
+        {
+            var beforeSeederFilter = results.Count;
+            results = results.Where(r => !r.Seeders.HasValue || r.Seeders.Value >= indexer.MinimumSeeders).ToList();
+            if (results.Count < beforeSeederFilter)
+            {
+                _logger.LogInformation("[Indexer Search] {Indexer}: {Dropped} of {Total} results below minimum seeders ({Min})",
+                    indexer.Name, beforeSeederFilter - results.Count, beforeSeederFilter, indexer.MinimumSeeders);
+            }
+        }
+
+
+        _logger.LogInformation("[Indexer Search] {Indexer} returned {Count} results with {Termination}",
+            indexer.Name, results.Count, outcome.Termination);
+        return outcome with { Releases = results };
     }
 
     /// <summary>
@@ -652,16 +760,24 @@ public class IndexerSearchService : IIndexerSearchService
         }
 
         var allResults = new List<ReleaseSearchResult>();
+        var requestGroups = indexers.GroupBy(indexer => GetRssRequestGroupKey(indexer, maxReleasesPerIndexer));
 
         // THROTTLING: Limit concurrent RSS fetches.
         using var indexerSemaphore = new SemaphoreSlim(MaxConcurrentIndexerQueries, MaxConcurrentIndexerQueries);
 
-        var fetchTasks = indexers.Select(async indexer =>
+        var fetchTasks = requestGroups.Select(async group =>
         {
             await indexerSemaphore.WaitAsync();
             try
             {
-                return await FetchRssFeedFromIndexerAsync(indexer, maxReleasesPerIndexer);
+                using var requestBatch = new IndexerSearchRequestBatch(
+                    maxSharedBodyBytes: 2 * IndexerSearchRequestBatch.MaxSharedBodyBytes,
+                    maxRetainedBytes: 2 * IndexerSearchRequestBatch.MaxSharedBodyBytes,
+                    maxEntries: 1);
+                var rowTasks = group.Select(indexer =>
+                    FetchRssFeedFromIndexerAsync(indexer, maxReleasesPerIndexer, requestBatch));
+                var rowResults = await Task.WhenAll(rowTasks);
+                return rowResults.SelectMany(result => result).ToList();
             }
             finally
             {
@@ -683,10 +799,36 @@ public class IndexerSearchService : IIndexerSearchService
         return allResults;
     }
 
+    private static string GetRssRequestGroupKey(Indexer indexer, int maxResults)
+    {
+        if (indexer.Type is not IndexerType.Torznab and not IndexerType.Newznab)
+            return indexer.Type + ":" + indexer.Id;
+
+        var categories = indexer.Categories?.Any() == true
+            ? indexer.Categories
+            : NewznabCategories.DefaultSportCategories.ToList();
+        var fields = new[]
+        {
+            indexer.Type.ToString(),
+            indexer.Url.TrimEnd('/'),
+            indexer.ApiPath?.Trim('/') ?? "",
+            indexer.ApiKey ?? "",
+            string.Join(",", categories),
+            maxResults.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            indexer.AdditionalParameters?.Trim() ?? "",
+            (indexer.RequestDelayMs > 0 ? indexer.RequestDelayMs : 2000)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+        return string.Join('\u001f', fields);
+    }
+
     /// <summary>
     /// Fetch RSS feed from a single indexer with health tracking
     /// </summary>
-    private async Task<List<ReleaseSearchResult>> FetchRssFeedFromIndexerAsync(Indexer indexer, int maxResults)
+    private async Task<List<ReleaseSearchResult>> FetchRssFeedFromIndexerAsync(
+        Indexer indexer,
+        int maxResults,
+        IndexerSearchRequestBatch requestBatch)
     {
         try
         {
@@ -703,15 +845,21 @@ public class IndexerSearchService : IIndexerSearchService
             {
                 results = indexer.Type switch
                 {
-                    IndexerType.Torznab => await FetchTorznabRssAsync(indexer, maxResults),
-                    IndexerType.Newznab => await FetchNewznabRssAsync(indexer, maxResults),
+                    IndexerType.Torznab => await FetchTorznabRssAsync(indexer, maxResults, requestBatch),
+                    IndexerType.Newznab => await FetchNewznabRssAsync(indexer, maxResults, requestBatch),
                     IndexerType.Rss or IndexerType.Torrent => await FetchPlainRssAsync(indexer, maxResults),
                     IndexerType.BroadcasTheNet => await FetchBroadcasTheNetRecentAsync(indexer, maxResults),
                     _ => new List<ReleaseSearchResult>()
                 };
 
                 // Record success
-                await _indexerStatus.RecordSuccessAsync(indexer.Id);
+                if (UsesQueryAdmission(indexer)) await _indexerStatus.RecordSuccessHealthAsync(indexer.Id);
+                else await _indexerStatus.RecordSuccessAsync(indexer.Id);
+            }
+            catch (IndexerQueryAdmissionException ex)
+            {
+                LogQueryAdmissionFailure(indexer, ex);
+                return new List<ReleaseSearchResult>();
             }
             catch (IndexerRateLimitException ex)
             {
@@ -722,7 +870,7 @@ public class IndexerSearchService : IIndexerSearchService
             catch (IndexerRequestException ex)
             {
                 // Handle other HTTP errors - record failure with backoff
-                await _indexerStatus.RecordFailureAsync(indexer.Id, ex.Message);
+                await RecordQueryOutcomeFailureAsync(indexer, ex.Message);
                 return new List<ReleaseSearchResult>();
             }
 
@@ -737,6 +885,7 @@ public class IndexerSearchService : IIndexerSearchService
             };
             foreach (var result in results)
             {
+                result.SourceQuality = result.Quality;
                 result.Protocol = protocol;
                 // Stamp which indexer this came from. The search path did this
                 // and the feed path did not, so a release profile scoped to a
@@ -756,15 +905,23 @@ public class IndexerSearchService : IIndexerSearchService
 
             return results;
         }
+        catch (IndexerQueryAdmissionException ex)
+        {
+            LogQueryAdmissionFailure(indexer, ex);
+            return new List<ReleaseSearchResult>();
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[RSS Feed] Error fetching from {Indexer}", indexer.Name);
-            await _indexerStatus.RecordFailureAsync(indexer.Id, ex.Message);
+            await RecordQueryOutcomeFailureAsync(indexer, ex.Message);
             return new List<ReleaseSearchResult>();
         }
     }
 
-    private async Task<List<ReleaseSearchResult>> FetchTorznabRssAsync(Indexer indexer, int maxResults)
+    private async Task<List<ReleaseSearchResult>> FetchTorznabRssAsync(
+        Indexer indexer,
+        int maxResults,
+        IndexerSearchRequestBatch requestBatch)
     {
         // Log categories being used for RSS (important for filtering out non-TV content)
         var categories = indexer.Categories?.Any() == true
@@ -774,9 +931,27 @@ public class IndexerSearchService : IIndexerSearchService
 
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var torznabLogger = _loggerFactory.CreateLogger<TorznabClient>();
-        var client = new TorznabClient(httpClient, torznabLogger, _qualityDetection);
+        var client = new TorznabClient(httpClient, torznabLogger, _qualityDetection, new IndexerQueryContext(indexer.Id));
+        client.SearchRequestSender = (request, completion) =>
+            requestBatch.SendAsync(httpClient, nameof(IndexerType.Torznab), indexer.RequestDelayMs, request, completion);
 
         return await client.FetchRssFeedAsync(indexer, maxResults);
+    }
+
+    private static bool UsesQueryAdmission(Indexer indexer) =>
+        indexer.Type is IndexerType.Torznab or IndexerType.Newznab;
+
+    private Task RecordQueryOutcomeFailureAsync(Indexer indexer, string reason) =>
+        UsesQueryAdmission(indexer)
+            ? _indexerStatus.RecordFailureHealthAsync(indexer.Id, reason)
+            : _indexerStatus.RecordFailureAsync(indexer.Id, reason);
+
+    private void LogQueryAdmissionFailure(Indexer indexer, IndexerQueryAdmissionException error)
+    {
+        if (error.Kind == QueryAdmissionFailure.Persistence)
+            _logger.LogError(error, "[Indexer Search] Local query admission failed for {Indexer}", indexer.Name);
+        else
+            _logger.LogDebug("[Indexer Search] Query admission {Kind} for {Indexer}: {Reason}", error.Kind, indexer.Name, error.Message);
     }
 
     private BroadcasTheNetClient CreateBtnClient()
@@ -798,7 +973,10 @@ public class IndexerSearchService : IIndexerSearchService
         return await client.TestConnectionAsync(indexer);
     }
 
-    private async Task<List<ReleaseSearchResult>> FetchNewznabRssAsync(Indexer indexer, int maxResults)
+    private async Task<List<ReleaseSearchResult>> FetchNewznabRssAsync(
+        Indexer indexer,
+        int maxResults,
+        IndexerSearchRequestBatch requestBatch)
     {
         // Log categories being used for RSS (important for filtering out non-TV content)
         var categories = indexer.Categories?.Any() == true
@@ -808,29 +986,39 @@ public class IndexerSearchService : IIndexerSearchService
 
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var newznabLogger = _loggerFactory.CreateLogger<NewznabClient>();
-        var client = new NewznabClient(httpClient, newznabLogger, _qualityDetection);
+        var client = new NewznabClient(httpClient, newznabLogger, _qualityDetection, new IndexerQueryContext(indexer.Id));
+        client.SearchRequestSender = (request, completion) =>
+            requestBatch.SendAsync(httpClient, nameof(IndexerType.Newznab), indexer.RequestDelayMs, request, completion);
 
         return await client.FetchRssFeedAsync(indexer, maxResults);
     }
 
     // Private helper methods
 
-    private async Task<List<ReleaseSearchResult>> SearchTorznabAsync(Indexer indexer, string query, int maxResults, string? sportarrId = null, bool useCategoryFilter = true)
+    private async Task<IndexerSearchOutcome> SearchTorznabAsync(Indexer indexer, string query, int maxResults, string? sportarrId = null, bool useCategoryFilter = true, IndexerSearchRequestBatch? requestBatch = null, RawIndexerRetrievalCache? retrievalCache = null)
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var torznabLogger = _loggerFactory.CreateLogger<TorznabClient>();
-        var client = new TorznabClient(httpClient, torznabLogger, _qualityDetection);
+        var client = new TorznabClient(httpClient, torznabLogger, _qualityDetection, new IndexerQueryContext(indexer.Id));
+        client.RetrievalCache = retrievalCache;
 
-        return await client.SearchAsync(indexer, query, maxResults, sportarrId, useCategoryFilter);
+        if (requestBatch != null)
+            client.SearchRequestSender = (request, completion) => requestBatch.SendAsync(httpClient, nameof(IndexerType.Torznab), indexer.RequestDelayMs, request, completion);
+
+        return await client.SearchDetailedAsync(indexer, query, maxResults, sportarrId, useCategoryFilter);
     }
 
-    private async Task<List<ReleaseSearchResult>> SearchNewznabAsync(Indexer indexer, string query, int maxResults, string? sportarrId = null, bool useCategoryFilter = true)
+    private async Task<IndexerSearchOutcome> SearchNewznabAsync(Indexer indexer, string query, int maxResults, string? sportarrId = null, bool useCategoryFilter = true, IndexerSearchRequestBatch? requestBatch = null, RawIndexerRetrievalCache? retrievalCache = null)
     {
         var httpClient = _httpClientFactory.CreateClient("IndexerClient");
         var newznabLogger = _loggerFactory.CreateLogger<NewznabClient>();
-        var client = new NewznabClient(httpClient, newznabLogger, _qualityDetection);
+        var client = new NewznabClient(httpClient, newznabLogger, _qualityDetection, new IndexerQueryContext(indexer.Id));
+        client.RetrievalCache = retrievalCache;
 
-        return await client.SearchAsync(indexer, query, maxResults, sportarrId, useCategoryFilter);
+        if (requestBatch != null)
+            client.SearchRequestSender = (request, completion) => requestBatch.SendAsync(httpClient, nameof(IndexerType.Newznab), indexer.RequestDelayMs, request, completion);
+
+        return await client.SearchDetailedAsync(indexer, query, maxResults, sportarrId, useCategoryFilter);
     }
 
     private async Task<List<ReleaseSearchResult>> SearchBroadcasTheNetAsync(Indexer indexer, string query, int maxResults)

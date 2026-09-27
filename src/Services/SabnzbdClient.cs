@@ -279,11 +279,18 @@ public class SabnzbdClient
             content.Add(fileContent, "nzbfile", filename);
 
             var requestUrl = $"{baseUrl}/api";
-            if (useQueryControlParams)
+            if (!useQueryControlParams && !string.IsNullOrWhiteSpace(category))
+            {
+                requestUrl += $"?category={Uri.EscapeDataString(category)}";
+            }
+            else if (useQueryControlParams)
             {
                 var addFileQuery = new System.Text.StringBuilder("?mode=addfile&output=json");
                 if (!string.IsNullOrWhiteSpace(category))
+                {
                     addFileQuery.Append($"&cat={Uri.EscapeDataString(category)}");
+                    content.Add(new StringContent(category), "category");
+                }
                 if (!string.IsNullOrWhiteSpace(apiKey))
                     addFileQuery.Append($"&apikey={Uri.EscapeDataString(apiKey)}");
                 else if (!string.IsNullOrWhiteSpace(config.Username) && !string.IsNullOrWhiteSpace(config.Password))
@@ -358,7 +365,8 @@ public class SabnzbdClient
     /// This method is intentionally separate from AddNzbAsync/AddNzbViaContentAsync so the
     /// normal SABnzbd routing remains unchanged.
     /// </summary>
-    public async Task<string?> AddNzbForDecypharrAsync(DownloadClient config, string nzbUrl, string category)
+    public async Task<string?> AddNzbForDecypharrAsync(
+        DownloadClient config, string nzbUrl, string category, string? expectedName = null)
     {
         try
         {
@@ -374,6 +382,10 @@ public class SabnzbdClient
 
             var nzbBytes = await response.Content.ReadAsByteArrayAsync();
             var filename = GetNzbFilename(response, nzbUrl);
+            var canonicalTitle = NormalizeDownloadTitle(expectedName);
+            var uploadFilename = string.IsNullOrEmpty(canonicalTitle)
+                ? filename
+                : canonicalTitle + ".nzb";
 
             _logger.LogInformation("[DecypharrUsenet] Downloaded NZB: {Filename} ({Size} bytes)", filename, nzbBytes.Length);
 
@@ -416,17 +428,9 @@ public class SabnzbdClient
             // {"status":false,"error":"No files uploaded"}.
             using var content = new MultipartFormDataContent();
 
-            // Both names in the form body too, for emulator versions that read it
-            // from there.
-            if (!string.IsNullOrWhiteSpace(category))
-            {
-                content.Add(new StringContent(category), "category");
-                content.Add(new StringContent(category), "cat");
-            }
-
             var fileContent = new ByteArrayContent(nzbBytes);
             fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-nzb");
-            content.Add(fileContent, "name", filename);
+            content.Add(fileContent, "name", uploadFilename);
 
             _logger.LogInformation("[DecypharrUsenet] Uploading NZB to: {Url}", Sportarr.Api.Helpers.SecretRedactor.Url(uploadUrl));
 
@@ -685,7 +689,7 @@ public class SabnzbdClient
                     {
                         DownloadId = item.nzo_id,
                         Title = item.filename,
-                        Category = item.category,
+                        Category = item.CategoryName,
                         FilePath = "", // Queue items don't have a storage path yet
                         Size = (long)(sizeMb * 1024 * 1024),
                         IsCompleted = false,
@@ -702,7 +706,7 @@ public class SabnzbdClient
         if (history != null)
         {
             foreach (var item in history.Where(h =>
-                h.category.Equals(category, StringComparison.OrdinalIgnoreCase) &&
+                h.CategoryName.Equals(category, StringComparison.OrdinalIgnoreCase) &&
                 h.status.Equals("Completed", StringComparison.OrdinalIgnoreCase)))
             {
                 if (seenIds.Add(item.nzo_id))
@@ -711,7 +715,7 @@ public class SabnzbdClient
                     {
                         DownloadId = item.nzo_id,
                         Title = item.name,
-                        Category = item.category,
+                        Category = item.CategoryName,
                         FilePath = item.storage,
                         Size = item.bytes,
                         IsCompleted = true,
@@ -726,6 +730,79 @@ public class SabnzbdClient
         }
 
         return results;
+    }
+
+    public async Task<(DownloadClientStatus? Status, string? NewDownloadId)> FindDownloadByTitleAsync(
+        DownloadClient config, string title, string? expectedCategory)
+    {
+        try
+        {
+            var normalizedTitle = NormalizeDownloadTitle(title);
+            if (string.IsNullOrEmpty(normalizedTitle))
+                return (null, null);
+
+            var candidates = new List<(string Id, string Title, string Category)>();
+            var queue = await GetQueueAsync(config);
+            if (queue != null)
+            {
+                candidates.AddRange(queue.Select(item =>
+                    (item.nzo_id, item.filename, item.CategoryName)));
+            }
+
+            var history = await GetHistoryAsync(config);
+            if (history != null)
+            {
+                candidates.AddRange(history.Select(item =>
+                    (item.nzo_id, item.name, item.CategoryName)));
+            }
+
+            var matches = candidates
+                .Where(candidate =>
+                    !string.IsNullOrWhiteSpace(candidate.Id) &&
+                    string.Equals(
+                        NormalizeDownloadTitle(candidate.Title),
+                        normalizedTitle,
+                        StringComparison.OrdinalIgnoreCase))
+                .DistinctBy(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var categoryMatches = string.IsNullOrWhiteSpace(expectedCategory)
+                ? matches
+                : matches.Where(candidate => string.Equals(
+                    candidate.Category,
+                    expectedCategory,
+                    StringComparison.OrdinalIgnoreCase)).ToList();
+            var eligibleMatches = categoryMatches.Count > 0 ? categoryMatches : matches;
+
+            if (eligibleMatches.Count != 1)
+            {
+                if (eligibleMatches.Count > 1)
+                {
+                    _logger.LogWarning(
+                        "[SABnzbd] Refusing ambiguous title recovery for {Title}. Found {Count} matching downloads",
+                        title, eligibleMatches.Count);
+                }
+
+                return (null, null);
+            }
+
+            var match = eligibleMatches[0];
+            var status = await GetDownloadStatusAsync(config, match.Id, expectedCategory);
+            return status == null ? (null, null) : (status, match.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[SABnzbd] Error finding download by title: {Title}", title);
+            return (null, null);
+        }
+    }
+
+    private static string NormalizeDownloadTitle(string? title)
+    {
+        var normalized = title?.Trim() ?? "";
+        return normalized.EndsWith(".nzb", StringComparison.OrdinalIgnoreCase)
+            ? normalized[..^4]
+            : normalized;
     }
 
     /// <summary>
@@ -785,15 +862,8 @@ public class SabnzbdClient
     /// Get download status for monitoring (optimized with nzo_id filtering).
     /// </summary>
     /// <param name="expectedCategory">
-    /// The category this item was actually grabbed under (falls back to
-    /// config.Category when null). An nzo_id still existing in SABnzbd doesn't mean
-    /// it's still Sportarr's - SABnzbd is commonly shared across multiple *arr-style
-    /// apps, each scoped to its own category. If an item's category doesn't match,
-    /// it's reported as not found here rather than matched by nzo_id alone, so
-    /// download monitoring stops tracking it instead of polling another app's
-    /// download forever - the nzo_id never disappears, only its owner does. A blank
-    /// expected category (no scoping in use, on either side) skips the check and
-    /// preserves the previous nzo_id-only match.
+    /// The category this item was grabbed under. An exact nzo_id remains authoritative
+    /// when a compatible client reports a different category.
     /// </param>
     public async Task<DownloadClientStatus?> GetDownloadStatusAsync(DownloadClient config, string nzoId, string? expectedCategory = null)
     {
@@ -858,7 +928,9 @@ public class SabnzbdClient
             if (queueItem != null && !string.IsNullOrWhiteSpace(categoryToMatch) &&
                 !string.Equals(queueItem.CategoryName, categoryToMatch, StringComparison.OrdinalIgnoreCase))
             {
-                queueItem = null;
+                _logger.LogDebug(
+                    "[SABnzbd] Download {NzoId} has category '{Actual}' instead of '{Expected}'. Tracking its exact ID",
+                    nzoId, queueItem.CategoryName, categoryToMatch);
             }
 
             if (queueItem != null)
@@ -925,9 +997,11 @@ public class SabnzbdClient
             var historyItem = history?.FirstOrDefault(h => string.Equals(h.nzo_id, nzoId, StringComparison.OrdinalIgnoreCase));
 
             if (historyItem != null && !string.IsNullOrWhiteSpace(categoryToMatch) &&
-                !string.Equals(historyItem.category, categoryToMatch, StringComparison.OrdinalIgnoreCase))
+                !string.Equals(historyItem.CategoryName, categoryToMatch, StringComparison.OrdinalIgnoreCase))
             {
-                historyItem = null;
+                _logger.LogDebug(
+                    "[SABnzbd] Download {NzoId} has category '{Actual}' instead of '{Expected}'. Tracking its exact ID",
+                    nzoId, historyItem.CategoryName, categoryToMatch);
             }
 
             if (historyItem != null)
@@ -1377,6 +1451,8 @@ public class SabnzbdClient
             // authenticate from there and reject form-only auth; real SABnzbd
             // accepts either.
             var addUrlQuery = new System.Text.StringBuilder("?mode=addurl&output=json");
+            if (!string.IsNullOrWhiteSpace(category))
+                addUrlQuery.Append($"&category={Uri.EscapeDataString(category)}");
             if (hasApiKey)
             {
                 addUrlQuery.Append($"&apikey={Uri.EscapeDataString(config.ApiKey!)}");
@@ -1416,7 +1492,8 @@ public class SabnzbdClient
                 // SendApiRequestAsync appends the auth itself. Adding it here as
                 // well sent ma_username and ma_password twice, which is the same
                 // CherryPy list merge that breaks mode.
-                var getQuery = $"?mode=addurl&name={Uri.EscapeDataString(nzbUrl)}&cat={Uri.EscapeDataString(category)}&output=json";
+                var encodedCategory = Uri.EscapeDataString(category);
+                var getQuery = $"?mode=addurl&name={Uri.EscapeDataString(nzbUrl)}&cat={encodedCategory}&category={encodedCategory}&output=json";
                 if (!string.IsNullOrWhiteSpace(nzbname))
                 {
                     getQuery += $"&nzbname={Uri.EscapeDataString(nzbname)}";
@@ -1566,8 +1643,12 @@ public class SabnzbdHistoryItem
     public string name { get; set; } = "";
     public string status { get; set; } = "";
     public long bytes { get; set; }
+    public string cat { get; set; } = "";
     public string category { get; set; } = "";
     public string storage { get; set; } = "";
     public long completed { get; set; } // Unix timestamp
     public string fail_message { get; set; } = ""; // Why it failed (if status is Failed)
+
+    [JsonIgnore]
+    public string CategoryName => !string.IsNullOrEmpty(category) ? category : cat;
 }

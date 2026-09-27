@@ -75,6 +75,17 @@ public class ManualImportSeedingTests
     }
 
     [Fact]
+    public void The_selected_part_survives()
+    {
+        var pending = ExternalTorrent(client: Qbit());
+        pending.SuggestedPart = "Main Card";
+
+        var item = QueueAndImportEndpoints.BuildManualImportQueueItem(pending);
+
+        item.Part.Should().Be("Main Card");
+    }
+
+    [Fact]
     public void A_hash_without_a_protocol_is_still_a_torrent()
     {
         // Read as usenet, the plan moves the file and the seed dies.

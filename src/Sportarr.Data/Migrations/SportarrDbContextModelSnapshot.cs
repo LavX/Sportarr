@@ -694,6 +694,9 @@ namespace Sportarr.Api.Migrations
                     b.Property<int>("EventId")
                         .HasColumnType("INTEGER");
 
+                    b.Property<DateTime?>("FailedAt")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("GrabCategory")
                         .HasColumnType("TEXT");
 
@@ -2740,6 +2743,9 @@ namespace Sportarr.Api.Migrations
 
                     b.Property<string>("InfoUrl")
                         .HasColumnType("TEXT");
+
+                    b.Property<bool?>("IsPack")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Language")
                         .HasColumnType("TEXT");

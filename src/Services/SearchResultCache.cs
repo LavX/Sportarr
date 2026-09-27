@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Sportarr.Api.Models;
 
 namespace Sportarr.Api.Services;
@@ -10,7 +12,7 @@ namespace Sportarr.Api.Services;
 ///
 /// This dramatically reduces indexer API calls for:
 /// - Multi-part events (UFC 300 Prelims, UFC 300 Main Card share cache)
-/// - Same-year events (NFL.2025 query works for all 2025 NFL games)
+/// - Repeated searches with the same source request parameters
 /// - Rapid successive searches by users
 ///
 /// Cached (raw indexer data):
@@ -25,6 +27,8 @@ namespace Sportarr.Api.Services;
 /// </summary>
 public class SearchResultCache : IDisposable
 {
+    internal SourceOutcomeCache SourceOutcomes { get; }
+    private readonly TimeProvider _clock;
     private readonly ILogger<SearchResultCache> _logger;
     private readonly ConcurrentDictionary<string, CachedSearchResults> _cache = new();
 
@@ -65,11 +69,35 @@ public class SearchResultCache : IDisposable
     /// </summary>
     public const int EmptyResultLifetimeSeconds = 60;
 
+    private static IndexerSearchDiagnostic[] CopyDiagnostics(IEnumerable<IndexerSearchDiagnostic>? diagnostics) =>
+        diagnostics?.Select(diagnostic => diagnostic with { Pages = diagnostic.Pages.ToArray() }).ToArray()
+        ?? Array.Empty<IndexerSearchDiagnostic>();
+
+    private static SkippedIndexer[] CopySkippedIndexers(IEnumerable<SkippedIndexer>? skippedIndexers) =>
+        skippedIndexers?.ToArray() ?? Array.Empty<SkippedIndexer>();
+
     /// <summary>
     /// Represents cached raw results from indexers
     /// </summary>
     public class CachedSearchResults
     {
+        private IReadOnlyList<IndexerSearchDiagnostic> _searchDiagnostics = Array.Empty<IndexerSearchDiagnostic>();
+        private IReadOnlyList<SkippedIndexer> _skippedIndexers = Array.Empty<SkippedIndexer>();
+
+        public bool SearchComplete { get; init; } = true;
+
+        public IReadOnlyList<IndexerSearchDiagnostic> SearchDiagnostics
+        {
+            get => CopyDiagnostics(_searchDiagnostics);
+            init => _searchDiagnostics = CopyDiagnostics(value);
+        }
+
+        public IReadOnlyList<SkippedIndexer> SkippedIndexers
+        {
+            get => CopySkippedIndexers(_skippedIndexers);
+            init => _skippedIndexers = CopySkippedIndexers(value);
+        }
+
         /// <summary>
         /// Raw, unprocessed releases from indexers (before matching/scoring)
         /// </summary>
@@ -114,6 +142,7 @@ public class SearchResultCache : IDisposable
         public string? DownloadUrl { get; set; }
         public string? InfoUrl { get; set; }
         public string Indexer { get; set; } = string.Empty;
+        public int? IndexerId { get; set; }
         public string? IndexerFlags { get; set; }
         public long Size { get; set; }
         public DateTime PublishDate { get; set; }
@@ -122,11 +151,16 @@ public class SearchResultCache : IDisposable
         public string? TorrentInfoHash { get; set; }
         public string? Protocol { get; set; }
         public bool IsPack { get; set; }
+        public string? SportarrEventId { get; set; }
+        public string? SportarrLeagueId { get; set; }
 
-        // Title-parsed fields (preserved from initial indexer response)
+        // Release metadata preserved from the initial indexer response.
+        public string? SourceQuality { get; set; }
         public string? Codec { get; set; }
         public string? Source { get; set; }
         public string? Language { get; set; }
+        public List<string>? MultiLanguageNames { get; set; }
+        public string? ReleaseGroup { get; set; }
 
         /// <summary>
         /// Convert a ReleaseSearchResult to a RawRelease for caching.
@@ -141,6 +175,7 @@ public class SearchResultCache : IDisposable
                 DownloadUrl = result.DownloadUrl,
                 InfoUrl = result.InfoUrl,
                 Indexer = result.Indexer,
+                IndexerId = result.IndexerId,
                 IndexerFlags = result.IndexerFlags,
                 Size = result.Size,
                 PublishDate = result.PublishDate,
@@ -149,9 +184,14 @@ public class SearchResultCache : IDisposable
                 TorrentInfoHash = result.TorrentInfoHash,
                 Protocol = result.Protocol,
                 IsPack = result.IsPack,
+                SportarrEventId = result.SportarrEventId,
+                SportarrLeagueId = result.SportarrLeagueId,
+                SourceQuality = result.SourceQuality,
                 Codec = result.Codec,
                 Source = result.Source,
-                Language = result.Language
+                Language = result.Language,
+                MultiLanguageNames = result.MultiLanguageNames?.ToList(),
+                ReleaseGroup = result.ReleaseGroup
             };
         }
 
@@ -168,6 +208,7 @@ public class SearchResultCache : IDisposable
                 DownloadUrl = DownloadUrl ?? string.Empty,
                 InfoUrl = InfoUrl,
                 Indexer = Indexer,
+                IndexerId = IndexerId,
                 IndexerFlags = IndexerFlags,
                 Size = Size,
                 PublishDate = PublishDate,
@@ -176,9 +217,14 @@ public class SearchResultCache : IDisposable
                 TorrentInfoHash = TorrentInfoHash,
                 Protocol = Protocol ?? "Unknown",
                 IsPack = IsPack,
+                SportarrEventId = SportarrEventId,
+                SportarrLeagueId = SportarrLeagueId,
+                SourceQuality = SourceQuality,
                 Codec = Codec,
                 Source = Source,
                 Language = Language,
+                MultiLanguageNames = MultiLanguageNames?.ToList(),
+                ReleaseGroup = ReleaseGroup,
                 // All scoring/evaluation fields reset - will be calculated by ReleaseEvaluator
                 Quality = null,
                 Score = 0,
@@ -195,9 +241,11 @@ public class SearchResultCache : IDisposable
         }
     }
 
-    public SearchResultCache(ILogger<SearchResultCache> logger)
+    public SearchResultCache(ILogger<SearchResultCache> logger, TimeProvider? timeProvider = null)
     {
         _logger = logger;
+        _clock = timeProvider ?? TimeProvider.System;
+        SourceOutcomes = new(_clock);
 
         // Cleanup used to run only inside Store, so a burst of searches that
         // then stopped left everything it had cached in memory until the next
@@ -214,6 +262,7 @@ public class SearchResultCache : IDisposable
         try
         {
             CleanupExpired(0);
+            SourceOutcomes.CleanupExpired();
         }
         catch (Exception ex)
         {
@@ -246,6 +295,25 @@ public class SearchResultCache : IDisposable
     {
         var tags = indexerTags?.Distinct().OrderBy(t => t).ToList() ?? new List<int>();
         return tags.Count == 0 ? query : $"tags:{string.Join(",", tags)}|{query}";
+    }
+
+    // Different source requests must not share a cached answer.
+    public static string RequestKey(IEnumerable<string> queries, IEnumerable<int>? indexerTags,
+        int maxResultsPerIndexer, bool useCategoryFilter, string? sportarrId, string? sourceFingerprint = null,
+        int? eventScope = null)
+    {
+        var request = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            Version = 2,
+            Queries = queries.ToArray(),
+            Tags = indexerTags?.Distinct().OrderBy(tag => tag).ToArray(),
+            MaxResultsPerIndexer = maxResultsPerIndexer,
+            UseCategoryFilter = useCategoryFilter,
+            SportarrId = sportarrId,
+            SourceFingerprint = sourceFingerprint,
+            EventScope = eventScope
+        });
+        return "request:" + Convert.ToHexString(SHA256.HashData(request));
     }
 
     /// <summary>
@@ -288,7 +356,7 @@ public class SearchResultCache : IDisposable
 
         if (_cache.TryGetValue(key, out var cached))
         {
-            var age = DateTime.UtcNow - cached.CachedAt;
+            var age = _clock.GetUtcNow().UtcDateTime - cached.CachedAt;
             // An entry is only served inside its own lifetime as well as the
             // caller's window. An empty answer is stored with a short one,
             // and judging it by the caller's window alone would keep serving
@@ -326,8 +394,18 @@ public class SearchResultCache : IDisposable
     /// entries aren't evicted before their configured lifetime (previously hardcoded to 300s,
     /// which silently truncated any user-configured duration above 5 minutes).</param>
     /// <param name="indexersQueried">Which indexers were queried</param>
-    public void Store(string query, IEnumerable<ReleaseSearchResult> results, int cacheDurationSeconds = 300, IEnumerable<string>? indexersQueried = null)
+    public void Store(string query, IEnumerable<ReleaseSearchResult> results, int cacheDurationSeconds = 300,
+        IEnumerable<string>? indexersQueried = null, bool searchComplete = true,
+        IEnumerable<IndexerSearchDiagnostic>? diagnostics = null, DateTimeOffset? expiresAt = null,
+        IEnumerable<SkippedIndexer>? skippedIndexers = null)
     {
+        var now = _clock.GetUtcNow().UtcDateTime;
+        if (expiresAt.HasValue)
+        {
+            cacheDurationSeconds = Math.Min(cacheDurationSeconds,
+                (int)Math.Clamp(Math.Floor((expiresAt.Value.UtcDateTime - now).TotalSeconds), 0, int.MaxValue));
+            if (cacheDurationSeconds <= 0) return;
+        }
         var key = NormalizeKey(query);
         var rawReleases = results.Select(RawRelease.FromSearchResult).ToList();
 
@@ -344,8 +422,11 @@ public class SearchResultCache : IDisposable
 
         var cached = new CachedSearchResults
         {
+            SearchComplete = searchComplete,
+            SearchDiagnostics = CopyDiagnostics(diagnostics),
+            SkippedIndexers = CopySkippedIndexers(skippedIndexers),
             RawReleases = rawReleases,
-            CachedAt = DateTime.UtcNow,
+            CachedAt = now,
             LifetimeSeconds = lifetime,
             Query = query,
             IndexersQueried = indexersQueried?.ToList() ?? new List<string>()
@@ -389,6 +470,7 @@ public class SearchResultCache : IDisposable
     {
         var count = _cache.Count;
         _cache.Clear();
+        SourceOutcomes.Clear();
         _logger.LogInformation("[ReleaseCache] Cleared all {Count} cached queries", count);
     }
 
@@ -397,7 +479,7 @@ public class SearchResultCache : IDisposable
     /// </summary>
     private void CleanupExpired(int maxAgeSeconds)
     {
-        var now = DateTime.UtcNow;
+        var now = _clock.GetUtcNow().UtcDateTime;
         // Each entry is judged against the lifetime it was stored with, not
         // against whatever the caller who triggered this cleanup asked for.
         var expiredKeys = _cache

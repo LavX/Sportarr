@@ -18,6 +18,7 @@ import {
   EyeIcon
 } from '@heroicons/react/24/outline';
 import apiClient from '../api/client';
+import ConfirmationModal from '../components/ConfirmationModal';
 import ManualImportModal from '../components/ManualImportModal';
 import PageHeader from '../components/PageHeader';
 import PageShell from '../components/PageShell';
@@ -59,6 +60,9 @@ interface QueueItem {
   size: number;
   downloaded: number;
   progress: number;
+  canRetryImport: boolean;
+  canImportAnyway?: boolean;
+  canChooseVideo?: boolean;
   timeRemaining?: string;
   errorMessage?: string;
   statusMessages?: string[]; // Status messages (warnings, errors)
@@ -83,6 +87,35 @@ interface ColumnVisibility {
   client: boolean;
   added: boolean;
   actions: boolean;
+}
+
+interface ExistingEventFile {
+  quality: string;
+  customFormatScore: number;
+  partName?: string | null;
+}
+
+interface ManualImportDialog {
+  items: QueueItem[];
+  existingFiles: Record<number, ExistingEventFile[]>;
+  loading: boolean;
+  loadError?: boolean;
+  error?: string;
+}
+
+interface VideoCandidate {
+  relativePath: string;
+  size: number;
+}
+
+interface VideoChoiceDialog {
+  item: QueueItem;
+  files: VideoCandidate[];
+  existingFiles: ExistingEventFile[];
+  selectedPath: string;
+  loading: boolean;
+  loadError?: boolean;
+  error?: string;
 }
 
 interface HistoryItem {
@@ -276,6 +309,16 @@ export default function ActivityPage() {
   const [isLoading, setIsLoading] = useState(true); // Only true for initial load
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [removeQueueDialog, setRemoveQueueDialog] = useState<RemoveQueueDialog | null>(null);
+  const [manualImportDialog, setManualImportDialog] = useState<ManualImportDialog | null>(null);
+  const lastManualImportDialog = React.useRef<ManualImportDialog | null>(null);
+  if (manualImportDialog) lastManualImportDialog.current = manualImportDialog;
+  const shownManualImportDialog = manualImportDialog ?? lastManualImportDialog.current;
+  const [manualImportBusy, setManualImportBusy] = useState(false);
+  const [videoChoiceDialog, setVideoChoiceDialog] = useState<VideoChoiceDialog | null>(null);
+  const lastVideoChoiceDialog = React.useRef<VideoChoiceDialog | null>(null);
+  if (videoChoiceDialog) lastVideoChoiceDialog.current = videoChoiceDialog;
+  const shownVideoChoiceDialog = videoChoiceDialog ?? lastVideoChoiceDialog.current;
+  const [videoChoiceBusy, setVideoChoiceBusy] = useState(false);
   const [removeHistoryDialog, setRemoveHistoryDialog] = useState<RemoveHistoryDialog | null>(null);
   const [removeBlocklistDialog, setRemoveBlocklistDialog] = useState<RemoveBlocklistDialog | null>(null);
   const [selectedBlocklistIds, setSelectedBlocklistIds] = useState<Set<number>>(new Set());
@@ -693,10 +736,6 @@ export default function ActivityPage() {
     setDeleteDiskFile(true);
   };
 
-  // Bulk Import: walk the selection and call the appropriate per-item import
-  // endpoint (force-import for unmonitored rows, retry-import for failed-but-
-  // downloaded rows). Disabled when the selection contains pending imports
-  // or queue rows whose status doesn't expose an Import action.
   const handleBulkImport = async () => {
     if (!canBulkImport) return;
     const items = selectedQueueItems;
@@ -714,6 +753,86 @@ export default function ActivityPage() {
       loadQueue();
     } catch (error) {
       console.error('Bulk import failed:', error);
+    }
+  };
+
+  const openManualImportDialog = async (item: QueueItem) => {
+    const items = [item];
+    setManualImportDialog({ items, existingFiles: {}, loading: true });
+    try {
+      const eventIds = [...new Set(items.map(item => item.eventId))];
+      const results = await Promise.all(eventIds.map(async eventId => {
+        const response = await apiClient.get<ExistingEventFile[]>(`/events/${eventId}/files`);
+        return [eventId, response.data] as const;
+      }));
+      setManualImportDialog(current => current?.items === items
+        ? { ...current, existingFiles: Object.fromEntries(results), loading: false }
+        : current);
+    } catch {
+      setManualImportDialog(current => current?.items === items
+        ? { ...current, loading: false, loadError: true, error: 'Could not load the current files. Close this window and try again.' }
+        : current);
+    }
+  };
+
+  const confirmManualImport = async () => {
+    if (!manualImportDialog || manualImportDialog.loading || manualImportBusy || manualImportDialog.loadError) return;
+    setManualImportBusy(true);
+    const item = manualImportDialog.items[0];
+    try {
+      await apiClient.post(`/queue/${item.id}/import-anyway`);
+      loadQueue();
+      setManualImportDialog(null);
+    } catch (error: any) {
+      loadQueue();
+      setManualImportDialog(current => current
+        ? { ...current, error: error.response?.data?.error || 'Import failed. Try again.' }
+        : current);
+    } finally {
+      setManualImportBusy(false);
+    }
+  };
+
+  const openVideoChoiceDialog = async (item: QueueItem) => {
+    setVideoChoiceDialog({ item, files: [], existingFiles: [], selectedPath: '', loading: true });
+    const [filesResult, existingResult] = await Promise.allSettled([
+      apiClient.get<VideoCandidate[]>(`/queue/${item.id}/video-files`),
+      apiClient.get<ExistingEventFile[]>(`/events/${item.eventId}/files`)
+    ]);
+    setVideoChoiceDialog(current => current?.item.id === item.id
+      ? {
+          ...current,
+          files: filesResult.status === 'fulfilled' ? filesResult.value.data : [],
+          existingFiles: existingResult.status === 'fulfilled' ? existingResult.value.data : [],
+          loading: false,
+          loadError: filesResult.status === 'rejected' || existingResult.status === 'rejected',
+          error: filesResult.status === 'rejected'
+            ? 'Could not load the video files. Close this window and try again.'
+            : existingResult.status === 'rejected'
+              ? 'Could not load the current files. Close this window and try again.'
+              : undefined
+        } : current);
+  };
+
+  const confirmVideoChoice = async () => {
+    if (!videoChoiceDialog?.selectedPath || videoChoiceBusy) return;
+    setVideoChoiceBusy(true);
+    setVideoChoiceDialog(current => current ? { ...current, error: undefined } : current);
+    try {
+      await apiClient.post(`/queue/${videoChoiceDialog.item.id}/import-selected`,
+        { relativePath: videoChoiceDialog.selectedPath });
+      setVideoChoiceDialog(null);
+      loadQueue();
+    } catch (error: any) {
+      if (error.response?.data?.retryRequired) {
+        setVideoChoiceDialog(null);
+      } else {
+        setVideoChoiceDialog(current => current
+          ? { ...current, error: error.response?.data?.error || 'Import failed. Choose a file again.' } : current);
+      }
+      loadQueue();
+    } finally {
+      setVideoChoiceBusy(false);
     }
   };
 
@@ -1226,20 +1345,12 @@ export default function ActivityPage() {
   const isAllQueueSelected = totalSelectable > 0 && totalSelected === totalSelectable;
   const isSomeQueueSelected = totalSelected > 0 && totalSelected < totalSelectable;
 
-  // Bulk Import is only valid for queue items where a per-item Import action
-  // is already exposed (force-import on unmonitored Warning/Completed rows
-  // and retry-import on failed-but-downloaded rows). Pending imports require
-  // per-item event mapping via the manual import dialog so they can't ride
-  // along on a bulk import.
+  // Pending imports need individual event mapping before import.
   const isQueueRowImportable = (item: QueueItem): boolean => {
     const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored')) ?? false;
     const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
-    const canRetryImport = item.status === 4 && item.progress >= 100;
-    // An import warning holds a downloaded file that lost the upgrade test. The
-    // monitor no longer retries it, so the user needs this route back to import
-    // after the library file changes.
-    const canImportWarning = item.status === 9;
-    return canImport || canRetryImport || canImportWarning;
+    const canRetryImport = item.canRetryImport === true;
+    return canImport || canRetryImport;
   };
 
   const selectedQueueItems = queueRows.filter(item => selectedQueueIds.has(item.id));
@@ -1247,12 +1358,14 @@ export default function ActivityPage() {
     totalSelected > 0 &&
     selectedPendingIds.size === 0 &&
     selectedQueueItems.length === selectedQueueIds.size &&
-    selectedQueueItems.every(isQueueRowImportable);
+    selectedQueueItems.every(item => !item.canImportAnyway && isQueueRowImportable(item));
 
   const bulkImportDisabledReason = (() => {
     if (totalSelected === 0) return 'Select rows to import';
     if (selectedPendingIds.size > 0) return 'Pending imports require per-item event mapping; remove them from the selection or open them individually';
-    if (!selectedQueueItems.every(isQueueRowImportable)) return 'One or more selected items are still downloading or already imported';
+    if (selectedQueueItems.some(item => item.canImportAnyway)) return 'Import Anyway needs confirmation for each download. Open each row individually';
+    if (selectedQueueItems.some(item => item.canChooseVideo)) return 'Choose a video for each download before importing';
+    if (!selectedQueueItems.every(isQueueRowImportable)) return 'One or more selected items cannot be imported yet. Check each row for the reason';
     return '';
   })();
 
@@ -1376,12 +1489,12 @@ export default function ActivityPage() {
         const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored'));
         // Show import button for Warning (5) or Completed (3) status when unmonitored
         const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
-        // Show retry import button for Failed (4) items that have completed download (100% progress)
-        const canRetryImport = item.status === 4 && item.progress >= 100;
+        const canRetryImport = item.canRetryImport === true;
+        const canImportAnyway = item.canImportAnyway === true;
+        const canChooseVideo = item.canChooseVideo === true;
         return (
           <td key="actions" className="px-2 py-1.5">
             <div className="flex items-center justify-end gap-1">
-              {/* Show Retry Import button for failed imports (download complete but import failed) */}
               {canRetryImport && (
                 <button
                   onClick={() => handleRetryImport(item)}
@@ -1389,6 +1502,26 @@ export default function ActivityPage() {
                   title="Retry Import"
                 >
                   <ArrowPathIcon className="w-4 h-4" />
+                </button>
+              )}
+              {canImportAnyway && (
+                <button
+                  onClick={() => openManualImportDialog(item)}
+                  className={BUTTON_ICON_WARNING}
+                  title="Import Anyway"
+                  aria-label="Import Anyway"
+                >
+                  <DocumentCheckIcon className="w-4 h-4" />
+                </button>
+              )}
+              {canChooseVideo && (
+                <button
+                  onClick={() => openVideoChoiceDialog(item)}
+                  className={BUTTON_ICON_WARNING}
+                  title="Choose Video"
+                  aria-label="Choose Video"
+                >
+                  <DocumentCheckIcon className="w-4 h-4" />
                 </button>
               )}
               {/* Show Import/Delete buttons for unmonitored downloads (Sonarr-style) */}
@@ -1994,14 +2127,16 @@ export default function ActivityPage() {
                   {queueRows.map((item) => {
                     const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored'));
                     const canImportCard = isUnmonitored && (item.status === 5 || item.status === 3);
-                    const canRetryImportCard = item.status === 4 && item.progress >= 100;
+                    const canRetryImportCard = item.canRetryImport === true;
+                    const canImportAnywayCard = item.canImportAnyway === true;
+                    const canChooseVideoCard = item.canChooseVideo === true;
                     return (
                       <div
                         key={item.id}
                         className={`bg-gray-800 border rounded-lg p-4 hover:bg-gray-750 transition-colors ${selectedQueueIds.has(item.id) ? 'border-red-600' : 'border-gray-700'}`}
                       >
-                        <div className="flex flex-wrap items-start justify-between gap-y-3">
-                          <div className="flex items-start gap-3 flex-1 min-w-0">
+                        <div className="flex flex-col sm:flex-row flex-wrap items-start justify-between gap-y-3">
+                          <div className="flex items-start gap-3 flex-1 min-w-0 w-full sm:w-auto">
                             <input
                               type="checkbox"
                               checked={selectedQueueIds.has(item.id)}
@@ -2057,6 +2192,18 @@ export default function ActivityPage() {
                               <button onClick={() => handleRetryImport(item)} className={BUTTON_WARNING}>
                                 <ArrowPathIcon className="w-4 h-4" />
                                 Retry Import
+                              </button>
+                            )}
+                            {canImportAnywayCard && (
+                              <button onClick={() => openManualImportDialog(item)} className={BUTTON_WARNING}>
+                                <DocumentCheckIcon className="w-4 h-4" />
+                                Import Anyway
+                              </button>
+                            )}
+                            {canChooseVideoCard && (
+                              <button onClick={() => openVideoChoiceDialog(item)} className={BUTTON_WARNING}>
+                                <DocumentCheckIcon className="w-4 h-4" />
+                                Choose Video
                               </button>
                             )}
                             {canImportCard && (
@@ -2669,6 +2816,83 @@ export default function ActivityPage() {
             )}
           </div>
         )}
+
+        <ConfirmationModal
+          isOpen={manualImportDialog !== null}
+          onClose={() => { if (!manualImportBusy) setManualImportDialog(null); }}
+          onConfirm={confirmManualImport}
+          title="Import this download?"
+          message={shownManualImportDialog && (
+            <div className="space-y-3">
+              <p>This choice bypasses quality and custom format preferences. It may replace the matching library file.</p>
+              {shownManualImportDialog.loading && <p>Loading current files...</p>}
+              {shownManualImportDialog.error && <p className="text-red-400">{shownManualImportDialog.error}</p>}
+              {!shownManualImportDialog.loading && !shownManualImportDialog.loadError && shownManualImportDialog.items.map(item => {
+                const files = shownManualImportDialog.existingFiles[item.eventId] ?? [];
+                const current = files.length > 0
+                  ? files.map(file => `${file.partName ? `${file.partName}: ` : ''}${file.quality} CF ${file.customFormatScore >= 0 ? '+' : ''}${file.customFormatScore}`).join(', ')
+                  : 'None';
+                const next = `${item.quality || 'Unknown'} CF ${(item.customFormatScore ?? 0) >= 0 ? '+' : ''}${item.customFormatScore ?? 0}`;
+                return (
+                  <div key={item.id} className="rounded-lg border border-gray-700 bg-black/30 p-3">
+                    <p className="font-medium text-white break-words">{item.event?.title || item.title}{item.part ? ` (${item.part})` : ''}</p>
+                    <p>Files on event: {current}</p>
+                    <p>Selected: {next}</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          confirmText="Import Anyway"
+          isLoading={manualImportBusy}
+          confirmDisabled={!!manualImportDialog?.loading || !!manualImportDialog?.loadError}
+          mobileFullScreen
+        />
+
+        <ConfirmationModal
+          isOpen={videoChoiceDialog !== null}
+          onClose={() => { if (!videoChoiceBusy) setVideoChoiceDialog(null); }}
+          onConfirm={confirmVideoChoice}
+          title="Choose the video to import"
+          message={shownVideoChoiceDialog && (
+            <div className="space-y-3">
+              <p>Sportarr found more than one possible video. The existing library file stays in place until you choose one. This manual choice ignores automatic upgrade preferences and can replace a higher-ranked file.</p>
+              {shownVideoChoiceDialog.loading && <p>Loading video files...</p>}
+              {shownVideoChoiceDialog.error && <p className="text-red-400">{shownVideoChoiceDialog.error}</p>}
+              {!shownVideoChoiceDialog.loading && !shownVideoChoiceDialog.error && (
+                <div className="rounded-lg border border-gray-700 bg-black/30 p-3">
+                  <p>Files on event: {shownVideoChoiceDialog.existingFiles.length > 0
+                    ? shownVideoChoiceDialog.existingFiles.map(file => `${file.quality} CF ${file.customFormatScore >= 0 ? '+' : ''}${file.customFormatScore}`).join(', ')
+                    : 'None'}</p>
+                  <p>Incoming: {shownVideoChoiceDialog.item.quality || 'Unknown'} CF {(shownVideoChoiceDialog.item.customFormatScore ?? 0) >= 0 ? '+' : ''}{shownVideoChoiceDialog.item.customFormatScore ?? 0}</p>
+                </div>
+              )}
+              {!shownVideoChoiceDialog.loading && !shownVideoChoiceDialog.loadError && shownVideoChoiceDialog.files.length === 0 &&
+                <p>No video files are available in this download.</p>}
+              <div className="max-h-64 space-y-2 overflow-y-auto">
+                {shownVideoChoiceDialog.files.map(file => (
+                  <label key={file.relativePath} className="flex min-h-11 items-center gap-3 rounded-lg border border-gray-700 bg-black/30 p-3 text-gray-200">
+                    <input
+                      type="radio"
+                      name="selected-video"
+                      value={file.relativePath}
+                      checked={shownVideoChoiceDialog.selectedPath === file.relativePath}
+                      onChange={() => setVideoChoiceDialog(current => current
+                        ? { ...current, selectedPath: file.relativePath, error: undefined } : current)}
+                      className="accent-red-600"
+                    />
+                    <span className="min-w-0 flex-1 break-words">{file.relativePath}</span>
+                    <span className="shrink-0 text-gray-400">{formatBytes(file.size)}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          confirmText="Import Selected Video"
+          isLoading={videoChoiceBusy}
+          confirmDisabled={!videoChoiceDialog?.selectedPath || videoChoiceDialog.loading || !!videoChoiceDialog.loadError}
+          mobileFullScreen
+        />
 
         {/* Remove from Queue Dialog (Sonarr-style) - Supports single and bulk removal */}
         {removeQueueDialog && (
