@@ -109,6 +109,8 @@ export const OPTION_CARD_UNSELECTED = 'w-full rounded-xl border border-gray-800 
 
 export const NAMING_GUIDANCE = 'flex items-start gap-2 rounded-lg border border-amber-700/40 bg-amber-950/20 px-3 py-2.5 text-xs leading-relaxed text-amber-200';
 
+export const NAMING_CONTEXT_PANEL = 'flex items-start gap-2 text-xs leading-relaxed text-gray-400';
+
 /** Info/utility action button used for supporting actions. */
 export const BUTTON_INFO = `${BUTTON_BASE} bg-blue-600 text-white hover:bg-blue-700`;
 

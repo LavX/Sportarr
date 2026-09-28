@@ -611,22 +611,22 @@ public static class TrashNamingTemplates
 
         // Simple date-based (TRaSH style)
         { "date-based", (
-            "{Event Title} ({Air Date Year}) - {Quality Full} - {Sportarr Id}",
-            "Simple date-based naming without episode numbers",
+            "{Series} - {Season}{Episode} - {Event Title} ({Air Date Year}) - {Quality Full} - {Sportarr Id}",
+            "Date-focused naming with TV episode numbers and an exact event ID",
             false
         )},
 
         // Sports-focused with league prefix
         { "sports-league", (
-            "{Series} - {Air Date} - {Event Title}{Part} [{Quality Full}] {Sportarr Id}",
-            "League-first naming with date. Good for sports organization.",
+            "{Series} - {Season}{Episode}{Part} - {Air Date} - {Event Title} [{Quality Full}] {Sportarr Id}",
+            "League-first naming with date, episode numbers, and event ID",
             true
         )},
 
         // Minimal clean naming
         { "minimal", (
-            "{Event Title} - {Quality}",
-            "Minimal naming - event title and quality only",
+            "{Series} - {Season}{Episode} - {Event Title} - {Sportarr Id}",
+            "Short naming with episode numbers and an exact event ID",
             false
         )},
 
@@ -640,7 +640,7 @@ public static class TrashNamingTemplates
         // Original filename preservation
         { "original", (
             "{Original Filename}",
-            "Keep original filename from release",
+            "Keep the release filename. Media-server matching depends on its contents.",
             false
         )},
     };

@@ -2444,6 +2444,7 @@ public class LibraryImportService
             {
                 EventTitle = matchedEvent.Title,
                 EventTitleThe = matchedEvent.Title,
+                SportarrId = matchedEvent.ExternalId ?? string.Empty,
                 AirDate = brandingDate,
                 Quality = parsedPreview.Quality ?? "Unknown",
                 QualityFull = _fileParser.BuildQualityString(parsedPreview),

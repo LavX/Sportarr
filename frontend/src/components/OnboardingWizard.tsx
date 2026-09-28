@@ -12,12 +12,14 @@ import {
   SparklesIcon,
   LockClosedIcon,
   ExclamationTriangleIcon,
+  InformationCircleIcon,
 } from '@heroicons/react/24/outline';
 import { useAuth } from '../contexts/AuthContext';
 import apiClient from '../api/client';
 import FileBrowserModal from './FileBrowserModal';
 import { toApiIndexer } from '../utils/indexerPayload';
-import { NAMING_GUIDANCE, OPTION_CARD_SELECTED, OPTION_CARD_UNSELECTED } from '../utils/designTokens';
+import { NAMING_CONTEXT_PANEL, NAMING_GUIDANCE, OPTION_CARD_SELECTED, OPTION_CARD_UNSELECTED } from '../utils/designTokens';
+import { getNamingWarning, NAMING_CONTEXT_TEXT, renderNamingExample } from '../utils/namingGuidance';
 
 /**
  * First-run setup guide. Walks a new install from nothing to a working setup in
@@ -31,6 +33,7 @@ import { NAMING_GUIDANCE, OPTION_CARD_SELECTED, OPTION_CARD_UNSELECTED } from '.
 interface OnboardingWizardProps {
   onClose: () => void;
   onComplete: () => void;
+  isFirstRunGuide?: boolean;
 }
 
 // Steps are assembled from the source selection: both acquisition paths can
@@ -92,25 +95,6 @@ const APP_STEPS: Record<string, string[]> = {
   ],
 };
 
-// The example filename shown under the naming preset picker. Token values
-// match the preview in Settings > Media Management so both screens teach
-// the same thing.
-function renderNamingExample(format: string): string {
-  return (
-    format
-      .replace(/{Series}/g, 'MMA League')
-      .replace(/{Season}/g, 's2026')
-      .replace(/{Episode}/g, 'e12')
-      .replace(/{Part}/g, ' - pt3')
-      .replace(/{Event Title}/g, 'Event 100 Main Event')
-      .replace(/{League}/g, 'MMA League')
-      .replace(/{Event Date}/g, '2026-11-16')
-      .replace(/{Quality Full}/g, 'WEBDL-1080p')
-      .replace(/{Sportarr Id}/g, 'sportarr-ev-2338110')
-      .replace(/{Release Group}/g, 'GROUP') + '.mkv'
-  );
-}
-
 // Order the naming presets with the recommended full-details preset first so
 // it reads as the default it actually is.
 function orderNamingPresets(keys: string[], presets: Record<string, { description: string }>): string[] {
@@ -129,7 +113,7 @@ const CLIENT_TYPES = [
   { value: 6, label: 'NZBGet', port: 6789, auth: 'userpass', protocol: 'usenet' },
 ] as const;
 
-export default function OnboardingWizard({ onClose, onComplete }: OnboardingWizardProps) {
+export default function OnboardingWizard({ onClose, onComplete, isFirstRunGuide = false }: OnboardingWizardProps) {
   const navigate = useNavigate();
   const { login } = useAuth();
 
@@ -161,11 +145,8 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
   const [rpHost, setRpHost] = useState('');
   const [rpRemote, setRpRemote] = useState('');
   const [rpLocal, setRpLocal] = useState('');
-  // Naming: default to the most detailed preset on a new install.
   const [namingPresets, setNamingPresets] = useState<Record<string, { format: string; description: string }>>({});
-  const [namingKey, setNamingKey] = useState<string>('');
-  const [applyNamingPreset, setApplyNamingPreset] = useState(false);
-  const namingChoiceTouchedRef = useRef(false);
+  const [namingChoice, setNamingChoice] = useState<string | null>(null);
   const [namingContextLoaded, setNamingContextLoaded] = useState(false);
   const [namingPresetsLoaded, setNamingPresetsLoaded] = useState(false);
 
@@ -205,12 +186,7 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
   // settings and shows what's already in place instead of starting blank.
   const [hasExistingCreds, setHasExistingCreds] = useState(false);
   const [currentNamingFormat, setCurrentNamingFormat] = useState('');
-  // "Configured" means someone actually set this install up (root folder
-  // exists). Only then does the current naming format override the
-  // recommended default - on a fresh install the stored format is just the
-  // shipped default and must not beat the recommendation.
-  const [installConfigured, setInstallConfigured] = useState(false);
-
+  const [currentRenameEvents, setCurrentRenameEvents] = useState(false);
   // IPTV provider form plus the editable list of connected providers
   // (multiple providers are fully supported, same as the sources page).
   const [pName, setPName] = useState('');
@@ -235,7 +211,6 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     (async () => {
       try {
         const { data: st } = await apiClient.get<any>('/onboarding/status');
-        if (st?.hasRootFolder) setInstallConfigured(true);
         if (st && (st.hasDownloadClient || st.hasEnabledIndexer || st.hasIptvSource)) {
           setWantsDownload(Boolean(st.hasDownloadClient || st.hasEnabledIndexer));
           setWantsIptv(Boolean(st.hasIptvSource));
@@ -254,6 +229,7 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
         }
         const media = JSON.parse(settings.mediaManagementSettings || '{}');
         if (media.standardFileFormat) setCurrentNamingFormat(media.standardFileFormat);
+        setCurrentRenameEvents(media.renameEvents === true);
       } catch { /* defaults stand */ }
       finally { setNamingContextLoaded(true); }
       try {
@@ -281,15 +257,6 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     })();
   }, []);
 
-  // Keep existing naming, including installs that have no root folder yet.
-  // The shipped Plex preset marks a fresh install, so its detailed preset
-  // starts checked. Never overwrite a choice made while settings load.
-  useEffect(() => {
-    if (!currentNamingFormat || Object.keys(namingPresets).length === 0 || namingChoiceTouchedRef.current) return;
-    const match = Object.entries(namingPresets).find(([, p]) => p.format === currentNamingFormat);
-    if (match && (installConfigured || match[0] !== 'plex-standard')) setNamingKey(match[0]);
-  }, [currentNamingFormat, namingPresets, installConfigured]);
-
   // Show the recommendation choice saved on an existing install.
   useEffect(() => {
     (async () => {
@@ -315,10 +282,6 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
         );
         const file = data.file ?? {};
         setNamingPresets(file);
-        // Full-details preset first and selected by default; the picker
-        // renders in this same order so the recommendation is the top row.
-        const ordered = orderNamingPresets(Object.keys(file), file);
-        setNamingKey(ordered[0] ?? '');
       } catch {
         // Non-fatal: naming just won't be offered.
       } finally {
@@ -327,10 +290,15 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
     })();
   }, []);
 
-  const stockNamingFormat = namingPresets['plex-standard']?.format === currentNamingFormat;
-  const shouldApplyNamingPreset = namingChoiceTouchedRef.current
-    ? applyNamingPreset
-    : !installConfigured && stockNamingFormat;
+  const stockNamingFormat = namingPresets['plex-standard']?.format === currentNamingFormat
+    || currentNamingFormat === '{Series} - {Season}{Episode}{Part} - {Event Title} - {Quality Full}';
+  const recommendedNamingKey = orderNamingPresets(Object.keys(namingPresets), namingPresets)[0] ?? '';
+  const namingKey = namingChoice ?? (isFirstRunGuide && stockNamingFormat ? recommendedNamingKey : '');
+  const shouldApplyNamingPreset = Boolean(namingKey);
+  const namingWarning = getNamingWarning(
+    shouldApplyNamingPreset ? namingPresets[namingKey]?.format ?? '' : currentNamingFormat,
+    shouldApplyNamingPreset || currentRenameEvents,
+  );
   const steps = buildSteps(wantsDownload, wantsIptv);
   const stepIndex = Math.max(0, steps.findIndex((s) => s.key === stepKey));
   const clientAuth = CLIENT_TYPES.find((c) => c.value === dcType)?.auth ?? 'userpass';
@@ -539,7 +507,7 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
           const { data: settings } = await apiClient.get<any>('/settings');
           const media = JSON.parse(settings.mediaManagementSettings || '{}');
           media.standardFileFormat = preset.format;
-          media.renameEpisodes = true;
+          media.renameEvents = true;
           await apiClient.put('/settings', { ...settings, mediaManagementSettings: JSON.stringify(media) });
         } catch (err: any) {
           failures.push(`file naming (${err?.response?.data?.error || err?.message || 'unknown error'})`);
@@ -1233,32 +1201,35 @@ export default function OnboardingWizard({ onClose, onComplete }: OnboardingWiza
               )}
               {Object.keys(namingPresets).length > 0 && (
                 <div className="mb-4">
-                  <label className={labelCls}>File naming (optional)</label>
-                  <select value={namingKey} onChange={(e) => { namingChoiceTouchedRef.current = true; setNamingKey(e.target.value); setApplyNamingPreset(true); }} className={inputCls}>
+                  <label htmlFor="onboarding-naming-preset" className={labelCls}>File naming (optional)</label>
+                  <select id="onboarding-naming-preset" value={namingKey} onChange={(e) => setNamingChoice(e.target.value)} className={inputCls}>
+                    <option value="">Keep current naming</option>
                     {orderNamingPresets(Object.keys(namingPresets), namingPresets).map((key, i) => (
                       <option key={key} value={key}>
-                        {key.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}{i === 0 ? ' (recommended)' : ''}
+                        {key === 'original' ? 'Original Filename (check source)' : key.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}{i === 0 ? ' (recommended)' : ''}
                       </option>
                     ))}
                   </select>
-                  <label className="mt-2 flex items-center gap-2 text-xs text-gray-400">
-                    <input type="checkbox" checked={shouldApplyNamingPreset} onChange={(e) => { namingChoiceTouchedRef.current = true; setApplyNamingPreset(e.target.checked); }} className="accent-red-600" />
-                    Apply this naming preset
-                  </label>
-                  <div role="note" className={`mt-3 ${NAMING_GUIDANCE}`}>
-                    <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
-                    <p>
-                      Keep season and episode numbers plus <code>{'{Sportarr Id}'}</code> in filenames. Without them, the Sportarr Metadata Agent may match the wrong event or none at all.
-                    </p>
-                  </div>
-                  {namingPresets[namingKey]?.description && (
-                    <p className="mt-1 text-xs text-gray-500">{namingPresets[namingKey].description}</p>
+                  {namingWarning && (
+                    <div role="alert" className={`mt-3 ${NAMING_GUIDANCE}`}>
+                      <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
+                      <p>{namingWarning}</p>
+                    </div>
                   )}
-                  {namingPresets[namingKey]?.format && (
+                  <div role="note" className={`mt-3 ${NAMING_CONTEXT_PANEL}`}>
+                    <InformationCircleIcon className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" aria-hidden="true" />
+                    <p>{NAMING_CONTEXT_TEXT}</p>
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">
+                    {namingKey ? namingPresets[namingKey]?.description : 'Your current naming settings will stay in place.'}
+                  </p>
+                  {(namingKey ? namingPresets[namingKey]?.format : currentNamingFormat) && (
                     <div className="mt-2 rounded-lg border border-gray-800 bg-gray-900/60 p-3">
-                      <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-gray-500">Files will be named like</p>
+                      <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-gray-500">
+                        {namingKey ? 'Files will be named like' : 'Current format'}
+                      </p>
                       <p className="break-all font-mono text-xs text-gray-200">
-                        {renderNamingExample(namingPresets[namingKey].format)}
+                        {namingKey ? renderNamingExample(namingPresets[namingKey].format) : currentNamingFormat}
                       </p>
                     </div>
                   )}

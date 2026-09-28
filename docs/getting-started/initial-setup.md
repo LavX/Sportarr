@@ -10,7 +10,7 @@ Choose **Standard setup** to start with the built-in profiles and neutral custom
 
 On a new install, **Skip Step** keeps Standard setup. Reopening the guide and skipping this step does not change existing preferences. Switching from Recommended to Standard clears scores in unedited built-in profiles. Choosing Standard when it is already active leaves scores alone. Custom profiles and previously imported quality size limits are left alone.
 
-On a new install, **Apply this naming preset** starts checked and selects a detailed format. Clear it or use **Skip Step** to keep the current naming settings. Reopening the guide leaves custom naming unchanged unless you opt in. Keep season and episode numbers and `{Sportarr Id}` in filenames for the most reliable matching with the Sportarr Metadata Agent. Removing them can cause missing or incorrect matches.
+On a new install, the file naming dropdown starts with a detailed preset. Saving the step applies that preset and turns on **Rename Events**. Choose **Keep current naming** or **Skip Step** to leave naming unchanged. A reopened guide starts with **Keep current naming**, so saving it does not change existing settings unless you select a preset. TV libraries need season and episode numbers to recognize events as episodes. The `{Sportarr Id}` token then gives the Sportarr Metadata Agent an exact event key. Keep both for the most reliable matching. The guide warns when a selected format omits either one.
 
 ## Manual setup
 

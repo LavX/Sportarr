@@ -24,7 +24,7 @@ import {
   SignalIcon,
   ArrowRightOnRectangleIcon,
 } from '@heroicons/react/24/outline';
-import { Suspense, useState, useEffect } from 'react';
+import { Suspense, useState, useEffect, useRef } from 'react';
 import FooterStatusBar from './FooterStatusBar';
 import MobileTabBar from './MobileTabBar';
 import OnboardingWizard from './OnboardingWizard';
@@ -70,6 +70,8 @@ export default function Layout() {
   // First-run setup guide: show it once when the install isn't set up yet and
   // the user hasn't dismissed it. Runs once when the shell mounts.
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [isFirstRunGuide, setIsFirstRunGuide] = useState(false);
+  const manualGuideOpenedRef = useRef(false);
   useEffect(() => {
     if (localStorage.getItem('sportarr.onboardingDismissed') === '1') return;
     let cancelled = false;
@@ -80,7 +82,11 @@ export default function Layout() {
         const status = await res.json();
         // The server remembers a dismissal, so a guide closed on one machine
         // stays closed on every other machine and browser.
-        if (!cancelled && status && status.isReady === false && status.dismissed !== true) {
+        if (!cancelled && !manualGuideOpenedRef.current && status
+          && status.isReady === false && status.dismissed !== true) {
+          setIsFirstRunGuide(!status.hasRootFolder && !status.hasDownloadClient
+            && !status.hasEnabledIndexer && !status.hasIptvSource
+            && status.monitoredLeagueCount === 0);
           setShowOnboarding(true);
         }
       } catch {
@@ -94,7 +100,11 @@ export default function Layout() {
   // regardless of the dismissed flag or how configured the install is -
   // the guide hydrates from current settings and shows what's already set.
   useEffect(() => {
-    const open = () => setShowOnboarding(true);
+    const open = () => {
+      manualGuideOpenedRef.current = true;
+      setIsFirstRunGuide(false);
+      setShowOnboarding(true);
+    };
     window.addEventListener('sportarr:open-setup-guide', open);
     return () => window.removeEventListener('sportarr:open-setup-guide', open);
   }, []);
@@ -502,6 +512,7 @@ export default function Layout() {
         <OnboardingWizard
           onClose={() => setShowOnboarding(false)}
           onComplete={() => setShowOnboarding(false)}
+          isFirstRunGuide={isFirstRunGuide}
         />
       )}
     </div>

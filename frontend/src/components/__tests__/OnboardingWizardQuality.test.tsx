@@ -16,6 +16,7 @@ async function openQualityStep(
   settingsResponse?: Promise<{ data: { useRecommendedReleaseSettings: boolean | null } }>,
   currentNamingFormat = '{Series} - {Season}{Episode}{Part} - {Event Title} - {Quality Full} - {Sportarr Id}',
   namingResponses?: { settings?: Promise<unknown>; presets?: Promise<unknown> },
+  isFirstRunGuide = !configured,
 ) {
   const user = userEvent.setup();
   vi.mocked(apiClient.get).mockImplementation(async (url) => {
@@ -27,18 +28,19 @@ async function openQualityStep(
       { id: 2, name: 'WEB-2160p (Alternative)', isDefault: false },
     ] } as never;
     if (url === '/settings') return (namingResponses?.settings ?? { data: {
-      mediaManagementSettings: JSON.stringify({ standardFileFormat: currentNamingFormat, renameEpisodes: false }),
+      mediaManagementSettings: JSON.stringify({ standardFileFormat: currentNamingFormat, renameEvents: false }),
       securitySettings: '{}',
     } }) as never;
     if (url === '/trash/naming-presets?enableMultiPartEpisodes=true') return (namingResponses?.presets ?? { data: {
       file: naming ? {
         'plex-standard': { format: '{Series} - {Season}{Episode}{Part} - {Event Title} - {Quality Full} - {Sportarr Id}', description: 'Plex naming' },
         'full-details': { format: '{Series} - {Season}{Episode}{Part} - {Event Title} [{Quality Full}] {Sportarr Id}', description: 'Full details' },
+        original: { format: '{Original Filename}', description: 'Keep the release filename' },
       } : {},
     } }) as never;
     return { data: [] } as never;
   });
-  renderWithProviders(<OnboardingWizard onClose={vi.fn()} onComplete={vi.fn()} />);
+  renderWithProviders(<OnboardingWizard onClose={vi.fn()} onComplete={vi.fn()} isFirstRunGuide={isFirstRunGuide} />);
   await user.click(screen.getByRole('button', { name: 'Get started' }));
   for (let step = 0; step < 3; step += 1) {
     await user.click(screen.getByRole('button', { name: 'Skip Step' }));
@@ -120,10 +122,33 @@ describe('onboarding release preferences', () => {
       '/onboarding/release-preferences', expect.anything());
   });
 
-  it('applies the recommended naming preset by default on a new installation', async () => {
-    const user = await openQualityStep(false, false, true);
+  it('defaults a reopened guide to keeping current naming without a second control', async () => {
+    const user = await openQualityStep(true, null, true);
+    const keepCurrent = screen.getByRole('option', { name: 'Keep current naming' });
 
-    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Apply this naming preset' })).toBeChecked());
+    expect(keepCurrent.closest('select')).toHaveValue('');
+    expect(screen.queryByRole('checkbox', { name: 'Apply this naming preset' })).not.toBeInTheDocument();
+    expect(screen.getByText(/Current format/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Save & Next' }));
+    expect(apiClient.put).not.toHaveBeenCalledWith('/settings', expect.anything());
+  });
+
+  it('lets a new install keep its existing naming through the dropdown', async () => {
+    const user = await openQualityStep(false, false, true);
+    const select = screen.getByRole('option', { name: 'Keep current naming' }).closest('select');
+
+    await user.selectOptions(select!, '');
+    await user.click(screen.getByRole('button', { name: 'Save & Next' }));
+
+    expect(apiClient.put).not.toHaveBeenCalledWith('/settings', expect.anything());
+  });
+
+  it('applies a selected preset on a reopened guide without a checkbox', async () => {
+    const user = await openQualityStep(true, false, true, undefined, '{Event Title} - {Quality}');
+    const select = screen.getByRole('option', { name: 'Full Details (recommended)' }).closest('select');
+
+    await user.selectOptions(select!, 'full-details');
+    expect(screen.queryByRole('checkbox', { name: 'Apply this naming preset' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Save & Next' }));
 
     await waitFor(() => expect(apiClient.put).toHaveBeenCalledWith('/settings', expect.anything()));
@@ -133,7 +158,63 @@ describe('onboarding release preferences', () => {
     const saved = JSON.parse(payload.mediaManagementSettings);
     expect(saved.standardFileFormat).toBe(
       '{Series} - {Season}{Episode}{Part} - {Event Title} [{Quality Full}] {Sportarr Id}');
-    expect(saved.renameEpisodes).toBe(true);
+    expect(saved.renameEvents).toBe(true);
+  });
+
+  it('applies the recommended naming preset by default on a new installation', async () => {
+    const user = await openQualityStep(false, false, true);
+
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue('full-details'));
+    await user.click(screen.getByRole('button', { name: 'Save & Next' }));
+
+    await waitFor(() => expect(apiClient.put).toHaveBeenCalledWith('/settings', expect.anything()));
+    const payload = vi.mocked(apiClient.put).mock.calls.find(([url]) => url === '/settings')?.[1] as {
+      mediaManagementSettings: string;
+    };
+    const saved = JSON.parse(payload.mediaManagementSettings);
+    expect(saved.standardFileFormat).toBe(
+      '{Series} - {Season}{Episode}{Part} - {Event Title} [{Quality Full}] {Sportarr Id}');
+    expect(saved.renameEvents).toBe(true);
+  });
+
+  it('applies the recommended preset when a fresh database returns the settings fallback', async () => {
+    const user = await openQualityStep(false, false, true, undefined,
+      '{Series} - {Season}{Episode}{Part} - {Event Title} - {Quality Full}');
+
+    expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue('full-details');
+    await user.click(screen.getByRole('button', { name: 'Save & Next' }));
+    await waitFor(() => expect(apiClient.put).toHaveBeenCalledWith('/settings', expect.anything()));
+  });
+
+  it('keeps current naming when manually reopened without a root folder', async () => {
+    const user = await openQualityStep(false, false, true, undefined, undefined, undefined, false);
+
+    expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue('');
+    await user.click(screen.getByRole('button', { name: 'Save & Next' }));
+    expect(apiClient.put).not.toHaveBeenCalledWith('/settings', expect.anything());
+  });
+
+  it('explains the recommended naming format without warning', async () => {
+    await openQualityStep(false, false, true);
+
+    expect(screen.getByText(/TV libraries recognize events as episodes/i)).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('warns about disabled renaming on a reopened guide even with safe tokens saved', async () => {
+    await openQualityStep(true, false, true);
+
+    expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue('');
+    expect(screen.getByRole('alert')).toHaveTextContent(/Renaming is off/);
+  });
+
+  it('warns when the original filename preset is selected', async () => {
+    const user = await openQualityStep(false, false, true);
+    const original = screen.getByRole('option', { name: 'Original Filename (check source)' }).closest('select');
+
+    await user.selectOptions(original!, 'original');
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/Original release names vary/i);
   });
 
   it('waits for naming data before saving the default preset', async () => {
@@ -164,16 +245,16 @@ describe('onboarding release preferences', () => {
   it('keeps custom naming on a reopened guide unless the user opts in', async () => {
     const user = await openQualityStep(true, false, true, undefined, '{Event Title} - {Quality}');
 
-    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Apply this naming preset' })).not.toBeChecked());
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue(''));
     await user.click(screen.getByRole('button', { name: 'Save & Next' }));
 
     expect(apiClient.put).not.toHaveBeenCalledWith('/settings', expect.anything());
   });
 
-  it('does not change naming when a new user skips despite the checked default', async () => {
+  it('does not change naming when a new user skips despite the selected default', async () => {
     const user = await openQualityStep(false, false, true);
 
-    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Apply this naming preset' })).toBeChecked());
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'File naming (optional)' })).toHaveValue('full-details'));
     await user.click(screen.getByRole('button', { name: 'Skip Step' }));
 
     expect(apiClient.put).not.toHaveBeenCalledWith('/settings', expect.anything());
@@ -214,8 +295,10 @@ describe('onboarding release preferences', () => {
     await user.click(screen.getByRole('button', { name: /Standard setup/i }));
 
     expect(screen.queryByText(/resets any scores/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/season and episode numbers/i)).toBeVisible();
-    expect(screen.getByText(/Sportarr Id/i)).toBeVisible();
+    const note = screen.getByRole('note');
+    expect(note).toHaveTextContent(/TV libraries recognize events as episodes/i);
+    expect(note).toHaveTextContent(/Sportarr provides one/i);
+    expect(note).toHaveTextContent(/TVDB or IMDb ID/i);
   });
 
   it('does not undo an applied recommendation when revisiting and skipping', async () => {

@@ -1497,7 +1497,7 @@ public class FileImportService : IFileImportService
                 QualityFull = effectiveQualityFull,
                 ReleaseGroup = parsed.ReleaseGroup ?? string.Empty,
                 OriginalTitle = parsed.EventTitle,
-                OriginalFilename = Path.GetFileNameWithoutExtension(parsed.EventTitle),
+                OriginalFilename = FileNamingService.GetOriginalFilenameToken(sourceFile),
                 // Plex TV show structure
                 Series = eventInfo.League?.Name ?? eventInfo.Sport ?? string.Empty,
                 Season = eventInfo.SeasonNumber?.ToString("0000") ?? eventInfo.Season ?? brandingDate.Year.ToString(),
