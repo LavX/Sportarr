@@ -3392,7 +3392,7 @@ namespace Sportarr.Api.Migrations.Postgres.Migrations
                         {
                             Id = 1,
                             CutoffQuality = 15,
-                            FormatItems = "[{\"Id\":0,\"FormatId\":1,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":2,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":3,\"Format\":null,\"Score\":5},{\"Id\":0,\"FormatId\":4,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":5,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":6,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":7,\"Format\":null,\"Score\":10}]",
+                            FormatItems = "[{\"Id\":0,\"FormatId\":1,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":2,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":3,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":4,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":5,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":6,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":7,\"Format\":null,\"Score\":0}]",
                             FormatScoreIncrement = 1,
                             IsCustomized = false,
                             IsDefault = true,
@@ -3406,7 +3406,7 @@ namespace Sportarr.Api.Migrations.Postgres.Migrations
                         {
                             Id = 2,
                             CutoffQuality = 19,
-                            FormatItems = "[{\"Id\":0,\"FormatId\":1,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":2,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":3,\"Format\":null,\"Score\":5},{\"Id\":0,\"FormatId\":4,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":5,\"Format\":null,\"Score\":-10000},{\"Id\":0,\"FormatId\":6,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":7,\"Format\":null,\"Score\":10}]",
+                            FormatItems = "[{\"Id\":0,\"FormatId\":1,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":2,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":3,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":4,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":5,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":6,\"Format\":null,\"Score\":0},{\"Id\":0,\"FormatId\":7,\"Format\":null,\"Score\":0}]",
                             FormatScoreIncrement = 1,
                             IsCustomized = false,
                             IsDefault = false,

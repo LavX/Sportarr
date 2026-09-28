@@ -505,6 +505,9 @@ public static class TrashScoreSets
 /// </summary>
 public class TrashSyncSettings
 {
+    // Null keeps the existing first-run behavior on upgraded installations.
+    public bool? UseRecommendedReleaseSettings { get; set; }
+
     /// <summary>
     /// Enable automatic scheduled sync
     /// </summary>
@@ -527,10 +530,9 @@ public class TrashSyncSettings
 
     /// <summary>
     /// Whether the one-time first-run enrichment has completed. On first run the
-    /// app ships bundled "floor" profiles/formats; once online it pulls the full
-    /// format set fresh from TRaSH Guides and applies scores to the seeded
-    /// profiles, then sets this so it never repeats. Stays false (retries next
-    /// start) if the app was offline, so the enrichment isn't lost.
+    /// Older installs may pull formats and scores once. Fresh installs wait for
+    /// the user to choose Recommended setup. A failed sync retries on startup
+    /// only for older installs.
     /// </summary>
     public bool FirstRunEnrichmentDone { get; set; } = false;
 

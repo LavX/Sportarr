@@ -1,5 +1,19 @@
 # Initial Setup
 
+The setup guide walks a new install through the library, release preferences, download source, and playback. You can also use the settings pages below.
+
+## Release preferences in the setup guide
+
+Sportarr includes ready-to-use 1080p and 4K quality profiles. The 1080p profile is the initial default. You can change the default later under **Settings > Profiles**.
+
+Choose **Standard setup** to start with the built-in profiles and neutral custom format scores. Choose **Recommended setup** to import custom format scores and quality size limits from TRaSH Guides. Recommended setup needs an internet connection. If the import fails, your current release preferences stay in place so you can try again.
+
+On a new install, **Skip Step** keeps Standard setup. Reopening the guide and skipping this step does not change existing preferences. Switching from Recommended to Standard clears scores in unedited built-in profiles. Choosing Standard when it is already active leaves scores alone. Custom profiles and previously imported quality size limits are left alone.
+
+On a new install, **Apply this naming preset** starts checked and selects a detailed format. Clear it or use **Skip Step** to keep the current naming settings. Reopening the guide leaves custom naming unchanged unless you opt in. Keep season and episode numbers and `{Sportarr Id}` in filenames for the most reliable matching with the Sportarr Metadata Agent. Removing them can cause missing or incorrect matches.
+
+## Manual setup
+
 Four steps take a fresh install to a working library.
 
 ## 1. Root folder

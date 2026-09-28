@@ -2271,6 +2271,8 @@ public static class DatabaseInitializer
         if (appSettings == null)
         {
             appSettings = new AppSettings { Id = 1 };
+            appSettings.TrashSyncSettings = System.Text.Json.JsonSerializer.Serialize(
+                new TrashSyncSettings { UseRecommendedReleaseSettings = false });
             db.AppSettings.Add(appSettings);
         }
 
