@@ -74,6 +74,14 @@ interface QueueItem {
   customFormatScore?: number;
 }
 
+const isQueueItemUnmonitored = (item: QueueItem): boolean =>
+  item.statusMessages?.some(message => message.includes('no longer monitored')) ?? false;
+
+const canImportQueueItem = (item: QueueItem): boolean => {
+  if (item.canRetryImport || item.canImportAnyway || item.canChooseVideo) return false;
+  return item.status === 3 || (isQueueItemUnmonitored(item) && item.status === 5);
+};
+
 interface ColumnVisibility {
   event: boolean;
   title: boolean;
@@ -770,9 +778,7 @@ export default function ActivityPage() {
     const items = selectedQueueItems;
     try {
       await Promise.all(items.map(async item => {
-        const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored')) ?? false;
-        const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
-        if (canImport) {
+        if (canImportQueueItem(item)) {
           await apiClient.post(`/queue/${item.id}/import`);
         } else {
           await apiClient.post(`/queue/${item.id}/retry`);
@@ -951,7 +957,6 @@ export default function ActivityPage() {
     }
   };
 
-  // Force import for unmonitored event downloads (Sonarr-style)
   const handleForceImport = async (item: QueueItem) => {
     try {
       await apiClient.post(`/queue/${item.id}/import`);
@@ -1389,10 +1394,8 @@ export default function ActivityPage() {
 
   // Pending imports need individual event mapping before import.
   const isQueueRowImportable = (item: QueueItem): boolean => {
-    const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored')) ?? false;
-    const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
     const canRetryImport = item.canRetryImport === true;
-    return canImport || canRetryImport;
+    return canImportQueueItem(item) || canRetryImport;
   };
 
   const selectedQueueItems = queueRows.filter(item => visibleSelectedQueueIds.has(item.id));
@@ -1527,9 +1530,8 @@ export default function ActivityPage() {
           </td>
         );
       case 'actions':
-        const isUnmonitored = item.statusMessages?.some(msg => msg.includes('no longer monitored'));
-        // Show import button for Warning (5) or Completed (3) status when unmonitored
-        const canImport = isUnmonitored && (item.status === 5 || item.status === 3);
+        const isUnmonitored = isQueueItemUnmonitored(item);
+        const canImport = canImportQueueItem(item);
         const canRetryImport = item.canRetryImport === true;
         const canImportAnyway = item.canImportAnyway === true;
         const canChooseVideo = item.canChooseVideo === true;
@@ -1565,27 +1567,26 @@ export default function ActivityPage() {
                   <DocumentCheckIcon className="w-4 h-4" />
                 </button>
               )}
-              {/* Show Import/Delete buttons for unmonitored downloads (Sonarr-style) */}
               {canImport && (
-                <>
-                  <button
-                    onClick={() => handleForceImport(item)}
-                    className={BUTTON_ICON_SUCCESS}
-                    title="Import Anyway"
-                  >
-                    <DocumentCheckIcon className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={() => handleDeleteUnmonitored(item)}
-                    className={BUTTON_ICON_DESTRUCTIVE}
-                    title="Delete Download"
-                  >
-                    <TrashIcon className="w-4 h-4" />
-                  </button>
-                </>
+                <button
+                  onClick={() => handleForceImport(item)}
+                  className={BUTTON_ICON_SUCCESS}
+                  title="Import"
+                  aria-label="Import"
+                >
+                  <DocumentCheckIcon className="w-4 h-4" />
+                </button>
               )}
-              {/* Regular remove button (only show when not already showing delete button for unmonitored) */}
-              {!canImport && (
+              {canImport && isUnmonitored && (
+                <button
+                  onClick={() => handleDeleteUnmonitored(item)}
+                  className={BUTTON_ICON_DESTRUCTIVE}
+                  title="Delete Download"
+                >
+                  <TrashIcon className="w-4 h-4" />
+                </button>
+              )}
+              {(!canImport || !isUnmonitored) && (
                 <button
                   onClick={() => handleOpenRemoveQueueDialog(item)}
                   className={BUTTON_ICON_DESTRUCTIVE}
@@ -2015,8 +2016,8 @@ export default function ActivityPage() {
           const key = `q:${item.id}`;
           const expanded = expandedCompactRow === key;
           const title = item.event?.title || 'Unknown Event';
-          const isUnmonitored = item.statusMessages?.some(message => message.includes('no longer monitored'));
-          const canImportCard = isUnmonitored && (item.status === 5 || item.status === 3);
+          const isUnmonitored = isQueueItemUnmonitored(item);
+          const canImportCard = canImportQueueItem(item);
           return (
             <article
               key={key}
@@ -2085,8 +2086,8 @@ export default function ActivityPage() {
                     {item.canImportAnyway && <button onClick={() => openManualImportDialog(item)} className={`${BUTTON_WARNING} min-h-11`}><DocumentCheckIcon className="h-4 w-4" />Import Anyway</button>}
                     {item.canChooseVideo && <button onClick={() => openVideoChoiceDialog(item)} className={`${BUTTON_WARNING} min-h-11`}><DocumentCheckIcon className="h-4 w-4" />Choose Video</button>}
                     {canImportCard && <button onClick={() => handleForceImport(item)} className={`${BUTTON_SUCCESS} min-h-11`}><DocumentCheckIcon className="h-4 w-4" />Import</button>}
-                    {canImportCard && <button onClick={() => handleDeleteUnmonitored(item)} className={`${BUTTON_DESTRUCTIVE} min-h-11`}><TrashIcon className="h-4 w-4" />Delete</button>}
-                    {!canImportCard && <button onClick={() => handleOpenRemoveQueueDialog(item)} className={`${BUTTON_DESTRUCTIVE} min-h-11`}><TrashIcon className="h-4 w-4" />Remove</button>}
+                    {canImportCard && isUnmonitored && <button onClick={() => handleDeleteUnmonitored(item)} className={`${BUTTON_DESTRUCTIVE} min-h-11`}><TrashIcon className="h-4 w-4" />Delete</button>}
+                    {(!canImportCard || !isUnmonitored) && <button onClick={() => handleOpenRemoveQueueDialog(item)} className={`${BUTTON_DESTRUCTIVE} min-h-11`}><TrashIcon className="h-4 w-4" />Remove</button>}
                   </div>
                 </div>
               )}

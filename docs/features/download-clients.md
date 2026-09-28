@@ -48,6 +48,8 @@ On phones and tablets, Queue shows compact rows. Open a row to see its release d
 
 Selecting rows shows bulk import and removal actions. Bulk import works only for eligible queue rows. Pending imports need per-item review, and **Import Anyway** needs individual confirmation. **Remove Selected** opens a confirmation. For downloads held by a client, the default **Remove from Download Client** method asks the client to delete the job and its files. Check that choice before confirming. Sportarr blocklists a removed pending import from a client even if that client cannot delete the job. Check the client if the download or files remain.
 
+When **Enable Auto Import** is off, completed downloads stay in Queue. Use **Import** on one row or select completed rows and choose **Import Selected**. Downloads that need a video choice or **Import Anyway** decision still need individual review.
+
 ## Retry a completed import
 
 Activity shows **Retry Import** when a completed download has failed to import or a pack member is held for correction. Resolve the displayed reason, then retry the import. Retrying uses the completed download and does not submit another download job. Bulk import supports these retries. **Import Anyway** requires confirmation on each download and is not available in bulk.
