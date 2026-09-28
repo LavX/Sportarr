@@ -530,6 +530,84 @@ public class RssPackAcquisitionTests(Xunit.Abstractions.ITestOutputHelper output
     }
 
     [Fact]
+    public async Task PushedNascarReleaseDoesNotGrabAnotherSeasonVenue()
+    {
+        await using var rig = await PartIdentityIntegrationHarness.CreateAsync(
+            rename: false, multipart: false, title: "Bass Pro Shops Night - Race",
+            sport: "Motorsport", leagueName: "NASCAR Cup Series", relational: true);
+        rig.Event.Round = "29";
+        rig.Event.Venue = "Bristol Motor Speedway";
+        rig.Event.Location = "United States";
+        rig.Db.Events.Add(new Event
+        {
+            Title = "Coca-Cola 600 - Race", Sport = "Motorsport", Season = "2020", Round = "12",
+            EventDate = new DateTime(2020, 5, 24, 22, 0, 0, DateTimeKind.Utc),
+            Venue = "Charlotte Motor Speedway", Location = "United States", League = rig.Event.League
+        });
+        await rig.Db.SaveChangesAsync();
+        var indexerId = await rig.Db.Indexers.Select(indexer => indexer.Id).SingleAsync();
+        var wrong = rig.Release("NASCAR Cup Series 2020 Round29 Charlotte Race 720p WEB-DL H264", suffix: "charlotte");
+        wrong.IndexerId = indexerId;
+        wrong.Size = 4_000_000_000;
+
+        var outcome = await rig.Services.GetRequiredService<RssSyncService>()
+            .ProcessPushedReleaseAsync(wrong, CancellationToken.None);
+
+        Assert.False(outcome.Grabbed);
+        Assert.Equal(0, rig.Transport.ClientAdds);
+
+        var wrongCountry = rig.Release(
+            "NASCAR Cup Series 2020 Round29 Bristol Motor Speedway Canada Race 720p WEB-DL H264",
+            suffix: "canada");
+        wrongCountry.IndexerId = indexerId;
+        wrongCountry.Size = 4_000_000_000;
+        var wrongCountryOutcome = await rig.Services.GetRequiredService<RssSyncService>()
+            .ProcessPushedReleaseAsync(wrongCountry, CancellationToken.None);
+
+        Assert.False(wrongCountryOutcome.Grabbed);
+        Assert.Equal(0, rig.Transport.ClientAdds);
+
+        var right = rig.Release("NASCAR Cup Series 2020 Round29 Bristol Motor Speedway Race 720p WEB-DL H264",
+            suffix: "bristol");
+        right.IndexerId = indexerId;
+        right.Size = 4_000_000_000;
+        var accepted = await rig.Services.GetRequiredService<RssSyncService>()
+            .ProcessPushedReleaseAsync(right, CancellationToken.None);
+
+        Assert.True(accepted.Grabbed, string.Join("; ", accepted.Rejections));
+        Assert.Equal(1, rig.Transport.ClientAdds);
+    }
+
+    [Fact]
+    public async Task PushedNascarReleaseHonorsExactEventIdOverVenueText()
+    {
+        await using var rig = await PartIdentityIntegrationHarness.CreateAsync(
+            rename: false, multipart: false, title: "Bass Pro Shops Night - Race",
+            sport: "Motorsport", leagueName: "NASCAR Cup Series", relational: true);
+        rig.Event.Round = "29";
+        rig.Event.Venue = "Bristol Motor Speedway";
+        rig.Event.Location = "United States";
+        rig.Event.ExternalId = "ev-123456";
+        rig.Db.Events.Add(new Event
+        {
+            Title = "Coca-Cola 600 - Race", Sport = "Motorsport", Season = "2020", Round = "12",
+            EventDate = new DateTime(2020, 5, 24, 22, 0, 0, DateTimeKind.Utc),
+            Venue = "Charlotte Motor Speedway", Location = "United States", League = rig.Event.League
+        });
+        await rig.Db.SaveChangesAsync();
+        var release = rig.Release("NASCAR Cup Series 2020 Round29 Charlotte Race 720p WEB-DL H264", suffix: "exact-id");
+        release.SportarrEventId = rig.Event.ExternalId;
+        release.IndexerId = await rig.Db.Indexers.Select(indexer => indexer.Id).SingleAsync();
+        release.Size = 4_000_000_000;
+
+        var outcome = await rig.Services.GetRequiredService<RssSyncService>()
+            .ProcessPushedReleaseAsync(release, CancellationToken.None);
+
+        Assert.True(outcome.Grabbed, string.Join("; ", outcome.Rejections));
+        Assert.Equal(1, rig.Transport.ClientAdds);
+    }
+
+    [Fact]
     public async Task PushedAewZeroHourPersistsAsCountdown()
     {
         await using var rig = await PartIdentityIntegrationHarness.CreateAsync(

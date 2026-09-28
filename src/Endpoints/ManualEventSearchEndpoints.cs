@@ -349,6 +349,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     var knownLeagues = await LeagueMatchContext.LoadAsync(db);
     var roundRaceNumbers = await LoadRoundRaceNumbersAsync(db, evt);
     var datePeers = await EventDateMatchContext.LoadAsync(db, evt);
+    var venueContext = await NascarVenueMatchContext.LoadAsync(db, evt);
 
     var dateRejectionCount = 0;
     var identityRejectedResults = new HashSet<ReleaseSearchResult>(ReferenceEqualityComparer.Instance);
@@ -385,7 +386,7 @@ app.MapPost("/api/event/{eventId:int}/search", async (
     {
         result.MatchScore = releaseMatchScorer.CalculateMatchScore(
             result.Title, evt, knownLeagues, part, config.EnableMultiPartEpisodes,
-            roundRaceNumbers);
+            roundRaceNumbers, venueContext, result.SportarrEventId);
 
         // Mark non-matching releases as rejected (so UI "Hide Rejected" filter works)
         if (result.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
@@ -441,7 +442,8 @@ app.MapPost("/api/event/{eventId:int}/search", async (
                 release.MatchScore = releaseMatchScorer.CalculateMatchScore(
                     release.Title, evt, knownLeagues, requestedPart: part,
                     enableMultiPartEpisodes: config.EnableMultiPartEpisodes,
-                    roundRaceNumbers: roundRaceNumbers);
+                    roundRaceNumbers: roundRaceNumbers, venueContext: venueContext,
+                    sportarrEventId: release.SportarrEventId);
                 if (release.MatchScore < ReleaseMatchScorer.MinimumMatchScore)
                 {
                     release.Approved = false;
@@ -628,6 +630,7 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
     var knownLeagues = await LeagueMatchContext.LoadAsync(db);
     var roundRaceNumbers = await LoadRoundRaceNumbersAsync(db, evt);
     var datePeers = await EventDateMatchContext.LoadAsync(db, evt);
+    var venueContext = await NascarVenueMatchContext.LoadAsync(db, evt);
 
     // The week the event belongs to. The general validation compares numbers
     // found in the release title against numbers in the event title, and a
@@ -663,7 +666,8 @@ app.MapPost("/api/event/{eventId:int}/search-pack", async (
         result.MatchScore = releaseMatchScorer.CalculateMatchScore(
             result.Title, evt, knownLeagues, requestedPart: null,
             enableMultiPartEpisodes: packConfig.EnableMultiPartEpisodes,
-            roundRaceNumbers: roundRaceNumbers);
+            roundRaceNumbers: roundRaceNumbers, venueContext: venueContext,
+            sportarrEventId: result.SportarrEventId);
         if (result.IsPack &&
             LeagueReleaseNamePolicy.HasChineseCbaSeasonPackIdentity(result.Title, evt))
         {

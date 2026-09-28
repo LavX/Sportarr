@@ -460,6 +460,7 @@ public class AutomaticSearchService : IAutomaticSearchService
             result.SearchComplete = searchComplete;
 
             var knownLeagues = await LeagueMatchContext.LoadAsync(_db);
+            var venueContext = await NascarVenueMatchContext.LoadAsync(_db, evt);
             IReadOnlyCollection<Event>? datePeers = null;
             if (EventDateMatchContext.ShouldLoadPeers(evt))
             {
@@ -548,7 +549,7 @@ public class AutomaticSearchService : IAutomaticSearchService
                     {
                         release.MatchScore = _releaseMatchScorer.CalculateMatchScore(
                             release.Title, evt, knownLeagues, part, config.EnableMultiPartEpisodes,
-                            roundRaceNumbers);
+                            roundRaceNumbers, venueContext, release.SportarrEventId);
                         scoredCount++;
                     }
 

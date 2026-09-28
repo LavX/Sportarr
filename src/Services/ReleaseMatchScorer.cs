@@ -414,12 +414,14 @@ public class ReleaseMatchScorer
         IReadOnlyCollection<League>? knownLeagues = null,
         string? requestedPart = null,
         bool enableMultiPartEpisodes = true,
-        IReadOnlyList<int>? roundRaceNumbers = null)
+        IReadOnlyList<int>? roundRaceNumbers = null,
+        NascarVenueMatchContext? venueContext = null,
+        string? sportarrEventId = null)
     {
         var parsed = ParseReleaseTitle(releaseTitle);
         return CalculateMatchScoreInternal(
             releaseTitle, parsed, evt, knownLeagues, requestedPart, enableMultiPartEpisodes,
-            roundRaceNumbers);
+            roundRaceNumbers, venueContext, sportarrEventId);
     }
 
     /// <summary>
@@ -428,7 +430,9 @@ public class ReleaseMatchScorer
     public int CalculateMatchScore(string releaseTitle, int? year, int? month, int? day,
         int? roundNumber, string? sportPrefix, Event evt,
         IReadOnlyCollection<League>? knownLeagues = null,
-        IReadOnlyList<int>? roundRaceNumbers = null)
+        IReadOnlyList<int>? roundRaceNumbers = null,
+        NascarVenueMatchContext? venueContext = null,
+        string? sportarrEventId = null)
     {
         var parsed = new ParsedRelease
         {
@@ -439,7 +443,8 @@ public class ReleaseMatchScorer
             SportPrefix = sportPrefix
         };
         return CalculateMatchScoreInternal(
-            releaseTitle, parsed, evt, knownLeagues, roundRaceNumbers: roundRaceNumbers);
+            releaseTitle, parsed, evt, knownLeagues, roundRaceNumbers: roundRaceNumbers,
+            venueContext: venueContext, sportarrEventId: sportarrEventId);
     }
 
     private int CalculateMatchScoreInternal(
@@ -449,8 +454,15 @@ public class ReleaseMatchScorer
         IReadOnlyCollection<League>? knownLeagues,
         string? requestedPart = null,
         bool enableMultiPartEpisodes = true,
-        IReadOnlyList<int>? roundRaceNumbers = null)
+        IReadOnlyList<int>? roundRaceNumbers = null,
+        NascarVenueMatchContext? venueContext = null,
+        string? sportarrEventId = null)
     {
+        var releaseEventId = SportarrIdToken.ExtractEventId(releaseTitle) ?? sportarrEventId;
+        if (!string.IsNullOrEmpty(releaseEventId) &&
+            evt.ExternalId?.StartsWith("ev-", StringComparison.OrdinalIgnoreCase) == true)
+            return string.Equals(releaseEventId, evt.ExternalId, StringComparison.OrdinalIgnoreCase) ? 100 : 0;
+
         var score = 0;
         var eventSportPrefix = GetSportPrefix(evt.League?.Name, evt.Sport);
         var isCombatEvent = EventPartDetector.IsFightingSport(evt.Sport ?? string.Empty);
@@ -719,7 +731,7 @@ public class ReleaseMatchScorer
         // This prevents "Qatar Grand Prix" from matching "Brazil Grand Prix" releases
         if (IsMotorsport(eventSportPrefix))
         {
-            var locationScore = GetLocationMatchScore(releaseTitle, evt);
+            var locationScore = GetLocationMatchScore(releaseTitle, evt, venueContext);
             if (locationScore < 0)
                 return 0; // Wrong location - reject immediately
             score += locationScore; // 0-25 points for matching locations
@@ -1119,11 +1131,20 @@ public class ReleaseMatchScorer
     /// Returns NEGATIVE score if release contains a DIFFERENT known motorsport location.
     /// This prevents "Qatar Grand Prix" from matching "Brazil Grand Prix Sprint" releases.
     /// </summary>
-    private int GetLocationMatchScore(string releaseTitle, Event evt)
+    private int GetLocationMatchScore(string releaseTitle, Event evt, NascarVenueMatchContext? venueContext)
     {
         var eventTitle = evt.Title ?? "";
         var normalizedRelease = NormalizeTitle(releaseTitle);
         var normalizedEvent = NormalizeTitle(eventTitle);
+        var useNascarVenues = venueContext != null &&
+            evt.League?.Name.StartsWith("NASCAR Cup", StringComparison.OrdinalIgnoreCase) == true;
+
+        if (useNascarVenues)
+        {
+            var nascarScore = GetNascarLocationScore(releaseTitle, evt, venueContext!);
+            if (nascarScore != 0)
+                return nascarScore;
+        }
 
         // SAME-COUNTRY DISTINCT-CIRCUIT resolution, using the event's own circuit.
         // Countries can host several races in one season (USA: Miami/Austin/Vegas;
@@ -1151,7 +1172,9 @@ public class ReleaseMatchScorer
 
         // CRITICAL: ALWAYS check for conflicting locations FIRST
         // Even if "Sprint" matches, "Brazil Sprint" should NOT match "Qatar Sprint"
-        var differentLocationFound = CheckForDifferentLocation(normalizedRelease, normalizedEvent);
+        var differentLocationFound = useNascarVenues
+            ? null
+            : CheckForDifferentLocation(normalizedRelease, normalizedEvent);
         if (differentLocationFound != null)
         {
             // Release has a different location - this is the wrong race
@@ -1206,6 +1229,20 @@ public class ReleaseMatchScorer
 
         // Location not matched but no conflicting location found - neutral
         return 0;
+    }
+
+    internal int GetNascarLocationScore(string releaseTitle, Event evt, NascarVenueMatchContext venueContext)
+    {
+        var venueMatch = venueContext.Evaluate(releaseTitle, evt.Venue);
+        if (venueMatch == NascarVenueMatch.Conflict)
+            return -50;
+
+        if (CheckForDifferentLocation(NormalizeTitle(releaseTitle),
+            NormalizeTitle($"{evt.Title} {evt.Venue} {evt.Location}"),
+            checkAllLocations: true, requireKnownEventLocation: true) != null)
+            return -50;
+
+        return venueMatch == NascarVenueMatch.Match ? 25 : 0;
     }
 
     /// <summary>
@@ -1390,7 +1427,9 @@ public class ReleaseMatchScorer
     /// For example, "Formula.1.2024.USA.Las.Vegas.Grand.Prix" matching "Las Vegas Grand Prix"
     /// is valid because Las Vegas is within USA - they're not conflicting locations.
     /// </summary>
-    private string? CheckForDifferentLocation(string normalizedRelease, string normalizedEvent)
+    private string? CheckForDifferentLocation(
+        string normalizedRelease, string normalizedEvent, bool checkAllLocations = false,
+        bool requireKnownEventLocation = false)
     {
         // Known motorsport locations and their variations
         // These are locations that appear in F1, MotoGP, and other motorsport releases
@@ -1451,6 +1490,9 @@ public class ReleaseMatchScorer
             }
         }
 
+        if (requireKnownEventLocation && eventLocations.Count == 0)
+            return null;
+
         // Also find parent locations for any event locations using the hierarchy
         // e.g., if event is "Las Vegas Grand Prix", also add "USA" as a valid parent
         var eventParentLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1469,13 +1511,16 @@ public class ReleaseMatchScorer
         // skip the wrong-location check so a scene language tag that doubles as a
         // demonym ("GERMAN" -> Germany, "FRENCH" -> France) cannot flag a false
         // conflict on a release that clearly names the correct circuit/country.
-        foreach (var eventLoc in eventLocations)
+        if (!checkAllLocations)
         {
-            if (ContainsLocationWord(normalizedRelease, eventLoc))
-                return null;
-            if (motorsportLocations.TryGetValue(eventLoc, out var eventLocAliases)
-                && eventLocAliases.Any(a => ContainsLocationWord(normalizedRelease, a)))
-                return null;
+            foreach (var eventLoc in eventLocations)
+            {
+                if (ContainsLocationWord(normalizedRelease, eventLoc))
+                    return null;
+                if (motorsportLocations.TryGetValue(eventLoc, out var eventLocAliases)
+                    && eventLocAliases.Any(a => ContainsLocationWord(normalizedRelease, a)))
+                    return null;
+            }
         }
 
         // Now check if release contains a DIFFERENT location
@@ -1521,6 +1566,8 @@ public class ReleaseMatchScorer
 
             foreach (var alias in aliases)
             {
+                if (checkAllLocations && SearchNormalizationService.SceneLanguageTags.Contains(alias))
+                    continue;
                 if (ContainsLocationWord(normalizedRelease, alias))
                 {
                     // Same check for aliases

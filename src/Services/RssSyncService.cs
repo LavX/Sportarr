@@ -116,6 +116,7 @@ public class RssSyncService : BackgroundService
         var configService = scope.ServiceProvider.GetRequiredService<ConfigService>();
         var partDetector = scope.ServiceProvider.GetRequiredService<EventPartDetector>();
         var releaseMatchingService = scope.ServiceProvider.GetRequiredService<ReleaseMatchingService>();
+        var releaseMatchScorer = scope.ServiceProvider.GetRequiredService<ReleaseMatchScorer>();
         var releaseEvaluator = scope.ServiceProvider.GetRequiredService<ReleaseEvaluator>();
         var releaseProfileService = scope.ServiceProvider.GetRequiredService<ReleaseProfileService>();
 
@@ -212,6 +213,7 @@ public class RssSyncService : BackgroundService
             cancellationToken);
         var roundRaceNumbersByRound = await LoadSupercarsRoundRaceNumbersAsync(
             db, monitoredEvents, cancellationToken);
+        var nascarVenues = await LoadNascarVenueContextsAsync(db, monitoredEvents, cancellationToken);
 
         _logger.LogDebug("[RSS Sync] Loaded {ProfileCount} quality profiles, {FormatCount} custom formats, {ReleaseProfileCount} release profiles for evaluation",
             qualityProfiles.Count, customFormats.Count, releaseProfiles.Count);
@@ -229,12 +231,14 @@ public class RssSyncService : BackgroundService
                     release,
                     monitoredEvents,
                     releaseMatchingService,
+                    releaseMatchScorer,
                     partDetector,
                     config.EnableMultiPartEpisodes,
                     earlyReleaseLimits,
                     knownLeagues,
                     datePeers,
-                    roundRaceNumbersByRound);
+                    roundRaceNumbersByRound,
+                    nascarVenues);
 
                 if (matchedEvent == null)
                     continue;
@@ -414,6 +418,7 @@ public class RssSyncService : BackgroundService
         var configService = scope.ServiceProvider.GetRequiredService<ConfigService>();
         var partDetector = scope.ServiceProvider.GetRequiredService<EventPartDetector>();
         var releaseMatchingService = scope.ServiceProvider.GetRequiredService<ReleaseMatchingService>();
+        var releaseMatchScorer = scope.ServiceProvider.GetRequiredService<ReleaseMatchScorer>();
         var releaseEvaluator = scope.ServiceProvider.GetRequiredService<ReleaseEvaluator>();
         var releaseProfileService = scope.ServiceProvider.GetRequiredService<ReleaseProfileService>();
 
@@ -461,17 +466,20 @@ public class RssSyncService : BackgroundService
             cancellationToken);
         var roundRaceNumbersByRound = await LoadSupercarsRoundRaceNumbersAsync(
             db, monitoredEvents, cancellationToken);
+        var nascarVenues = await LoadNascarVenueContextsAsync(db, monitoredEvents, cancellationToken);
 
         var matchedEvent = FindMatchingEvent(
             release,
             monitoredEvents,
             releaseMatchingService,
+            releaseMatchScorer,
             partDetector,
             config.EnableMultiPartEpisodes,
             earlyReleaseLimits,
             knownLeagues,
             datePeers,
-            roundRaceNumbersByRound);
+            roundRaceNumbersByRound,
+            nascarVenues);
 
         if (matchedEvent == null)
         {
@@ -603,12 +611,14 @@ public class RssSyncService : BackgroundService
         ReleaseSearchResult release,
         List<Event> monitoredEvents,
         ReleaseMatchingService matchingService,
+        ReleaseMatchScorer matchScorer,
         EventPartDetector partDetector,
         bool enableMultiPartEpisodes,
         IReadOnlyDictionary<int, int?> earlyReleaseLimits,
         IReadOnlyCollection<League> knownLeagues,
         IReadOnlyCollection<Event> datePeers,
-        IReadOnlyDictionary<(int? LeagueId, string? Season, string? Round), List<int>> roundRaceNumbersByRound)
+        IReadOnlyDictionary<(int? LeagueId, string? Season, string? Round), List<int>> roundRaceNumbersByRound,
+        IReadOnlyDictionary<(int? LeagueId, string? Season), NascarVenueMatchContext> nascarVenues)
     {
         Event? bestMatch = null;
         int bestConfidence = int.MinValue;
@@ -646,6 +656,14 @@ public class RssSyncService : BackgroundService
                 earlyReleaseLimitDays: earlyLimit, roundRaceNumbers: roundRaceNumbers,
                 knownLeagues: knownLeagues, datePeers: datePeers);
             if (!matchResult.IsMatch || matchResult.IsHardRejection)
+                continue;
+
+            var releaseEventId = preParsed.SportarrEventId ?? release.SportarrEventId;
+            var exactEventId = !string.IsNullOrEmpty(releaseEventId) &&
+                evt.ExternalId?.StartsWith("ev-", StringComparison.OrdinalIgnoreCase) == true &&
+                string.Equals(releaseEventId, evt.ExternalId, StringComparison.OrdinalIgnoreCase);
+            if (!exactEventId && nascarVenues.TryGetValue((evt.LeagueId, evt.Season), out var venues) &&
+                matchScorer.GetNascarLocationScore(release.Title, evt, venues) < 0)
                 continue;
 
             // Honor league custom-search-template required keywords.
@@ -690,6 +708,23 @@ public class RssSyncService : BackgroundService
         }
 
         return bestMatch;
+    }
+
+    private static async Task<Dictionary<(int? LeagueId, string? Season), NascarVenueMatchContext>>
+        LoadNascarVenueContextsAsync(SportarrDbContext db, IReadOnlyCollection<Event> monitoredEvents,
+            CancellationToken cancellationToken)
+    {
+        var contexts = new Dictionary<(int? LeagueId, string? Season), NascarVenueMatchContext>();
+        foreach (var group in monitoredEvents
+            .Where(evt => evt.League?.Name.StartsWith("NASCAR Cup", StringComparison.OrdinalIgnoreCase) == true)
+            .GroupBy(evt => (evt.LeagueId, evt.Season)))
+        {
+            var context = await NascarVenueMatchContext.LoadAsync(db, group.First(), cancellationToken);
+            if (context != null)
+                contexts.Add(group.Key, context);
+        }
+
+        return contexts;
     }
 
     private static async Task<Dictionary<(int? LeagueId, string? Season, string? Round), List<int>>> LoadSupercarsRoundRaceNumbersAsync(
