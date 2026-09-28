@@ -122,6 +122,10 @@ public class ReleaseMatchingService
         new Regex(@"\bcoach(?:'?s|es)?[\s\.\-_]*(?:film|tape|cam)", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), // coaches film/tape/cam
     };
 
+    private static readonly Regex _warmUpShowQualifierPattern = new(
+        @"\bweekend[\s\._-]*warm[\s\._-]*up\b|\bwarm[\s\._-]*up[\s\._-]*(?:show|weekend)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     // Pre-season test detection — fires inside per-event ValidateRelease loop.
     private static readonly Regex _preSeasonTestRegex = new(
         @"\bpre[\s\.\-_]*season[\s\.\-_]*test",
@@ -376,8 +380,15 @@ public class ReleaseMatchingService
             var highlightsAllowed =
                 string.Equals(nonEventContent, "Highlights", StringComparison.OrdinalIgnoreCase)
                 && (evt.League?.AllowHighlights ?? false);
+            var scheduledWarmUp =
+                string.Equals(nonEventContent, "Warm-up Show", StringComparison.OrdinalIgnoreCase) &&
+                EventPartDetector.DetectMotorsportSessionIdentity(
+                    evt.Title, evt.League?.Name, releaseTitle: false) == "Warm Up" &&
+                EventPartDetector.DetectMotorsportSessionIdentity(
+                    release.Title, evt.League?.Name, releaseTitle: true) == "Warm Up" &&
+                !_warmUpShowQualifierPattern.IsMatch(release.Title);
 
-            if (highlightsAllowed || selectedWrestlingPackage)
+            if (highlightsAllowed || selectedWrestlingPackage || scheduledWarmUp)
             {
                 _logger.LogTrace("[Release Matching] Allowing selected package for '{Event}': '{Release}'",
                     evt.Title, release.Title);
@@ -499,6 +510,23 @@ public class ReleaseMatchingService
                     release.Title, releaseLeagueId, evt.League.Name, evt.League.ExternalId);
                 return result;
             }
+        }
+
+        var motoGpIdentity = MotoGpGrandPrixIdentity.Evaluate(
+            release.Title, evt, ExtractRoundNumber(release.Title), parseResult.EventDate);
+        if (motoGpIdentity is MotoGpGrandPrixMatch.Conflict or MotoGpGrandPrixMatch.Insufficient)
+        {
+            result.Confidence = 0;
+            result.IsHardRejection = true;
+            result.Rejections.Add(motoGpIdentity == MotoGpGrandPrixMatch.Conflict
+                ? "Location mismatch: release names a different MotoGP Grand Prix"
+                : "Release does not identify the selected MotoGP Grand Prix");
+            return result;
+        }
+        if (motoGpIdentity == MotoGpGrandPrixMatch.Location)
+        {
+            result.Confidence += 25;
+            result.MatchReasons.Add("MotoGP Grand Prix location matches");
         }
 
         // Normalize titles for comparison (includes diacritic removal)
@@ -1480,7 +1508,7 @@ public class ReleaseMatchingService
         // VALIDATION 6c: Motorsport location mismatch detection
         // If event title contains a known location (e.g., "Australian"), reject releases
         // containing a DIFFERENT known location (e.g., "Thailand")
-        if (isMotorsport)
+        if (isMotorsport && motoGpIdentity == MotoGpGrandPrixMatch.NotApplicable)
         {
             var conflictingLocation = DetectConflictingLocation(release.Title, evt.Title);
             if (conflictingLocation != null)

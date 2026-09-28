@@ -261,6 +261,9 @@ public class ReleaseMatchScorer
     // scoring pass.
     private static readonly Regex _titleRoundRegex = new(@"(?:Round|R|Week|W)\.?\s*(\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _yearRegex = new(@"\b((?:19[3-9]\d|20\d\d))\b", RegexOptions.Compiled);
+    private static readonly Regex _motoGpSeasonYearRegex = new(
+        @"(?<![A-Za-z0-9])S(20\d{2})E\d+\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex _parseRoundRegex = new(@"(?:Round|R|Week|W)[\.\s]*(\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _gameNumberRegex = new(@"\bGame[\.\s_-]*(\d{1,2})\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _isoDateRegex = new(@"(?<!\d)((?:19[3-9]\d|20\d\d))[._/\-\s](0?[1-9]|1[0-2])[._/\-\s](0?[1-9]|[12]\d|3[01])(?!\d)", RegexOptions.Compiled);
@@ -469,15 +472,27 @@ public class ReleaseMatchScorer
         // Use the broadcast-local year so end-of-year shows (AEW Dec 31 8pm
         // Eastern = Jan 1 UTC) match releases titled with the broadcast year.
         var eventYear = (evt.BroadcastDate ?? evt.EventDate.Date).Year;
+        int? releaseYear = parsed.Year;
+        if (eventSportPrefix == "MotoGP" && !releaseYear.HasValue)
+        {
+            var seasonToken = _motoGpSeasonYearRegex.Match(releaseTitle);
+            if (seasonToken.Success)
+                releaseYear = int.Parse(seasonToken.Groups[1].Value);
+        }
         var ehfSeasonStartMatches = parsed.Year.HasValue && parsed.Year != eventYear &&
             LeagueReleaseNamePolicy.HasMatchingEHFSeasonStartIdentity(releaseTitle, evt, parsed.Year.Value);
 
         // === REQUIRED CRITERIA (score 0 if these don't match) ===
 
         // Year must match - this is required
-        if (parsed.Year.HasValue && parsed.Year != eventYear &&
+        if (releaseYear.HasValue && releaseYear != eventYear &&
             !CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(releaseTitle, evt) &&
             !ehfSeasonStartMatches)
+            return 0;
+
+        var motoGpIdentity = MotoGpGrandPrixIdentity.Evaluate(
+            releaseTitle, evt, parsed.RoundNumber, BuildParsedDate(parsed, eventYear));
+        if (motoGpIdentity is MotoGpGrandPrixMatch.Conflict or MotoGpGrandPrixMatch.Insufficient)
             return 0;
 
         // Cross-sport detection - reject releases from completely different sports
@@ -591,7 +606,7 @@ public class ReleaseMatchScorer
         // === SCORING CRITERIA ===
 
         // Base score for matching year (if year info exists)
-        if (parsed.Year.HasValue && (parsed.Year == eventYear ||
+        if (releaseYear.HasValue && (releaseYear == eventYear ||
             CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(releaseTitle, evt) ||
             ehfSeasonStartMatches))
             score += 15;
@@ -731,7 +746,12 @@ public class ReleaseMatchScorer
         // This prevents "Qatar Grand Prix" from matching "Brazil Grand Prix" releases
         if (IsMotorsport(eventSportPrefix))
         {
-            var locationScore = GetLocationMatchScore(releaseTitle, evt, venueContext);
+            var locationScore = motoGpIdentity switch
+            {
+                MotoGpGrandPrixMatch.Location => 25,
+                MotoGpGrandPrixMatch.RoundOrDate => 0,
+                _ => GetLocationMatchScore(releaseTitle, evt, venueContext)
+            };
             if (locationScore < 0)
                 return 0; // Wrong location - reject immediately
             score += locationScore; // 0-25 points for matching locations
@@ -1263,7 +1283,7 @@ public class ReleaseMatchScorer
         string? leagueName,
         string? eventSportPrefix)
     {
-        if (eventSportPrefix is "WSBK" or "WEC" ||
+        if (eventSportPrefix is "WSBK" or "WEC" or "MotoGP" ||
             (eventSportPrefix == "IndyCar" &&
              EventPartDetector.DetectMotorsportSessionIdentity(
                  eventTitle, leagueName, releaseTitle: false) == "Final Practice"))
