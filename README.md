@@ -177,6 +177,13 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/TRusselo">
+                    <img src="https://avatars.githubusercontent.com/u/1154815?v=4" width="72;" alt="TRusselo"/>
+                    <br />
+                    <sub><b>TRusselo</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/cdude5464">
                     <img src="https://avatars.githubusercontent.com/u/157808172?v=4" width="72;" alt="cdude5464"/>
                     <br />
@@ -190,6 +197,8 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                     <sub><b>nickperkins</b></sub>
                 </a>
             </td>
+		</tr>
+		<tr>
             <td align="center">
                 <a href="https://github.com/safetyp1">
                     <img src="https://avatars.githubusercontent.com/u/33685132?v=4" width="72;" alt="safetyp1"/>
@@ -197,20 +206,11 @@ Sportarr is made better by everyone who has contributed code. Thank you.
                     <sub><b>safetyp1</b></sub>
                 </a>
             </td>
-		</tr>
-		<tr>
             <td align="center">
                 <a href="https://github.com/scottrobertson">
                     <img src="https://avatars.githubusercontent.com/u/68361?v=4" width="72;" alt="scottrobertson"/>
                     <br />
                     <sub><b>scottrobertson</b></sub>
-                </a>
-            </td>
-            <td align="center">
-                <a href="https://github.com/TRusselo">
-                    <img src="https://avatars.githubusercontent.com/u/1154815?v=4" width="72;" alt="TRusselo"/>
-                    <br />
-                    <sub><b>TRusselo</b></sub>
                 </a>
             </td>
             <td align="center">
