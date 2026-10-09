@@ -133,6 +133,44 @@ public class LeagueEventsPaginationTests
     }
 
     [Fact]
+    public async Task HugePage_ClampsItsOffsetInsteadOfOverflowing()
+    {
+        await using var harness = await Harness.CreateAsync();
+        const int total = 2500;
+        var leagueId = await SeedKeepAllLeagueAsync(harness.Db, total);
+
+        // NormalizeLeagueEventsPaging clamps page only at 1, so the largest
+        // int page at the size cap is a legal request. Its offset does not
+        // fit in int: the raw (page - 1) * size multiply overflows and wraps
+        // negative, which puts a negative OFFSET in the composed SQL, so a
+        // valid huge page turns into an invalid query instead of an empty
+        // page.
+        var (currentPage, size) = LeagueEndpoints.NormalizeLeagueEventsPaging(int.MaxValue, 1000);
+        var (_, pageQuery) = LeagueEndpoints.ComposeUnfilteredEventPageQueries(harness.Db, leagueId, null, currentPage, size);
+
+        var sql = pageQuery.ToQueryString();
+        var offsetIndex = sql.IndexOf("OFFSET", StringComparison.OrdinalIgnoreCase);
+        offsetIndex.Should().BeGreaterThan(-1, "the composed page query always carries an OFFSET");
+        // EF Core parameterizes the Skip value, so the offset rides as a named
+        // parameter and ToQueryString declares its value in a ".param set"
+        // line instead of inlining it next to the OFFSET token.
+        var offsetParameter = sql[(offsetIndex + "OFFSET".Length)..].TrimStart()
+            .Split(' ', ',', ')', '\r', '\n', ';')[0];
+        var declarationPrefix = $".param set {offsetParameter} ";
+        var declarationIndex = sql.IndexOf(declarationPrefix, StringComparison.Ordinal);
+        declarationIndex.Should().BeGreaterThan(-1,
+            "ToQueryString declares the offset parameter's value in a .param set line");
+        var offset = int.Parse(sql[(declarationIndex + declarationPrefix.Length)..].Split('\r', '\n')[0]);
+        offset.Should().BeGreaterOrEqualTo(0,
+            "the page offset must never overflow int into a negative SQL OFFSET");
+
+        // The clamped offset sits far past the league, so the database must
+        // return an empty page instead of rejecting the query.
+        var records = await pageQuery.ToListAsync();
+        records.Should().BeEmpty("a page beyond the last row is empty, not a 500");
+    }
+
+    [Fact]
     public async Task UnfilteredCountQuery_CountsRowsWithoutTheRelationshipGraph()
     {
         await using var harness = await Harness.CreateAsync();

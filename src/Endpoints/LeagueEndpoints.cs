@@ -3115,7 +3115,7 @@ app.MapPost("/api/leagues/move/bulk", async (BulkMoveLeaguesRequest request, Lea
             .Include(e => e.Files)
             .OrderByDescending(e => e.EventDate)
             .ThenByDescending(e => e.Id)
-            .Skip((currentPage - 1) * size)
+            .Skip((int)Math.Min((currentPage - 1) * (long)size, int.MaxValue))
             .Take(size);
 
         return (CountQuery: query, PageQuery: pageQuery);
