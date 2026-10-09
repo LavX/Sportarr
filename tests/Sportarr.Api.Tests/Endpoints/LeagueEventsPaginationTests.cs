@@ -149,6 +149,66 @@ public class LeagueEventsPaginationTests
     }
 
     [Fact]
+    public async Task UnfilteredPageQuery_SeeksItsWindowThroughTheLeagueEventsIndex()
+    {
+        await using var harness = await Harness.CreateAsync();
+        const int total = 2500;
+        var leagueId = await SeedKeepAllLeagueAsync(harness.Db, total);
+
+        // The window's own ordering, EventDate DESC then Id DESC inside one
+        // league, is what the composite (LeagueId, EventDate, Id) index
+        // serves. With only the single-column indexes the planner sought
+        // Events by LeagueId and then re-sorted the whole league for every
+        // page: USE TEMP B-TREE FOR ORDER BY, which cost two thirds of each
+        // page's latency on a 67,516-event league. The window rides inside a
+        // subquery of the captured SQL, so cut that subquery out and ask
+        // SQLite for its plan alone; the outer query sorts only the returned
+        // page, which is fine and is not what this pins.
+        var (_, pageQuery) = LeagueEndpoints.ComposeUnfilteredEventPageQueries(harness.Db, leagueId, null, currentPage: 3, size: 100);
+        var sql = pageQuery.ToQueryString();
+
+        var fromIndex = sql.IndexOf("FROM (", StringComparison.OrdinalIgnoreCase);
+        fromIndex.Should().BeGreaterThan(-1, "EF pushes the page window into a subquery");
+        var innerStart = fromIndex + "FROM (".Length;
+        var depth = 1;
+        var scan = innerStart;
+        while (scan < sql.Length && depth > 0)
+        {
+            if (sql[scan] == '(')
+            {
+                depth++;
+            }
+            else if (sql[scan] == ')')
+            {
+                depth--;
+            }
+            scan++;
+        }
+        depth.Should().Be(0, "the window subquery's parentheses must close inside the captured SQL");
+        var innerEnd = scan - 1;
+        innerEnd.Should().BeGreaterThan(innerStart, "the window subquery closes before the joins begin");
+        var window = sql[innerStart..innerEnd];
+
+        // The window is the statement whose plan matters: it filters by
+        // league, orders by date then id, and cuts its page with the LIMIT.
+        window.Should().Contain("LeagueId", "the page window filters by league");
+        window.Should().Contain("EventDate", "the page window orders by event date");
+        window.Should().Contain("LIMIT", "the page window cuts its page in SQL");
+
+        var connection = (SqliteConnection)harness.Db.Database.GetDbConnection();
+        var plan = await ExplainQueryPlanAsync(connection, window);
+        var planText = string.Join("\n", plan);
+
+        plan.Should().Contain(line =>
+                line.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) &&
+                line.Contains("IX_Events_LeagueId_EventDate_Id", StringComparison.Ordinal) &&
+                line.Contains("LeagueId=", StringComparison.Ordinal),
+            "the page window must seek the composite league events index by league, not scan it. Plan:\n" + planText);
+        plan.Should().NotContain(line => line.Contains("TEMP B-TREE", StringComparison.OrdinalIgnoreCase),
+            "the composite index must serve the window's ordering instead of re-sorting the league per page. Plan:\n" + planText);
+    }
+
+    [Fact]
     public async Task HugePage_ClampsItsOffsetInsteadOfOverflowing()
     {
         await using var harness = await Harness.CreateAsync();
@@ -379,5 +439,22 @@ public class LeagueEventsPaginationTests
             $"season {season} must narrow the page");
         records.Select(e => e.Id).Should().BeEquivalentTo(expectedIds,
             $"season {season} must return exactly that season's rows");
+    }
+
+    private static async Task<List<string>> ExplainQueryPlanAsync(SqliteConnection connection, string sqlText)
+    {
+        // ToQueryString appends .param set lines for SQLite's CLI dialect;
+        // the statement itself ends before them, and its parameters stay
+        // unbound, which is fine for a plan.
+        var executable = sqlText.Split(".param set")[0].TrimEnd(';', ' ', '\r', '\n');
+        await using var command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN " + executable;
+        var lines = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            lines.Add(reader.GetString(3));
+        }
+        return lines;
     }
 }
