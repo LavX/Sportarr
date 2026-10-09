@@ -184,16 +184,26 @@ public class LeagueEventsPaginationTests
             }
             scan++;
         }
+        depth.Should().Be(0, "the window subquery's parentheses must close inside the captured SQL");
         var innerEnd = scan - 1;
         innerEnd.Should().BeGreaterThan(innerStart, "the window subquery closes before the joins begin");
         var window = sql[innerStart..innerEnd];
+
+        // The window is the statement whose plan matters: it filters by
+        // league, orders by date then id, and cuts its page with the LIMIT.
+        window.Should().Contain("LeagueId", "the page window filters by league");
+        window.Should().Contain("EventDate", "the page window orders by event date");
+        window.Should().Contain("LIMIT", "the page window cuts its page in SQL");
 
         var connection = (SqliteConnection)harness.Db.Database.GetDbConnection();
         var plan = await ExplainQueryPlanAsync(connection, window);
         var planText = string.Join("\n", plan);
 
-        plan.Should().Contain(line => line.Contains("IX_Events_LeagueId_EventDate_Id", StringComparison.Ordinal),
-            "the page window must seek the composite league events index. Plan:\n" + planText);
+        plan.Should().Contain(line =>
+                line.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) &&
+                line.Contains("IX_Events_LeagueId_EventDate_Id", StringComparison.Ordinal) &&
+                line.Contains("LeagueId=", StringComparison.Ordinal),
+            "the page window must seek the composite league events index by league, not scan it. Plan:\n" + planText);
         plan.Should().NotContain(line => line.Contains("TEMP B-TREE", StringComparison.OrdinalIgnoreCase),
             "the composite index must serve the window's ordering instead of re-sorting the league per page. Plan:\n" + planText);
     }
