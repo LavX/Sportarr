@@ -121,15 +121,31 @@ public class LeagueEventsPaginationTests
         sql.Should().Contain("OFFSET",
             "page 3 must skip the first two pages server-side");
 
-        var orderBy = sql[sql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase)..];
-        var dateIndex = orderBy.IndexOf("EventDate", StringComparison.OrdinalIgnoreCase);
-        var idIndex = orderBy.IndexOf("Id", StringComparison.OrdinalIgnoreCase);
-        dateIndex.Should().BeGreaterThan(-1, "the page is ordered by event date");
-        idIndex.Should().BeGreaterThan(-1, "the Id tiebreaker must be part of the ordering");
+        // The captured SQL holds more orderings than the page window's own:
+        // EF pushes the window down into a subquery, and the outer query
+        // that joins teams and files appends its own ORDER BY with every
+        // joined key. Searching everything after the first ORDER BY let that
+        // outer ordering satisfy the tiebreaker check, so a dropped
+        // tiebreaker still passed. The window's own clause is the ORDER BY
+        // its LIMIT cuts, so assert against that slice alone.
+        var limitIndex = sql.IndexOf("LIMIT", StringComparison.OrdinalIgnoreCase);
+        var windowOrderIndex = sql.LastIndexOf("ORDER BY", limitIndex, StringComparison.OrdinalIgnoreCase);
+        windowOrderIndex.Should().BeGreaterThan(-1,
+            "the page window's own ORDER BY precedes its LIMIT");
+        // EF quotes every identifier, so strip the quotes before matching
+        // column names. The window's own clause then reads
+        // ORDER BY e.EventDate DESC, e.Id DESC.
+        var windowOrderBy = sql[windowOrderIndex..limitIndex].Replace("\"", "");
+
+        var dateIndex = windowOrderBy.IndexOf("EventDate", StringComparison.OrdinalIgnoreCase);
+        var idIndex = windowOrderBy.IndexOf("Id", StringComparison.OrdinalIgnoreCase);
+        dateIndex.Should().BeGreaterThan(-1, "the page window is ordered by event date");
+        idIndex.Should().BeGreaterThan(-1, "the Id tiebreaker must be part of the page window's ordering");
         dateIndex.Should().BeLessThan(idIndex,
             "the Id tiebreaker must follow EventDate so page boundaries stay deterministic when dates tie");
-        orderBy[dateIndex..idIndex].Should().Contain("DESC", "newest events come first");
-        orderBy[idIndex..].Should().Contain("DESC", "the tiebreaker also runs newest Id first");
+        windowOrderBy[dateIndex..idIndex].Should().Contain("DESC", "newest events come first");
+        windowOrderBy[(idIndex + "Id".Length)..].Trim().Should().Be("DESC",
+            "the page window's ordering must end with the Id DESC tiebreaker");
     }
 
     [Fact]
